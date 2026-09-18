@@ -440,7 +440,9 @@ const commands = {
     const runId = args["run-id"] || fail("--run-id required");
     const outcome = args.outcome || "completed";
     if (!["completed", "blocked", "failed"].includes(outcome)) fail("--outcome must be completed|blocked|failed");
-    const run = loadRun(runId);
+    // A blocked/failed run may never have reached triage or apply, so there
+    // may be no run file yet; the receipt must still be recordable.
+    const run = loadRun(runId, { create: true });
     const receipt = {
       schemaVersion: 1,
       runId,

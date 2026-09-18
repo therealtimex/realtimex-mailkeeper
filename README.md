@@ -56,6 +56,22 @@ That is a bridge, not the design. [realtimex-ai-app#1996](https://rtgit.rta.vn/r
 
 The account picker depends on `optionsRoutePath` support in the host config modal — [realtimex-ai-app#2001](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2001), which also brings schema-driven grouping, compact rows, and correct required state. On an older host the field renders as a plain multi-select with no options; `GET /accounts` still answers.
 
+## Requirements for the maintenance agent
+
+The heartbeat agent runs `himalaya` from inside its own terminal session, so that session needs outbound network access to your IMAP hosts and access to the credential source the Himalaya config points at (macOS Keychain, a command, or a file).
+
+- **Codex CLI** — RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, and that sandbox denies outbound network by default. Add to `~/.codex/config.toml`:
+
+  ```toml
+  [sandbox_workspace_write]
+  network_access = true
+  ```
+
+  Without it the run ends as `blocked` with "IMAP connection setup failed" and no receipt of moved messages (nothing is touched).
+- **Other agents** — check the equivalent sandbox/network setting for the agent you pick in *Maintenance agent*.
+
+A blocked run is the plugin behaving correctly: it posts a summary to the maintenance thread and records a `blocked` receipt; it never moves anything it could not inspect.
+
 ## Development
 
 ```sh
