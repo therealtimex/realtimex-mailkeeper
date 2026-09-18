@@ -7,7 +7,7 @@ const { hostFor, hasPublicApi } = require("../runtime/host");
 
 test("prefers the public SDK namespaces when the host provides them", () => {
   const api = {
-    pluginId: "com.realtimex.mailbox",
+    pluginId: "com.realtimex.mailkeeper",
     workspaces: { get: async () => null, listEnabledForPlugin: async () => [], ensureThread: async () => ({}) },
     heartbeat: { readSettings: async () => ({}), upsertManagedTask: async () => ({}), removeManagedTask: async () => ({}) },
   };
@@ -19,9 +19,9 @@ test("prefers the public SDK namespaces when the host provides them", () => {
 });
 
 test("falls back to the shim and reports a clear error outside the host", () => {
-  const api = { pluginId: "com.realtimex.mailbox" };
+  const api = { pluginId: "com.realtimex.mailkeeper" };
   assert.equal(hasPublicApi(api), false);
   // Outside a RealTimeX server process the @/ modules do not resolve; the
   // adapter must surface that as one coded error rather than a raw stack.
-  assert.throws(() => hostFor(api), { code: "MAILBOX_HOST_CAPABILITY_MISSING" });
+  assert.throws(() => hostFor(api), { code: "MAILKEEPER_HOST_CAPABILITY_MISSING" });
 });

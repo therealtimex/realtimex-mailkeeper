@@ -1,6 +1,6 @@
 ---
 name: mailbox-cleanup
-description: Multi-pass mailbox cleanup playbook over Himalaya (any IMAP provider). Use for large-backlog inbox cleanup, proposing and promoting cleanup rules, unattended maintenance runs driven by the RealTimeX Mailbox plugin heartbeat, and reversing a previous run. Pattern-based subject/sender/body passes catch far more archivable mail than sender-only scans.
+description: Multi-pass mailbox cleanup playbook over Himalaya (any IMAP provider). Use for large-backlog inbox cleanup, proposing and promoting cleanup rules, unattended maintenance runs driven by the RealTimeX MailKeeper plugin heartbeat, and reversing a previous run. Pattern-based subject/sender/body passes catch far more archivable mail than sender-only scans.
 ---
 
 # Mailbox Cleanup
@@ -8,7 +8,7 @@ description: Multi-pass mailbox cleanup playbook over Himalaya (any IMAP provide
 A playbook for large-scale mailbox cleanup, adapted from the Vellum `inbox-cleanup` skill for any IMAP provider through Himalaya. Two ways to run it:
 
 - **Interactive** (a human is in the thread): all phases, you confirm every archive decision.
-- **Maintenance** (launched by the Mailbox plugin heartbeat): only *promoted* rules execute; everything else is a dry run reported as a proposal. The generated prompt tells you which.
+- **Maintenance** (launched by the MailKeeper plugin heartbeat): only *promoted* rules execute; everything else is a dry run reported as a proposal. The generated prompt tells you which.
 
 Read `MAILBOX.md` in the workspace root before anything else. It is the human-owned policy and outranks both this file and the generated prompt.
 
@@ -16,7 +16,7 @@ Read `MAILBOX.md` in the workspace root before anything else. It is the human-ow
 
 - Account name and mode come from the plugin (workspace settings) — never guess a host, address, or folder.
 - Himalaya config: `HIMALAYA_CONFIG` if set, otherwise the BizOps-configured TOML (`realtimex-bizops` skill explains how to resolve it). All commands take `-a <account>`.
-- Local state lives in `.mailbox/` in the workspace root: `snapshot.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
+- Local state lives in `.mailkeeper/` in the workspace root: `snapshot.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
 - `scripts/mailbox-ops.js` is the only way to touch the mailbox from this skill. Do not hand-assemble `himalaya message move` commands.
 
 ## Safety rules (non-negotiable)
@@ -45,7 +45,7 @@ node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <n
 node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <name> --since-last-run   # delta (maintenance)
 ```
 
-Pulls envelopes (uid, date, from, subject, flags) into `.mailbox/snapshot.json`. All passes run against this cache, so previews are instant and the server is only hit again to move UIDs.
+Pulls envelopes (uid, date, from, subject, flags) into `.mailkeeper/snapshot.json`. All passes run against this cache, so previews are instant and the server is only hit again to move UIDs.
 
 ### 3. Urgency triage — always first
 
@@ -89,7 +89,7 @@ Only when a pass is ambiguous: flag as cold outreach when **3+** of these hold �
 node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js submit --run-id <id> --outcome completed --summary "..."
 ```
 
-Writes `.mailbox/outbox/<runId>.json` with `actions`, `proposals`, `urgent`, and the summary. The plugin ingests it on the next lifecycle event or status read. Exit only after it prints `ok:true`.
+Writes `.mailkeeper/outbox/<runId>.json` with `actions`, `proposals`, `urgent`, and the summary. The plugin ingests it on the next lifecycle event or status read. Exit only after it prints `ok:true`.
 
 ### 7. Reversal
 

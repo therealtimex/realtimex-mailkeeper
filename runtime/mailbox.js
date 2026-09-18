@@ -18,7 +18,7 @@ const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
 
-const HIMALAYA_BIN = process.env.MAILBOX_HIMALAYA_BIN || "himalaya";
+const HIMALAYA_BIN = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const BATCH = 200;
 
 function tailArgs(account) {

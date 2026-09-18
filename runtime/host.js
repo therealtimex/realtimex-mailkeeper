@@ -38,9 +38,9 @@ function lazyHostRequire(request) {
     return require(request);
   } catch (error) {
     const wrapped = new Error(
-      `realtimex-mailbox needs host module "${request}" until realtimex-ai-app#1996 exposes it on PluginAPI: ${error.message}`
+      `realtimex-mailkeeper needs host module "${request}" until realtimex-ai-app#1996 exposes it on PluginAPI: ${error.message}`
     );
-    wrapped.code = "MAILBOX_HOST_CAPABILITY_MISSING";
+    wrapped.code = "MAILKEEPER_HOST_CAPABILITY_MISSING";
     throw wrapped;
   }
 }
@@ -106,7 +106,7 @@ function shimBackend(api) {
         const error = new Error(
           `Thread ${slug} is archived and cannot be reused`
         );
-        error.code = "MAILBOX_THREAD_ARCHIVED";
+        error.code = "MAILKEEPER_THREAD_ARCHIVED";
         error.statusCode = 409;
         throw error;
       }
@@ -116,7 +116,7 @@ function shimBackend(api) {
         const row = await Workspace.get({ id: workspace.id });
         if (!row) {
           const error = new Error(`Workspace ${workspace.slug} does not exist`);
-          error.code = "MAILBOX_WORKSPACE_MISSING";
+          error.code = "MAILKEEPER_WORKSPACE_MISSING";
           error.statusCode = 404;
           throw error;
         }

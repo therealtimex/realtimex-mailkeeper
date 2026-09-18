@@ -1,6 +1,8 @@
-# RealTimeX Mailbox
+# RealTimeX MailKeeper
 
-Heartbeat-driven mailbox hygiene for RealTimeX: cleanup, rules, retention. Works with any IMAP provider through the Himalaya account that BizOps already manages.
+**Keeps your inbox clean on a schedule.** Rules you promote, everything else proposed, every run reversible. Works with any IMAP provider through the Himalaya account that BizOps already manages.
+
+MailKeeper is *hygiene*; [BizOps](https://github.com/therealtimex) is *correspondence* (reply, cases, CRM). They share the same account config and never overlap.
 
 It is **not** a mail client. It never reads message bodies into chat, never replies, never deletes. It moves messages into `Auto/*` folders (or the archive folder) according to rules a human has promoted, and it reports everything else as a proposal.
 
@@ -44,7 +46,7 @@ skills/mailbox-cleanup/
   scripts/mailbox-ops.js        self-contained CLI the agent runs in the workspace
 ```
 
-Workspace-side state lives in `<workspace>/.mailbox/`: `rules.json` (written by the plugin: effective config + promoted rules), `snapshot.json` (envelope cache), `runs/`, `outbox/` (receipts the plugin ingests on the next lifecycle event or status read).
+Workspace-side state lives in `<workspace>/.mailkeeper/`: `rules.json` (written by the plugin: effective config + promoted rules), `snapshot.json` (envelope cache), `runs/`, `outbox/` (receipts the plugin ingests on the next lifecycle event or status read).
 
 ### Host dependency
 
@@ -57,7 +59,7 @@ That is a bridge, not the design. [realtimex-ai-app#1996](https://rtgit.rta.vn/r
 ```sh
 npm test                 # config + host adapter tests (no server needed)
 npm run lint:manifest
-npm run build:plugin     # dist/realtimex-mailbox-plugin-<version>.zip + .sha256
+npm run build:plugin     # dist/realtimex-mailkeeper-plugin-<version>.zip + .sha256
 ```
 
 Install for local testing with the `realtimex-plugin-developer` skill or the marketplace install flow, then enable it on a workspace whose BizOps email config has the account you name.

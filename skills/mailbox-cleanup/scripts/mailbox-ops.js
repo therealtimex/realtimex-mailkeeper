@@ -5,7 +5,7 @@
  * mailbox-ops.js — the only way the mailbox-cleanup skill touches a mailbox.
  *
  * Self-contained on purpose: this file is copied into the workspace by the
- * RealTimeX Mailbox plugin's workspace-skill provider and runs in the agent's
+ * RealTimeX MailKeeper plugin's workspace-skill provider and runs in the agent's
  * terminal, so it cannot require the plugin runtime.
  *
  *   snapshot  --account <name> [--since-last-run] [--folder INBOX]
@@ -16,7 +16,7 @@
  *   submit    --run-id <id> --outcome <completed|blocked|failed> [--summary "..."]
  *   undo      --account <name> --run-id <id> [--dry-run]
  *
- * State: <workspace>/.mailbox/{rules.json, snapshot.json, runs/, outbox/}
+ * State: <workspace>/.mailkeeper/{rules.json, snapshot.json, runs/, outbox/}
  * rules.json is written by the plugin on every provision and carries the
  * effective config plus the promoted rule set. Never edit it by hand.
  */
@@ -26,8 +26,8 @@ const path = require("path");
 const { execFileSync } = require("child_process");
 
 const ROOT = process.cwd();
-const STATE = path.join(ROOT, ".mailbox");
-const HIMALAYA = process.env.MAILBOX_HIMALAYA_BIN || "himalaya";
+const STATE = path.join(ROOT, ".mailkeeper");
+const HIMALAYA = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const BATCH = 200;
 
 // ---------------------------------------------------------------------------
@@ -191,7 +191,7 @@ function listAll(account, folder, query) {
 
 function loadRules() {
   const rules = readJson(path.join(STATE, "rules.json"));
-  if (!rules?.config) fail(".mailbox/rules.json missing — the Mailbox plugin writes it on provision. Is the plugin enabled for this workspace?");
+  if (!rules?.config) fail(".mailkeeper/rules.json missing — the MailKeeper plugin writes it on provision. Is the plugin enabled for this workspace?");
   return rules;
 }
 
@@ -428,7 +428,7 @@ const commands = {
     };
     writeJson(path.join(STATE, "outbox", `${runId}.json`), receipt);
     writeJson(runFile(runId), { ...run, submittedAt: receipt.finishedAt, outcome });
-    console.log(JSON.stringify({ ok: true, runId, actions: receipt.actions.length, proposals: receipt.proposals.length, urgent: receipt.urgent.length, queued: `.mailbox/outbox/${runId}.json` }));
+    console.log(JSON.stringify({ ok: true, runId, actions: receipt.actions.length, proposals: receipt.proposals.length, urgent: receipt.urgent.length, queued: `.mailkeeper/outbox/${runId}.json` }));
   },
 
   undo(args) {

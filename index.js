@@ -3,7 +3,7 @@
 const fs = require("fs");
 const path = require("path");
 const { definePlugin } = require("@realtimex/plugin-sdk");
-const { MailboxService, PLUGIN_ID } = require("./runtime/service");
+const { MailKeeperService, PLUGIN_ID } = require("./runtime/service");
 
 const SKILL_DIR = path.join(__dirname, "skills", "mailbox-cleanup");
 
@@ -12,7 +12,7 @@ const services = new WeakMap();
 function serviceFor(api) {
   let service = services.get(api);
   if (!service) {
-    service = new MailboxService(api);
+    service = new MailKeeperService(api);
     services.set(api, service);
   }
   return service;
@@ -22,7 +22,7 @@ function errorResponse(response, error) {
   return response.status(error?.statusCode || 500).json({
     ok: false,
     error: error?.statusCode ? error.message : "Internal server error",
-    code: error?.code || "MAILBOX_INTERNAL_ERROR",
+    code: error?.code || "MAILKEEPER_INTERNAL_ERROR",
   });
 }
 
@@ -44,7 +44,7 @@ async function resolveWorkspace(service, request, { allowInactive = false } = {}
     const enabled = (await service.host.workspaces.listEnabledForPlugin()).some(
       (entry) => entry.id === workspace.id
     );
-    if (!enabled) return { error: "Mailbox is not active for this workspace", status: 403 };
+    if (!enabled) return { error: "MailKeeper is not active for this workspace", status: 403 };
   }
   return { workspace, user: request.user || request.session?.user || null };
 }
@@ -55,13 +55,13 @@ async function withScope(service, request, response, handler, options = {}) {
     return response.status(resolved.status).json({
       ok: false,
       error: resolved.error,
-      code: "MAILBOX_SCOPE_INVALID",
+      code: "MAILKEEPER_SCOPE_INVALID",
     });
   }
   try {
     return await handler(resolved);
   } catch (error) {
-    service.api.log?.error?.("Mailbox route failed", {
+    service.api.log?.error?.("MailKeeper route failed", {
       code: error?.code || null,
       error: error.message,
     });
@@ -89,7 +89,7 @@ module.exports = definePlugin({
     const service = serviceFor(api);
     const routeOptions = { auth: "internalOrAppId" };
 
-    api.registerWorkspaceSkillProvider("mailbox-workspace-skill", async () => [
+    api.registerWorkspaceSkillProvider("mailkeeper-workspace-skill", async () => [
       {
         name: "mailbox-cleanup",
         displayName: "Mailbox Cleanup",

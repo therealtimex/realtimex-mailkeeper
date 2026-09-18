@@ -1,7 +1,7 @@
 {
-  "name": "realtimex-mailbox",
+  "name": "realtimex-mailkeeper",
   "version": "0.1.0",
-  "description": "Heartbeat-driven mailbox hygiene plugin for RealTimeX: cleanup, rules, retention. Any IMAP provider via Himalaya.",
+  "description": "MailKeeper: keeps your inbox clean on a schedule. Rules you promote, everything else proposed, every run reversible. Any IMAP provider via Himalaya.",
   "license": "UNLICENSED",
   "private": true,
   "main": "index.js",
@@ -15,6 +15,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/therealtimex/realtimex-mailbox.git"
+    "url": "https://github.com/therealtimex/realtimex-mailkeeper.git"
   }
 }

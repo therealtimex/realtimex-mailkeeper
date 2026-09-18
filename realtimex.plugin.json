@@ -1,9 +1,9 @@
 {
-  "id": "com.realtimex.mailbox",
-  "name": "realtimex-mailbox",
-  "displayName": "RealTimeX Mailbox",
+  "id": "com.realtimex.mailkeeper",
+  "name": "realtimex-mailkeeper",
+  "displayName": "RealTimeX MailKeeper",
   "version": "0.1.0",
-  "description": "Heartbeat-driven mailbox hygiene: cleanup, rules, retention. Works with any IMAP provider through the Himalaya account configured in BizOps.",
+  "description": "Keeps your inbox clean on a schedule: rules you promote, everything else proposed, every run reversible. Any IMAP provider via the Himalaya account configured in BizOps.",
   "author": { "name": "RealTimeX Team" },
   "license": "UNLICENSED",
   "enabledByDefault": false,
@@ -11,13 +11,13 @@
   "supportsWorkspaceOverrides": true,
   "entrypoint": "index.js",
   "capabilities": {
-    "workspace_skill_providers": ["mailbox-workspace-skill"],
+    "workspace_skill_providers": ["mailkeeper-workspace-skill"],
     "api_routes": [
       {
         "method": "GET",
         "path": "/status",
         "auth": "internalOrAppId",
-        "description": "Read a workspace Mailbox profile, readiness state, promoted rules, and last run summary."
+        "description": "Read a workspace MailKeeper profile, readiness state, promoted rules, and last run summary."
       },
       {
         "method": "POST",
@@ -119,7 +119,7 @@
       "type": "select",
       "required": true,
       "default": "1d",
-      "description": "Mailbox inherits timezone, active hours, and pause state from this workspace's heartbeat settings.",
+      "description": "MailKeeper inherits timezone, active hours, and pause state from this workspace's heartbeat settings.",
       "options": [
         { "value": "4h", "label": "Every 4 hours" },
         { "value": "12h", "label": "Every 12 hours" },

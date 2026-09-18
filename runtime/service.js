@@ -8,7 +8,7 @@ const { hostFor } = require("./host");
 const { resolveProfileConfig } = require("./config");
 const mailbox = require("./mailbox");
 
-const PLUGIN_ID = "com.realtimex.mailbox";
+const PLUGIN_ID = "com.realtimex.mailkeeper";
 const TEMPLATE_DIR = path.join(__dirname, "..", "templates");
 
 function codedError(message, code, statusCode = 500) {
@@ -25,14 +25,14 @@ function text(value, max = 500) {
 }
 
 function taskIdentity(workspaceId) {
-  return `mailbox-maintenance-${workspaceId}`;
+  return `mailkeeper-maintenance-${workspaceId}`;
 }
 
 function threadKey(workspaceId) {
-  return `mailbox-maintenance-${workspaceId}`;
+  return `mailkeeper-maintenance-${workspaceId}`;
 }
 
-class MailboxService {
+class MailKeeperService {
   constructor(api) {
     this.api = api;
     this.host = hostFor(api);
@@ -88,7 +88,7 @@ class MailboxService {
         errors,
         updatedAt: new Date().toISOString(),
       });
-      this.api.log?.warn?.("Mailbox profile not ready", {
+      this.api.log?.warn?.("MailKeeper profile not ready", {
         workspace: workspace.slug,
         errors,
       });
@@ -111,7 +111,7 @@ class MailboxService {
 
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
-      name: `Mailbox: ${config.emailAccount}`,
+      name: `MailKeeper: ${config.emailAccount}`,
     });
 
     this.seedContract(workspace, config);
@@ -121,7 +121,7 @@ class MailboxService {
 
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
-      name: `Mailbox maintenance (${config.emailAccount})`,
+      name: `MailKeeper maintenance (${config.emailAccount})`,
       interval: config.cadence,
       executor: "agent",
       agent: config.agent,
@@ -132,7 +132,7 @@ class MailboxService {
       directPrompt: true,
       resumeSession: false,
       autoCloseTerminalOnStop: true,
-      promptArtifactCategory: "mailbox-maintenance",
+      promptArtifactCategory: "mailkeeper-maintenance",
       promptArtifactRetention: "durable",
     });
 
@@ -176,7 +176,7 @@ class MailboxService {
       try {
         await this.provision(workspace);
       } catch (error) {
-        this.api.log?.error?.("Mailbox boot provision failed", {
+        this.api.log?.error?.("MailKeeper boot provision failed", {
           workspace: workspace.slug,
           error: error.message,
         });
@@ -207,7 +207,7 @@ class MailboxService {
   }
 
   /**
-   * `.mailbox/rules.json` is the contract between the plugin and the
+   * `.mailkeeper/rules.json` is the contract between the plugin and the
    * workspace-side `mailbox-ops.js`: effective config + promoted rules.
    * Rewritten on every provision; the script never edits it.
    */
@@ -217,7 +217,7 @@ class MailboxService {
       : "Archive";
     const sentFolder =
       folders.find((name) => /^(\[Gmail\]\/)?Sent( Mail)?$/i.test(name)) || "Sent";
-    const target = path.join(workspace.workingDirectory, ".mailbox", "rules.json");
+    const target = path.join(workspace.workingDirectory, ".mailkeeper", "rules.json");
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(
       target,
@@ -247,11 +247,11 @@ class MailboxService {
   }
 
   /**
-   * Pick up receipts the agent queued in `.mailbox/outbox/` and record them.
+   * Pick up receipts the agent queued in `.mailkeeper/outbox/` and record them.
    * Called on heartbeat lifecycle events and status reads; no watcher needed.
    */
   async ingestOutbox(workspace) {
-    const dir = path.join(workspace.workingDirectory, ".mailbox", "outbox");
+    const dir = path.join(workspace.workingDirectory, ".mailkeeper", "outbox");
     if (!fs.existsSync(dir)) return { ingested: 0 };
     let ingested = 0;
     for (const file of fs.readdirSync(dir).filter((name) => name.endsWith(".json"))) {
@@ -260,7 +260,7 @@ class MailboxService {
       try {
         body = JSON.parse(fs.readFileSync(full, "utf8"));
       } catch (error) {
-        this.api.log?.warn?.("Mailbox receipt unreadable", { file, error: error.message });
+        this.api.log?.warn?.("MailKeeper receipt unreadable", { file, error: error.message });
         fs.renameSync(full, `${full}.invalid`);
         continue;
       }
@@ -269,7 +269,7 @@ class MailboxService {
         fs.unlinkSync(full);
         ingested += 1;
       } catch (error) {
-        this.api.log?.warn?.("Mailbox receipt rejected", { file, error: error.message });
+        this.api.log?.warn?.("MailKeeper receipt rejected", { file, error: error.message });
         fs.renameSync(full, `${full}.rejected`);
       }
     }
@@ -297,19 +297,19 @@ class MailboxService {
 
   async promoteRule(workspace, body, user) {
     if (!user?.id)
-      throw codedError("Authenticated human required", "MAILBOX_HUMAN_REQUIRED", 403);
+      throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const { config, errors } = this.profileConfig(workspace);
     if (errors.length)
-      throw codedError(errors.join(" "), "MAILBOX_CONFIG_NOT_READY", 409);
+      throw codedError(errors.join(" "), "MAILKEEPER_CONFIG_NOT_READY", 409);
     const rules = await this.ensureRules(workspace, config);
     const ruleId = text(body.ruleId, 120);
     const proposal = rules.proposed.find((entry) => entry.id === ruleId);
     if (!proposal)
-      throw codedError(`Unknown proposed rule ${ruleId}`, "MAILBOX_RULE_UNKNOWN", 404);
+      throw codedError(`Unknown proposed rule ${ruleId}`, "MAILKEEPER_RULE_UNKNOWN", 404);
     if (!config.promotablePasses.includes(proposal.pass)) {
       throw codedError(
         `Pass "${proposal.pass}" is not promotable at aggressiveness "${config.aggressiveness}"`,
-        "MAILBOX_RULE_NOT_PROMOTABLE",
+        "MAILKEEPER_RULE_NOT_PROMOTABLE",
         409
       );
     }
@@ -328,12 +328,12 @@ class MailboxService {
 
   async demoteRule(workspace, body, user) {
     if (!user?.id)
-      throw codedError("Authenticated human required", "MAILBOX_HUMAN_REQUIRED", 403);
+      throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const rules = await this.store.get(this.rulesKey(workspace));
     const ruleId = text(body.ruleId, 120);
     const rule = rules?.promoted?.find((entry) => entry.id === ruleId);
     if (!rule)
-      throw codedError(`Unknown promoted rule ${ruleId}`, "MAILBOX_RULE_UNKNOWN", 404);
+      throw codedError(`Unknown promoted rule ${ruleId}`, "MAILKEEPER_RULE_UNKNOWN", 404);
     rules.promoted = rules.promoted.filter((entry) => entry.id !== ruleId);
     rules.proposed.push({ ...rule, demotedAt: new Date().toISOString() });
     rules.revision += 1;
@@ -353,7 +353,7 @@ class MailboxService {
    */
   async submitRun(workspace, body) {
     const runId = text(body.runId, 80);
-    if (!runId) throw codedError("runId is required", "MAILBOX_RUN_INVALID", 400);
+    if (!runId) throw codedError("runId is required", "MAILKEEPER_RUN_INVALID", 400);
     const existing = await this.store.get(this.runKey(workspace, runId));
     if (existing) return { runId, reused: true };
 
@@ -361,7 +361,7 @@ class MailboxService {
     if (!["completed", "blocked", "failed"].includes(outcome)) {
       throw codedError(
         "outcome must be completed, blocked, or failed",
-        "MAILBOX_RUN_INVALID",
+        "MAILKEEPER_RUN_INVALID",
         400
       );
     }
@@ -412,15 +412,15 @@ class MailboxService {
 
   async undoRun(workspace, body, user) {
     if (!user?.id)
-      throw codedError("Authenticated human required", "MAILBOX_HUMAN_REQUIRED", 403);
+      throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const runId = text(body.runId, 80);
     const receipt = await this.store.get(this.runKey(workspace, runId));
-    if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILBOX_RUN_UNKNOWN", 404);
+    if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILKEEPER_RUN_UNKNOWN", 404);
     if (receipt.undoneAt)
       return { runId, reused: true, undoneAt: receipt.undoneAt };
     const { config, errors } = this.profileConfig(workspace);
     if (errors.length)
-      throw codedError(errors.join(" "), "MAILBOX_CONFIG_NOT_READY", 409);
+      throw codedError(errors.join(" "), "MAILKEEPER_CONFIG_NOT_READY", 409);
     const result = await mailbox.undoActions(config.emailAccount, receipt.actions, {
       dryRun: body.dryRun === true,
     });
@@ -478,7 +478,7 @@ class MailboxService {
 
   async admitHeartbeat(context) {
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
-    if (!workspace) throw codedError("Workspace missing", "MAILBOX_WORKSPACE_MISSING", 404);
+    if (!workspace) throw codedError("Workspace missing", "MAILKEEPER_WORKSPACE_MISSING", 404);
     const { errors } = this.profileConfig(workspace);
     if (errors.length) {
       return { admitted: false, reason: `config_invalid: ${errors.join(" ")}` };
@@ -497,7 +497,7 @@ class MailboxService {
   }
 
   async recordHeartbeatDispatch(context) {
-    this.api.log?.info?.("Mailbox maintenance dispatched", {
+    this.api.log?.info?.("MailKeeper maintenance dispatched", {
       workspace: context.workspace?.slug,
       heartbeatRunId: context.heartbeatRunId || null,
     });
@@ -530,7 +530,7 @@ class MailboxService {
           .join("\n")
       : "- (none promoted yet — this run is report-only regardless of MODE)";
     return [
-      `You are the Mailbox maintenance agent for account "${config.emailAccount}" in workspace "${workspace.slug}".`,
+      `You are the MailKeeper maintenance agent for account "${config.emailAccount}" in workspace "${workspace.slug}".`,
       `Use the workspace skill "mailbox-cleanup". Read ${config.contractPath} first; it is the human-owned policy and outranks this prompt.`,
       "",
       `MODE: ${config.mode}${config.modeCappedByCeiling ? ` (capped from ${config.requestedMode} by the global ceiling)` : ""}`,
@@ -563,4 +563,4 @@ function ruleIdFor(proposal) {
     .slice(0, 16);
 }
 
-module.exports = { MailboxService, PLUGIN_ID, taskIdentity };
+module.exports = { MailKeeperService, PLUGIN_ID, taskIdentity };
