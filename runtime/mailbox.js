@@ -18,6 +18,9 @@ const { promisify } = require("util");
 
 const execFileAsync = promisify(execFile);
 
+// realtimex-plugin-validator: allow-process-env -- Himalaya binary and TOML
+// path are host-runtime discovery (which CLI, which BizOps-managed config file),
+// not plugin configuration; kept injectable so tests never depend on the host.
 const HIMALAYA_BIN = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const BATCH = 200;
 

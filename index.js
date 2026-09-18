@@ -83,7 +83,7 @@ function readSkillFiles() {
 }
 
 module.exports = definePlugin({
-  id: PLUGIN_ID,
+  id: "com.realtimex.mailkeeper", // must equal PLUGIN_ID in runtime/service.js
 
   register(api) {
     const service = serviceFor(api);

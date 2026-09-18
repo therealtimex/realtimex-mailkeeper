@@ -27,6 +27,9 @@ const { execFileSync } = require("child_process");
 
 const ROOT = process.cwd();
 const STATE = path.join(ROOT, ".mailkeeper");
+// realtimex-plugin-validator: allow-process-env -- this CLI runs in the agent's
+// terminal, not the plugin host; the Himalaya binary and TOML path are runtime
+// discovery injected by the environment, never plugin configuration.
 const HIMALAYA = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const BATCH = 200;
 
