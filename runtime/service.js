@@ -64,8 +64,11 @@ class MailKeeperService {
   // -------------------------------------------------------------------------
 
   profileConfig(workspace) {
-    // Read fresh every time: workspace saves do not reload the plugin.
-    const raw = this.api.getConfig({ workspaceSlug: workspace.slug }) || {};
+    // Read fresh every time: workspace saves do not reload the plugin. Pass the
+    // id as well as the slug: the host resolves ids directly, while slugs go
+    // through a cache that can lag a storage-user switch.
+    const raw =
+      this.api.getConfig({ workspaceId: workspace.id, workspaceSlug: workspace.slug }) || {};
     return resolveProfileConfig(raw);
   }
 
@@ -515,16 +518,23 @@ class MailKeeperService {
   // Heartbeat hooks
   // -------------------------------------------------------------------------
 
+  /**
+   * Scheduler admission. The host honours `{ skipLaunch, skipReason }`; every
+   * other returned key is merged into the launch metadata the agent sees, which
+   * is how RUN_ID reaches the maintenance prompt.
+   */
   async admitHeartbeat(context) {
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
-    if (!workspace) throw codedError("Workspace missing", "MAILKEEPER_WORKSPACE_MISSING", 404);
+    if (!workspace) {
+      return { skipLaunch: true, skipReason: "workspace missing" };
+    }
     const { errors } = this.profileConfig(workspace);
     if (errors.length) {
-      return { admitted: false, reason: `config_invalid: ${errors.join(" ")}` };
+      return { skipLaunch: true, skipReason: `config_invalid: ${errors.join(" ")}` };
     }
     const active = await this.store.get(this.activeRunKey(workspace));
     if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {
-      return { admitted: false, reason: `run ${active.runId} still in flight` };
+      return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
     }
     const runId = crypto.randomUUID();
     await this.store.set(this.activeRunKey(workspace), {
@@ -532,7 +542,7 @@ class MailKeeperService {
       heartbeatRunId: context.heartbeatRunId || null,
       startedAt: new Date().toISOString(),
     });
-    return { admitted: true, runId };
+    return { mailkeeperRunId: runId };
   }
 
   async recordHeartbeatDispatch(context) {
@@ -542,15 +552,18 @@ class MailKeeperService {
     });
   }
 
+  /**
+   * `dispatch.dispatchStatus` is the host's classification of the executor
+   * event: anything other than `running` ends the occurrence. Ingest whatever
+   * the agent queued and release the single-flight lock.
+   */
   async recordHeartbeatLifecycle(context) {
-    // A terminal exit without a receipt means the agent never called
-    // submit-run; release the single-flight lock so the next tick can run.
-    if (["stopped", "failed", "exited"].includes(String(context.event?.type || ""))) {
-      const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
-      if (!workspace) return;
-      await this.ingestOutbox(workspace); // submitRun clears the lock on success
-      await this.store.set(this.activeRunKey(workspace), null);
-    }
+    const status = String(context.dispatch?.dispatchStatus || "").toLowerCase();
+    if (!status || status === "running") return;
+    const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
+    if (!workspace) return;
+    await this.ingestOutbox(workspace); // submitRun clears the lock on success
+    await this.store.set(this.activeRunKey(workspace), null);
   }
 
   async resolveHeartbeatLaunchPolicy() {
@@ -581,7 +594,7 @@ class MailKeeperService {
       "PROMOTED RULES (the only rules you may execute unattended):",
       promoted,
       "",
-      "Procedure (run from the workspace root; RUN_ID is the runId in your launch metadata, or a fresh UUID). Repeat steps 1-4 for EVERY account listed above, passing --account <name> each time; submit once at the end:",
+      "Procedure (run from the workspace root; RUN_ID is `mailkeeperRunId` from your launch metadata, or a fresh UUID if absent). Repeat steps 1-4 for EVERY account listed above, passing --account <name> each time; submit once at the end:",
       "1. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <name> --since-last-run",
       "2. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account <name> --run-id RUN_ID   # urgency first; hits are never touched",
       `3. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply --account <name> --promoted-only --mode ${config.mode} --run-id RUN_ID`,
