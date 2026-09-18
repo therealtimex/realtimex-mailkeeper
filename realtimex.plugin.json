@@ -4,14 +4,18 @@
   "displayName": "RealTimeX MailKeeper",
   "version": "0.1.0",
   "description": "Keeps your inbox clean on a schedule: rules you promote, everything else proposed, every run reversible. Any IMAP provider via the Himalaya account configured in BizOps.",
-  "author": { "name": "RealTimeX Team" },
+  "author": {
+    "name": "RealTimeX Team"
+  },
   "license": "UNLICENSED",
   "enabledByDefault": false,
   "activationScope": "workspace",
   "supportsWorkspaceOverrides": true,
   "entrypoint": "index.js",
   "capabilities": {
-    "workspace_skill_providers": ["mailkeeper-workspace-skill"],
+    "workspace_skill_providers": [
+      "mailkeeper-workspace-skill"
+    ],
     "api_routes": [
       {
         "method": "GET",
@@ -55,16 +59,26 @@
   "configSchema": [
     {
       "key": "DEFAULT_MODE_CEILING",
-      "label": "Maximum mode any workspace may use",
+      "label": "Mode ceiling",
       "type": "select",
       "required": true,
       "default": "label-only",
-      "description": "Global ceiling. A workspace can pick a lower mode but never a higher one.",
+      "description": "Highest mode any workspace may use. Set once, globally.",
       "options": [
-        { "value": "report-only", "label": "Report only (no mailbox changes)" },
-        { "value": "label-only", "label": "Label only (move to Auto/* folders, never leave the inbox)" },
-        { "value": "archive-promoted", "label": "Archive promoted rules" }
-      ]
+        {
+          "value": "report-only",
+          "label": "Report only (no mailbox changes)"
+        },
+        {
+          "value": "label-only",
+          "label": "Label only (move to Auto/* folders, never leave the inbox)"
+        },
+        {
+          "value": "archive-promoted",
+          "label": "Archive promoted rules"
+        }
+      ],
+      "workspaceOverridable": false
     },
     {
       "key": "AUTO_FOLDER_PREFIX",
@@ -72,22 +86,27 @@
       "type": "text",
       "required": true,
       "default": "Auto",
-      "description": "Folder prefix used for audit-trail moves, e.g. Auto/Newsletters. On Gmail a folder is a label."
+      "description": "Folder prefix for audit-trail moves, e.g. Auto/Newsletters.",
+      "workspaceOverridable": false
     },
     {
       "key": "PROTECTED_DOMAINS",
       "label": "Protected sender domains",
       "type": "tag-list",
-      "default": [".gov", ".edu"],
+      "default": [
+        ".gov",
+        ".edu"
+      ],
       "workspaceOverridable": false,
-      "description": "Senders matching these suffixes are never touched by any rule, promoted or not. Merged into every workspace; cannot be overridden."
+      "description": "Sender domains no rule may ever touch. Applies to every workspace."
     },
     {
       "key": "RETENTION_DAYS",
       "label": "Run receipt retention (days)",
       "type": "number",
       "default": 90,
-      "description": "How long run receipts (and therefore undo) are kept."
+      "description": "How long run receipts (and undo) are kept.",
+      "workspaceOverridable": false
     },
     {
       "key": "EMAIL_ACCOUNT",
@@ -96,7 +115,7 @@
       "type": "text",
       "required": true,
       "default": "",
-      "description": "Himalaya account name from the BizOps email config ([accounts.<name>] in the configured TOML). Never a raw address or password."
+      "description": "Himalaya account name (the [accounts.<name>] key in the BizOps email config). Not an address."
     },
     {
       "key": "MODE",
@@ -105,11 +124,20 @@
       "type": "select",
       "required": true,
       "default": "report-only",
-      "description": "What the heartbeat may do unattended. Capped by the global ceiling.",
+      "description": "What the heartbeat may do unattended. Cannot exceed the global mode ceiling.",
       "options": [
-        { "value": "report-only", "label": "Report only" },
-        { "value": "label-only", "label": "Label only" },
-        { "value": "archive-promoted", "label": "Archive promoted rules" }
+        {
+          "value": "report-only",
+          "label": "Report only"
+        },
+        {
+          "value": "label-only",
+          "label": "Label only"
+        },
+        {
+          "value": "archive-promoted",
+          "label": "Archive promoted rules"
+        }
       ]
     },
     {
@@ -119,13 +147,28 @@
       "type": "select",
       "required": true,
       "default": "1d",
-      "description": "MailKeeper inherits timezone, active hours, and pause state from this workspace's heartbeat settings.",
+      "description": "How often the maintenance run happens. Follows this workspace's heartbeat active hours and pause state.",
       "options": [
-        { "value": "4h", "label": "Every 4 hours" },
-        { "value": "12h", "label": "Every 12 hours" },
-        { "value": "1d", "label": "Daily" },
-        { "value": "3d", "label": "Every 3 days" },
-        { "value": "7d", "label": "Weekly" }
+        {
+          "value": "4h",
+          "label": "Every 4 hours"
+        },
+        {
+          "value": "12h",
+          "label": "Every 12 hours"
+        },
+        {
+          "value": "1d",
+          "label": "Daily"
+        },
+        {
+          "value": "3d",
+          "label": "Every 3 days"
+        },
+        {
+          "value": "7d",
+          "label": "Weekly"
+        }
       ]
     },
     {
@@ -135,7 +178,7 @@
       "type": "number",
       "required": true,
       "default": 90,
-      "description": "Messages older than this are eligible for the age-based pass."
+      "description": "Messages older than this qualify for the age pass."
     },
     {
       "key": "AGGRESSIVENESS",
@@ -144,11 +187,20 @@
       "type": "select",
       "required": true,
       "default": "conservative",
-      "description": "Controls which cleanup passes may be promoted. Conservative: no-reply, calendar, sketchy TLDs. Standard: + receipts, generic outreach phrases. Aggressive: + personalized outreach, repeat senders.",
+      "description": "Which passes may be promoted. See MAILBOX.md for the pass list per level.",
       "options": [
-        { "value": "conservative", "label": "Conservative" },
-        { "value": "standard", "label": "Standard" },
-        { "value": "aggressive", "label": "Aggressive" }
+        {
+          "value": "conservative",
+          "label": "Conservative"
+        },
+        {
+          "value": "standard",
+          "label": "Standard"
+        },
+        {
+          "value": "aggressive",
+          "label": "Aggressive"
+        }
       ]
     },
     {
@@ -157,24 +209,23 @@
       "label": "VIP senders",
       "type": "tag-list",
       "default": [],
-      "description": "Addresses or domains that are never touched. Seeds MAILBOX.md; edit there afterwards."
+      "description": "Addresses or domains that are never touched. Seeds MAILBOX.md."
     },
     {
       "key": "AGENT",
       "scope": "workspace",
-      "label": "Heartbeat agent",
-      "type": "text",
+      "label": "Maintenance agent",
+      "type": "terminal-agent",
       "required": true,
-      "default": "codex",
-      "description": "Terminal agent that runs the maintenance task, e.g. codex or claude."
+      "description": "Terminal agent that runs the maintenance task."
     },
     {
       "key": "MODEL",
       "scope": "workspace",
-      "label": "Heartbeat model",
-      "type": "text",
-      "default": "",
-      "description": "Optional model override for the heartbeat agent."
+      "label": "Model",
+      "type": "terminal-agent-model",
+      "description": "Optional. Empty means the agent's default model.",
+      "agentKey": "AGENT"
     }
   ],
   "permissions": []

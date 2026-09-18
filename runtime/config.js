@@ -74,7 +74,7 @@ function resolveProfileConfig(raw = {}) {
     ageThresholdDays: Number(raw.AGE_THRESHOLD_DAYS) || 90,
     aggressiveness: text(raw.AGGRESSIVENESS, 20).toLowerCase() || "conservative",
     vipSenders: list(raw.VIP_SENDERS),
-    agent: text(raw.AGENT, 60) || "codex",
+    agent: text(raw.AGENT, 60),
     model: text(raw.MODEL, 120),
     contractPath: "MAILBOX.md",
   };
@@ -100,7 +100,7 @@ function resolveProfileConfig(raw = {}) {
   if (!(config.ageThresholdDays > 0)) {
     errors.push("Age threshold must be a positive number of days.");
   }
-  if (!config.agent) errors.push("Heartbeat agent is required.");
+  if (!config.agent) errors.push("Maintenance agent is required.");
 
   return { config, errors: [...new Set(errors)] };
 }
