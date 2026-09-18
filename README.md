@@ -48,11 +48,13 @@ skills/mailbox-cleanup/
 
 Workspace-side state lives in `<workspace>/.mailkeeper/`: `rules.json` (written by the plugin: effective config + promoted rules), `snapshot.json` (envelope cache), `runs/`, `outbox/` (receipts the plugin ingests on the next lifecycle event or status read).
 
-### Host dependency
+### Host dependencies
 
 The plugin follows the built-in Dogfood pattern: workspace-scoped activation, a managed task in the workspace `HEARTBEAT.md`, a plugin-owned thread, and clean teardown. The public `PluginAPI` does not yet expose workspace/thread/heartbeat operations, so `runtime/host.js` bridges to server internals through the `@/` shim the loader already provides for plugin entrypoints.
 
 That is a bridge, not the design. [realtimex-ai-app#1996](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/1996) proposes `api.workspaces` and `api.heartbeat` namespaces; `host.js` switches to them automatically when present and nothing else in the plugin changes. Nothing outside `host.js` may require `@/`.
+
+A second host request, [realtimex-ai-app#2001](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2001), covers the plugin config modal: schema-driven grouping, compact rows, correct required state, and `optionsRoutePath` for `select` fields so `EMAIL_ACCOUNT` can become a dropdown of Himalaya accounts.
 
 ## Development
 
