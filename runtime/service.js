@@ -182,10 +182,11 @@ class MailKeeperService {
       try {
         await this.provision(workspace);
       } catch (error) {
-        this.api.log?.error?.("MailKeeper boot provision failed", {
-          workspace: workspace.slug,
-          error: error.message,
-        });
+        // Message carries the detail: the host log line prints only the message.
+        this.api.log?.error?.(
+          `MailKeeper boot provision failed for ${workspace.slug}: ${error.message}`,
+          { workspace: workspace.slug, stack: error.stack }
+        );
       }
     }
   }

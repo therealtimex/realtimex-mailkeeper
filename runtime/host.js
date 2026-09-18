@@ -55,7 +55,10 @@ function shimBackend(api) {
   const { PluginWorkspaceConfig } = lazyHostRequire(
     "@/models/pluginWorkspaceConfig"
   );
-  const { workingDataPath } = lazyHostRequire("@/utils/files");
+  // `workingDataPath` is a getter that follows the active storage user; read it
+  // per call rather than destructuring once at load, or a storage-user switch
+  // (guest mode, worktree profiles) leaves every workspace path stale.
+  const files = lazyHostRequire("@/utils/files");
   const {
     readWorkspaceHeartbeatFile,
     writeWorkspaceHeartbeatFileCoordinated,
@@ -66,7 +69,7 @@ function shimBackend(api) {
     upsertManagedHeartbeatTask,
   } = lazyHostRequire("@/utils/heartbeat/taskBlock");
 
-  const workingDirectoryFor = (slug) => path.join(workingDataPath, slug);
+  const workingDirectoryFor = (slug) => path.join(files.workingDataPath, slug);
 
   const toPublicWorkspace = (row) =>
     row

@@ -30,7 +30,7 @@ function errorResponse(response, error) {
  * Resolve the target workspace for a route. Mirrors Dogfood: a terminal
  * session bound to a workspace may not claim a different one.
  */
-async function resolveWorkspace(service, request, { allowInactive = false } = {}) {
+async function resolveWorkspace(service, request, response, { allowInactive = false } = {}) {
   const claimed = request.body?.workspaceSlug || request.query?.workspaceSlug;
   const bound = request.terminalSession?.context?.workspaceSlug;
   if (claimed && bound && claimed !== bound) {
@@ -46,11 +46,14 @@ async function resolveWorkspace(service, request, { allowInactive = false } = {}
     );
     if (!enabled) return { error: "MailKeeper is not active for this workspace", status: 403 };
   }
-  return { workspace, user: request.user || request.session?.user || null };
+  // The host's validatedRequest middleware attaches the session user to
+  // response.locals; app-id (agent) calls carry no user, which is what
+  // "Authenticated human required" checks for.
+  return { workspace, user: response?.locals?.user || null };
 }
 
 async function withScope(service, request, response, handler, options = {}) {
-  const resolved = await resolveWorkspace(service, request, options);
+  const resolved = await resolveWorkspace(service, request, response, options);
   if (resolved.error) {
     return response.status(resolved.status).json({
       ok: false,
@@ -61,10 +64,10 @@ async function withScope(service, request, response, handler, options = {}) {
   try {
     return await handler(resolved);
   } catch (error) {
-    service.api.log?.error?.("MailKeeper route failed", {
-      code: error?.code || null,
-      error: error.message,
-    });
+    service.api.log?.error?.(
+      `MailKeeper route failed: ${error.message}`,
+      { code: error?.code || null }
+    );
     return errorResponse(response, error);
   }
 }
