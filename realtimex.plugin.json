@@ -1,0 +1,181 @@
+{
+  "id": "com.realtimex.mailbox",
+  "name": "realtimex-mailbox",
+  "displayName": "RealTimeX Mailbox",
+  "version": "0.1.0",
+  "description": "Heartbeat-driven mailbox hygiene: cleanup, rules, retention. Works with any IMAP provider through the Himalaya account configured in BizOps.",
+  "author": { "name": "RealTimeX Team" },
+  "license": "UNLICENSED",
+  "enabledByDefault": false,
+  "activationScope": "workspace",
+  "supportsWorkspaceOverrides": true,
+  "entrypoint": "index.js",
+  "capabilities": {
+    "workspace_skill_providers": ["mailbox-workspace-skill"],
+    "api_routes": [
+      {
+        "method": "GET",
+        "path": "/status",
+        "auth": "internalOrAppId",
+        "description": "Read a workspace Mailbox profile, readiness state, promoted rules, and last run summary."
+      },
+      {
+        "method": "POST",
+        "path": "/runs",
+        "auth": "internalOrAppId",
+        "availableWhenInactive": true,
+        "description": "Record a finite cleanup run receipt (actions taken, proposals, urgent items), including after workspace deactivation."
+      },
+      {
+        "method": "POST",
+        "path": "/rules/promote",
+        "auth": "internalOrAppId",
+        "description": "Promote a proposed rule so the heartbeat may execute it unattended. Human-only."
+      },
+      {
+        "method": "POST",
+        "path": "/rules/demote",
+        "auth": "internalOrAppId",
+        "description": "Demote a promoted rule back to proposal. Human-only."
+      },
+      {
+        "method": "POST",
+        "path": "/undo",
+        "auth": "internalOrAppId",
+        "description": "Reverse every action recorded in one run receipt by UID."
+      },
+      {
+        "method": "POST",
+        "path": "/repair",
+        "auth": "internalOrAppId",
+        "description": "Explicitly re-provision the profile-owned thread, contract file, and managed heartbeat task."
+      }
+    ]
+  },
+  "configSchema": [
+    {
+      "key": "DEFAULT_MODE_CEILING",
+      "label": "Maximum mode any workspace may use",
+      "type": "select",
+      "required": true,
+      "default": "label-only",
+      "description": "Global ceiling. A workspace can pick a lower mode but never a higher one.",
+      "options": [
+        { "value": "report-only", "label": "Report only (no mailbox changes)" },
+        { "value": "label-only", "label": "Label only (move to Auto/* folders, never leave the inbox)" },
+        { "value": "archive-promoted", "label": "Archive promoted rules" }
+      ]
+    },
+    {
+      "key": "AUTO_FOLDER_PREFIX",
+      "label": "Auto folder prefix",
+      "type": "text",
+      "required": true,
+      "default": "Auto",
+      "description": "Folder prefix used for audit-trail moves, e.g. Auto/Newsletters. On Gmail a folder is a label."
+    },
+    {
+      "key": "PROTECTED_DOMAINS",
+      "label": "Protected sender domains",
+      "type": "tag-list",
+      "default": [".gov", ".edu"],
+      "workspaceOverridable": false,
+      "description": "Senders matching these suffixes are never touched by any rule, promoted or not. Merged into every workspace; cannot be overridden."
+    },
+    {
+      "key": "RETENTION_DAYS",
+      "label": "Run receipt retention (days)",
+      "type": "number",
+      "default": 90,
+      "description": "How long run receipts (and therefore undo) are kept."
+    },
+    {
+      "key": "EMAIL_ACCOUNT",
+      "scope": "workspace",
+      "label": "Email account",
+      "type": "text",
+      "required": true,
+      "default": "",
+      "description": "Himalaya account name from the BizOps email config ([accounts.<name>] in the configured TOML). Never a raw address or password."
+    },
+    {
+      "key": "MODE",
+      "scope": "workspace",
+      "label": "Mode",
+      "type": "select",
+      "required": true,
+      "default": "report-only",
+      "description": "What the heartbeat may do unattended. Capped by the global ceiling.",
+      "options": [
+        { "value": "report-only", "label": "Report only" },
+        { "value": "label-only", "label": "Label only" },
+        { "value": "archive-promoted", "label": "Archive promoted rules" }
+      ]
+    },
+    {
+      "key": "CADENCE",
+      "scope": "workspace",
+      "label": "Heartbeat cadence",
+      "type": "select",
+      "required": true,
+      "default": "1d",
+      "description": "Mailbox inherits timezone, active hours, and pause state from this workspace's heartbeat settings.",
+      "options": [
+        { "value": "4h", "label": "Every 4 hours" },
+        { "value": "12h", "label": "Every 12 hours" },
+        { "value": "1d", "label": "Daily" },
+        { "value": "3d", "label": "Every 3 days" },
+        { "value": "7d", "label": "Weekly" }
+      ]
+    },
+    {
+      "key": "AGE_THRESHOLD_DAYS",
+      "scope": "workspace",
+      "label": "Age threshold (days)",
+      "type": "number",
+      "required": true,
+      "default": 90,
+      "description": "Messages older than this are eligible for the age-based pass."
+    },
+    {
+      "key": "AGGRESSIVENESS",
+      "scope": "workspace",
+      "label": "Aggressiveness",
+      "type": "select",
+      "required": true,
+      "default": "conservative",
+      "description": "Controls which cleanup passes may be promoted. Conservative: no-reply, calendar, sketchy TLDs. Standard: + receipts, generic outreach phrases. Aggressive: + personalized outreach, repeat senders.",
+      "options": [
+        { "value": "conservative", "label": "Conservative" },
+        { "value": "standard", "label": "Standard" },
+        { "value": "aggressive", "label": "Aggressive" }
+      ]
+    },
+    {
+      "key": "VIP_SENDERS",
+      "scope": "workspace",
+      "label": "VIP senders",
+      "type": "tag-list",
+      "default": [],
+      "description": "Addresses or domains that are never touched. Seeds MAILBOX.md; edit there afterwards."
+    },
+    {
+      "key": "AGENT",
+      "scope": "workspace",
+      "label": "Heartbeat agent",
+      "type": "text",
+      "required": true,
+      "default": "codex",
+      "description": "Terminal agent that runs the maintenance task, e.g. codex or claude."
+    },
+    {
+      "key": "MODEL",
+      "scope": "workspace",
+      "label": "Heartbeat model",
+      "type": "text",
+      "default": "",
+      "description": "Optional model override for the heartbeat agent."
+    }
+  ],
+  "permissions": []
+}

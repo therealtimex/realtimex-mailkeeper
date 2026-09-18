@@ -1,0 +1,20 @@
+{
+  "name": "realtimex-mailbox",
+  "version": "0.1.0",
+  "description": "Heartbeat-driven mailbox hygiene plugin for RealTimeX: cleanup, rules, retention. Any IMAP provider via Himalaya.",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test tests/*.test.js",
+    "build:plugin": "node ./scripts/build-plugin-release.mjs",
+    "lint:manifest": "node -e \"JSON.parse(require('fs').readFileSync('realtimex.plugin.json','utf8')); console.log('manifest ok')\""
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/therealtimex/realtimex-mailbox.git"
+  }
+}
