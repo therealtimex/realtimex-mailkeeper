@@ -9,14 +9,17 @@
  * terminal, so it cannot require the plugin runtime.
  *
  *   snapshot  --account <name> [--since-last-run] [--folder INBOX]
- *   triage    --account <name>
+ *   triage    --account <name> [--run-id <id>]
  *   preview   --account <name> --pass <pass>
  *   apply     --account <name> (--pass <pass> | --promoted-only) --run-id <id> [--mode <mode>] [--dry-run]
  *   propose   --account <name> --run-id <id>
  *   submit    --run-id <id> --outcome <completed|blocked|failed> [--summary "..."]
- *   undo      --account <name> --run-id <id> [--dry-run]
+ *   undo      --run-id <id> [--account <name>] [--dry-run]
  *
- * State: <workspace>/.mailkeeper/{rules.json, snapshot.json, runs/, outbox/}
+ * A workspace may keep several accounts; every command except submit/undo is
+ * per account, and receipts tag each action with its account.
+ *
+ * State: <workspace>/.mailkeeper/{rules.json, snapshot-<account>.json, runs/, outbox/}
  * rules.json is written by the plugin on every provision and carries the
  * effective config plus the promoted rule set. Never edit it by hand.
  */
@@ -198,14 +201,28 @@ function loadRules() {
   return rules;
 }
 
-function loadSnapshot() {
-  const snapshot = readJson(path.join(STATE, "snapshot.json"));
-  if (!snapshot?.envelopes) fail("no snapshot — run `mailbox-ops.js snapshot` first");
+function snapshotFile(account) {
+  return path.join(STATE, `snapshot-${account}.json`);
+}
+
+function loadSnapshot(account) {
+  if (!account) fail("--account required");
+  const snapshot = readJson(snapshotFile(account));
+  if (!snapshot?.envelopes) fail(`no snapshot for ${account} — run \`mailbox-ops.js snapshot --account ${account}\` first`);
   return snapshot;
+}
+
+function accountConfig(rules, account) {
+  const known = rules.config.emailAccounts || [];
+  if (known.length && !known.includes(account)) {
+    fail(`account "${account}" is not configured for this workspace (configured: ${known.join(", ")})`);
+  }
+  return rules.config.accounts?.[account] || { archiveFolder: "Archive", sentFolder: "Sent" };
 }
 
 function buildContext(rules, snapshot) {
   const config = rules.config;
+  const account = accountConfig(rules, snapshot.account);
   const identity = readJson(path.join(STATE, "identity.json"), null);
   const senderCounts = new Map();
   for (const e of snapshot.envelopes) senderCounts.set(e.fromAddress, (senderCounts.get(e.fromAddress) || 0) + 1);
@@ -217,7 +234,7 @@ function buildContext(rules, snapshot) {
     vip.some((v) => e.fromAddress === v || e.fromDomain === v || e.fromDomain.endsWith(`.${v}`) || e.fromAddress.endsWith(v)) ||
     protectedDomains.some((d) => e.fromDomain === d.replace(/^\./, "") || e.fromDomain.endsWith(d)) ||
     e.flags.includes("Flagged");
-  return { config, identity, senderCounts, repliedTo, knownDomains, isProtected };
+  return { config, account, identity, senderCounts, repliedTo, knownDomains, isProtected };
 }
 
 function urgentHits(snapshot) {
@@ -245,7 +262,7 @@ function summarize(list) {
 function targetFolder(passName, ctx, mode) {
   const pass = PASSES[passName];
   if (pass.action === "archive") {
-    if (mode === "archive-promoted") return ctx.config.archiveFolder;
+    if (mode === "archive-promoted") return ctx.account.archiveFolder;
     return `${ctx.config.autoFolderPrefix}/Aged`; // label-only downgrade
   }
   return `${ctx.config.autoFolderPrefix}/${pass.action}`;
@@ -262,7 +279,7 @@ function move(account, uids, from, to, dryRun) {
   for (let i = 0; i < uids.length; i += BATCH) {
     const chunk = uids.slice(i, i + BATCH);
     if (!dryRun) himalaya(account, ["message", "move", "-f", from, to, ...chunk], { json: false });
-    for (const uid of chunk) actions.push({ kind: "move", uid, from, to, dryRun });
+    for (const uid of chunk) actions.push({ kind: "move", account, uid, from, to, dryRun });
   }
   return actions;
 }
@@ -287,7 +304,8 @@ const commands = {
     const account = args.account || fail("--account required");
     const folder = args.folder || "INBOX";
     const rules = loadRules();
-    const previous = readJson(path.join(STATE, "snapshot.json"));
+    const accountCfg = accountConfig(rules, account);
+    const previous = readJson(snapshotFile(account));
     let query = "";
     if (args["since-last-run"] && previous?.takenAt) {
       query = `after ${previous.takenAt.slice(0, 10)}`;
@@ -310,7 +328,7 @@ const commands = {
     // Reply signal: senders we have written to.
     let sentTo = [];
     try {
-      sentTo = listAll(account, rules.config.sentFolder || "Sent", "").map((e) => e.fromAddress);
+      sentTo = listAll(account, accountCfg.sentFolder, "").map((e) => e.fromAddress);
     } catch {
       /* no Sent folder on this server */
     }
@@ -322,25 +340,30 @@ const commands = {
       repliedTo: [...new Set(sentTo)],
       sentDomains: [...new Set(sentTo.map((a) => a.split("@").pop()).filter(Boolean))],
     };
-    writeJson(path.join(STATE, "snapshot.json"), snapshot);
-    console.log(JSON.stringify({ ok: true, envelopes: envelopes.length, takenAt: snapshot.takenAt }));
+    writeJson(snapshotFile(account), snapshot);
+    console.log(JSON.stringify({ ok: true, account, envelopes: envelopes.length, takenAt: snapshot.takenAt }));
   },
 
   triage(args) {
-    const snapshot = loadSnapshot();
+    const account = args.account || fail("--account required");
+    const snapshot = loadSnapshot(account);
     const hits = urgentHits(snapshot);
     if (args["run-id"]) {
       const run = loadRun(args["run-id"], { create: true });
-      run.urgent = hits.map((e) => ({ uid: e.uid, from: e.fromAddress, subject: e.subject, date: e.date }));
+      run.urgent = [
+        ...(run.urgent || []).filter((e) => e.account !== account),
+        ...hits.map((e) => ({ account, uid: e.uid, from: e.fromAddress, subject: e.subject, date: e.date })),
+      ];
       writeJson(runFile(run.runId), run);
     }
     console.log(JSON.stringify({ ok: true, urgent: hits.length, items: hits.slice(0, 50).map((e) => `${e.fromAddress} — ${e.subject.slice(0, 90)}`) }, null, 2));
   },
 
   preview(args) {
+    const account = args.account || fail("--account required");
     const passName = args.pass || fail("--pass required");
     const rules = loadRules();
-    const snapshot = loadSnapshot();
+    const snapshot = loadSnapshot(account);
     const ctx = buildContext(rules, snapshot);
     const list = candidates(passName, ctx, snapshot, urgentHits(snapshot));
     console.log(JSON.stringify({ ok: true, pass: passName, rule: PASSES[passName].describe(ctx), target: targetFolder(passName, ctx, rules.config.mode), ...summarize(list) }, null, 2));
@@ -350,7 +373,7 @@ const commands = {
     const account = args.account || fail("--account required");
     const runId = args["run-id"] || fail("--run-id required");
     const rules = loadRules();
-    const snapshot = loadSnapshot();
+    const snapshot = loadSnapshot(account);
     const ctx = buildContext(rules, snapshot);
     const mode = args.mode || rules.config.mode;
     const dryRun = args["dry-run"] === true || mode === "report-only";
@@ -374,22 +397,23 @@ const commands = {
       if (!dryRun && list.length) ensureFolder(account, to);
       const actions = move(account, list.map((e) => e.uid), snapshot.folder, to, dryRun).map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId }));
       run.actions.push(...actions);
-      run.passes.push({ pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
-      results.push({ pass: step.pass, to, dryRun, ...summarize(list) });
+      run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
+      results.push({ account, pass: step.pass, to, dryRun, ...summarize(list) });
     }
     if (!dryRun) {
       const moved = new Set(run.actions.filter((a) => !a.dryRun).map((a) => a.uid));
       snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
-      writeJson(path.join(STATE, "snapshot.json"), snapshot);
+      writeJson(snapshotFile(account), snapshot);
     }
     writeJson(runFile(runId), run);
-    console.log(JSON.stringify({ ok: true, runId, mode, dryRun, results }, null, 2));
+    console.log(JSON.stringify({ ok: true, runId, account, mode, dryRun, results }, null, 2));
   },
 
   propose(args) {
+    const account = args.account || fail("--account required");
     const runId = args["run-id"] || fail("--run-id required");
     const rules = loadRules();
-    const snapshot = loadSnapshot();
+    const snapshot = loadSnapshot(account);
     const ctx = buildContext(rules, snapshot);
     const urgent = urgentHits(snapshot);
     const promotedPasses = new Set((rules.promoted || []).map((r) => r.pass));
@@ -400,15 +424,16 @@ const commands = {
       const list = candidates(passName, ctx, snapshot, urgent);
       if (list.length < 5) continue; // not worth a rule
       proposals.push({
+        account,
         pass: passName,
         query: PASSES[passName].describe(ctx),
         action: `move → ${targetFolder(passName, ctx, rules.config.mode)}`,
         ...summarize(list),
       });
     }
-    run.proposals = proposals;
+    run.proposals = [...(run.proposals || []).filter((p) => p.account !== account), ...proposals];
     writeJson(runFile(runId), run);
-    console.log(JSON.stringify({ ok: true, runId, proposals: proposals.length, passes: proposals.map((p) => `${p.pass}: ${p.count}`) }, null, 2));
+    console.log(JSON.stringify({ ok: true, runId, account, proposals: proposals.length, passes: proposals.map((p) => `${p.pass}: ${p.count}`) }, null, 2));
   },
 
   submit(args) {
@@ -435,25 +460,27 @@ const commands = {
   },
 
   undo(args) {
-    const account = args.account || fail("--account required");
     const runId = args["run-id"] || fail("--run-id required");
     const dryRun = args["dry-run"] === true;
+    const only = args.account || null;
     const run = loadRun(runId);
     if (run.undoneAt) fail(`run ${runId} already undone at ${run.undoneAt}`);
     const groups = new Map();
     for (const a of run.actions) {
       if (a.kind !== "move" || a.dryRun) continue;
-      const key = `${a.to}→${a.from}`;
-      if (!groups.has(key)) groups.set(key, { from: a.to, to: a.from, uids: [] });
+      const acct = a.account || only || fail("receipt action has no account; pass --account");
+      if (only && acct !== only) continue;
+      const key = `${acct}|${a.to}→${a.from}`;
+      if (!groups.has(key)) groups.set(key, { account: acct, from: a.to, to: a.from, uids: [] });
       groups.get(key).uids.push(a.uid);
     }
     let reversed = 0;
     const skipped = [];
     for (const g of groups.values()) {
       try {
-        reversed += move(account, g.uids, g.from, g.to, dryRun).length;
+        reversed += move(g.account, g.uids, g.from, g.to, dryRun).length;
       } catch (error) {
-        skipped.push({ from: g.from, to: g.to, count: g.uids.length, error: String(error.message).split("\n")[0] });
+        skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length, error: String(error.message).split("\n")[0] });
       }
     }
     if (!dryRun) writeJson(runFile(runId), { ...run, undoneAt: new Date().toISOString() });

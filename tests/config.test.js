@@ -10,7 +10,7 @@ const valid = {
   AUTO_FOLDER_PREFIX: "Auto",
   PROTECTED_DOMAINS: [".gov"],
   RETENTION_DAYS: 90,
-  EMAIL_ACCOUNT: "work",
+  EMAIL_ACCOUNTS: ["work"],
   MODE: "report-only",
   CADENCE: "1d",
   AGE_THRESHOLD_DAYS: 90,
@@ -34,14 +34,19 @@ test("workspace mode is capped by the global ceiling", () => {
   assert.equal(config.modeCappedByCeiling, true);
 });
 
-test("email account must be a Himalaya account name, not an address", () => {
-  const { errors } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNT: "me@example.com" });
-  assert.ok(errors.some((e) => /account name/.test(e)));
+test("email accounts must be Himalaya account names, not addresses", () => {
+  const { errors } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["work", "me@example.com"] });
+  assert.ok(errors.some((e) => /"me@example.com" must be a Himalaya account name/.test(e)));
 });
 
-test("missing account is an error", () => {
-  const { errors } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNT: "" });
-  assert.ok(errors.includes("Email account is required."));
+test("at least one account is required and duplicates collapse", () => {
+  assert.ok(
+    resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: [] }).errors.includes(
+      "At least one email account is required."
+    )
+  );
+  const { config } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["a", "a", "b"] });
+  assert.deepEqual(config.emailAccounts, ["a", "b"]);
 });
 
 test("empty cadence falls back to the daily default", () => {

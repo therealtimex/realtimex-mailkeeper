@@ -24,6 +24,13 @@
         "description": "Read a workspace MailKeeper profile, readiness state, promoted rules, and last run summary."
       },
       {
+        "method": "GET",
+        "path": "/accounts",
+        "auth": "internalOrAppId",
+        "availableWhenInactive": true,
+        "description": "List Himalaya accounts from the configured email config as select options for EMAIL_ACCOUNTS. Never returns hosts or secrets."
+      },
+      {
         "method": "POST",
         "path": "/runs",
         "auth": "internalOrAppId",
@@ -109,13 +116,14 @@
       "workspaceOverridable": false
     },
     {
-      "key": "EMAIL_ACCOUNT",
+      "key": "EMAIL_ACCOUNTS",
       "scope": "workspace",
-      "label": "Email account",
-      "type": "text",
-      "required": true,
-      "default": "",
-      "description": "Himalaya account name (the [accounts.<name>] key in the BizOps email config). Not an address."
+      "label": "Email accounts",
+      "type": "multi-select",
+      "default": [],
+      "description": "Accounts this workspace keeps clean. Sourced from the BizOps Himalaya config; each gets its own snapshot and Auto/* folders.",
+      "optionsRoutePath": "/accounts",
+      "required": true
     },
     {
       "key": "MODE",

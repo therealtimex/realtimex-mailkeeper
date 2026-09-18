@@ -14,9 +14,9 @@ Read `MAILBOX.md` in the workspace root before anything else. It is the human-ow
 
 ## Sources of truth
 
-- Account name and mode come from the plugin (workspace settings) — never guess a host, address, or folder.
+- Account names and mode come from the plugin (workspace settings) — never guess a host, address, or folder. A workspace may keep several accounts: run every per-account step once per account, then submit one receipt.
 - Himalaya config: `HIMALAYA_CONFIG` if set, otherwise the BizOps-configured TOML (`realtimex-bizops` skill explains how to resolve it). All commands take `-a <account>`.
-- Local state lives in `.mailkeeper/` in the workspace root: `snapshot.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
+- Local state lives in `.mailkeeper/` in the workspace root: `rules.json` (written by the plugin: effective config, per-account folders, promoted rules), `snapshot-<account>.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
 - `scripts/mailbox-ops.js` is the only way to touch the mailbox from this skill. Do not hand-assemble `himalaya message move` commands.
 
 ## Safety rules (non-negotiable)
@@ -50,7 +50,7 @@ Pulls envelopes (uid, date, from, subject, flags) into `.mailkeeper/snapshot.jso
 ### 3. Urgency triage — always first
 
 ```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account <name>
+node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account <name> --run-id <id>
 ```
 
 Surfaces overdue / suspension / collections / legal / `.gov` hits. These go in the receipt under `urgent` and are excluded from every later pass.
@@ -94,10 +94,10 @@ Writes `.mailkeeper/outbox/<runId>.json` with `actions`, `proposals`, `urgent`, 
 ### 7. Reversal
 
 ```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js undo --account <name> --run-id <id> [--dry-run]
+node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js undo --run-id <id> [--account <name>] [--dry-run]
 ```
 
-Moves every UID in the receipt back to where it came from. Or use the plugin's `POST /undo` from the status page.
+Moves every UID in the receipt back to where it came from, across every account the run touched (or just one with `--account`). Or use the plugin's `POST /undo` from the status page.
 
 ## Reporting
 

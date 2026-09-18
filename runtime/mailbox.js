@@ -43,6 +43,29 @@ async function himalaya(account, args, { timeoutMs = 120_000 } = {}) {
 }
 
 /**
+ * Accounts declared in the Himalaya TOML. Names only — never hosts, addresses
+ * or secrets — which is exactly what the EMAIL_ACCOUNTS picker needs.
+ */
+async function listAccounts() {
+  const { stdout } = await execFileAsync(
+    HIMALAYA_BIN,
+    [
+      "account", "list", "-o", "json",
+      ...(process.env.HIMALAYA_CONFIG ? ["-c", process.env.HIMALAYA_CONFIG] : []),
+    ],
+    { timeout: 30_000, maxBuffer: 1024 * 1024 }
+  );
+  const rows = stdout.trim() ? JSON.parse(stdout) : [];
+  return (Array.isArray(rows) ? rows : [])
+    .map((row) => ({
+      name: String(row.name || ""),
+      backend: String(row.backend || ""),
+      isDefault: row.default === true,
+    }))
+    .filter((row) => row.name);
+}
+
+/**
  * Cheap readiness probe: can we list folders for this account?
  */
 async function checkAccount(account) {
@@ -168,6 +191,7 @@ async function ensureFolder(account, name) {
 }
 
 module.exports = {
+  listAccounts,
   checkAccount,
   listEnvelopes,
   move,

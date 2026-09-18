@@ -95,33 +95,39 @@ class MailKeeperService {
       return { state: "config_invalid", errors };
     }
 
-    const readiness = await mailbox.checkAccount(config.emailAccount);
-    if (!readiness.ok) {
+    const readiness = {};
+    const authErrors = [];
+    for (const account of config.emailAccounts) {
+      const probe = await mailbox.checkAccount(account);
+      readiness[account] = probe;
+      if (!probe.ok) authErrors.push(probe.error);
+    }
+    if (authErrors.length) {
       await this.host.heartbeat.removeManagedTask(workspace, {
         id: taskIdentity(workspace.id),
       });
       await this.store.set(this.profileKey(workspace), {
         ...profile,
         state: "auth_missing",
-        errors: [readiness.error],
+        errors: authErrors,
         updatedAt: new Date().toISOString(),
       });
-      return { state: "auth_missing", errors: [readiness.error] };
+      return { state: "auth_missing", errors: authErrors };
     }
 
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
-      name: `MailKeeper: ${config.emailAccount}`,
+      name: `MailKeeper: ${config.emailAccounts.join(", ")}`.slice(0, 180),
     });
 
     this.seedContract(workspace, config);
 
     const rules = await this.ensureRules(workspace, config);
-    this.syncRulesFile(workspace, config, rules, readiness.folders);
+    this.syncRulesFile(workspace, config, rules, readiness);
 
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
-      name: `MailKeeper maintenance (${config.emailAccount})`,
+      name: `MailKeeper maintenance (${config.emailAccounts.join(", ")})`.slice(0, 120),
       interval: config.cadence,
       executor: "agent",
       agent: config.agent,
@@ -139,7 +145,7 @@ class MailKeeperService {
     const next = {
       state: heartbeat.explicitlyPaused ? "paused_by_heartbeat" : "ready",
       errors: [],
-      emailAccount: config.emailAccount,
+      emailAccounts: config.emailAccounts,
       mode: config.mode,
       threadId: thread.id,
       threadSlug: thread.slug,
@@ -195,7 +201,7 @@ class MailKeeperService {
       ? config.vipSenders.map((entry) => `- ${entry}`).join("\n")
       : "- (none yet)";
     const rendered = template
-      .replaceAll("{{EMAIL_ACCOUNT}}", config.emailAccount)
+      .replaceAll("{{EMAIL_ACCOUNT}}", config.emailAccounts.join(", "))
       .replaceAll("{{MODE}}", config.mode)
       .replaceAll("{{AGE_THRESHOLD_DAYS}}", String(config.ageThresholdDays))
       .replaceAll("{{AGGRESSIVENESS}}", config.aggressiveness)
@@ -211,12 +217,19 @@ class MailKeeperService {
    * workspace-side `mailbox-ops.js`: effective config + promoted rules.
    * Rewritten on every provision; the script never edits it.
    */
-  syncRulesFile(workspace, config, rules, folders = []) {
-    const archiveFolder = folders.includes("[Gmail]/All Mail")
-      ? "[Gmail]/All Mail"
-      : "Archive";
-    const sentFolder =
-      folders.find((name) => /^(\[Gmail\]\/)?Sent( Mail)?$/i.test(name)) || "Sent";
+  syncRulesFile(workspace, config, rules, readiness = {}) {
+    const accounts = {};
+    for (const account of config.emailAccounts) {
+      const folders = readiness[account]?.folders || [];
+      accounts[account] = {
+        archiveFolder: folders.includes("[Gmail]/All Mail")
+          ? "[Gmail]/All Mail"
+          : "Archive",
+        sentFolder:
+          folders.find((name) => /^(\[Gmail\]\/)?Sent( Mail)?$/i.test(name)) ||
+          "Sent",
+      };
+    }
     const target = path.join(workspace.workingDirectory, ".mailkeeper", "rules.json");
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(
@@ -226,7 +239,8 @@ class MailKeeperService {
           revision: rules.revision,
           writtenAt: new Date().toISOString(),
           config: {
-            emailAccount: config.emailAccount,
+            emailAccounts: config.emailAccounts,
+            accounts,
             mode: config.mode,
             ageThresholdDays: config.ageThresholdDays,
             aggressiveness: config.aggressiveness,
@@ -234,8 +248,6 @@ class MailKeeperService {
             autoFolderPrefix: config.autoFolderPrefix,
             protectedDomains: config.protectedDomains,
             vipSenders: [...new Set([...config.vipSenders, ...(rules.vipSenders || [])])],
-            archiveFolder,
-            sentFolder,
           },
           promoted: rules.promoted,
         },
@@ -421,15 +433,41 @@ class MailKeeperService {
     const { config, errors } = this.profileConfig(workspace);
     if (errors.length)
       throw codedError(errors.join(" "), "MAILKEEPER_CONFIG_NOT_READY", 409);
-    const result = await mailbox.undoActions(config.emailAccount, receipt.actions, {
-      dryRun: body.dryRun === true,
-    });
+    const result = { reversed: 0, skipped: [], dryRun: body.dryRun === true };
+    for (const account of config.emailAccounts) {
+      const actions = receipt.actions.filter(
+        (action) => (action.account || config.emailAccounts[0]) === account
+      );
+      if (!actions.length) continue;
+      const partial = await mailbox.undoActions(account, actions, {
+        dryRun: result.dryRun,
+      });
+      result.reversed += partial.reversed;
+      result.skipped.push(...partial.skipped.map((entry) => ({ account, ...entry })));
+    }
     if (!body.dryRun) {
       receipt.undoneAt = new Date().toISOString();
       receipt.undoneBy = user.id;
       await this.store.set(this.runKey(workspace, runId), receipt);
     }
     return { runId, reused: false, ...result };
+  }
+
+  // -------------------------------------------------------------------------
+  // Options for the EMAIL_ACCOUNTS picker (optionsRoutePath: /accounts)
+  // -------------------------------------------------------------------------
+
+  async accountOptions() {
+    const accounts = await mailbox.listAccounts();
+    return {
+      options: accounts.map((account) => ({
+        value: account.name,
+        label: account.name,
+        description: [account.backend, account.isDefault ? "default" : ""]
+          .filter(Boolean)
+          .join(" · "),
+      })),
+    };
   }
 
   // -------------------------------------------------------------------------
@@ -447,7 +485,7 @@ class MailKeeperService {
       workspace: { id: workspace.id, slug: workspace.slug },
       profile,
       config: {
-        emailAccount: config.emailAccount,
+        emailAccounts: config.emailAccounts,
         mode: config.mode,
         modeCeiling: config.modeCeiling,
         modeCappedByCeiling: config.modeCappedByCeiling,
@@ -530,7 +568,7 @@ class MailKeeperService {
           .join("\n")
       : "- (none promoted yet — this run is report-only regardless of MODE)";
     return [
-      `You are the MailKeeper maintenance agent for account "${config.emailAccount}" in workspace "${workspace.slug}".`,
+      `You are the MailKeeper maintenance agent for ${config.emailAccounts.length === 1 ? "account" : "accounts"} ${config.emailAccounts.map((a) => `"${a}"`).join(", ")} in workspace "${workspace.slug}".`,
       `Use the workspace skill "mailbox-cleanup". Read ${config.contractPath} first; it is the human-owned policy and outranks this prompt.`,
       "",
       `MODE: ${config.mode}${config.modeCappedByCeiling ? ` (capped from ${config.requestedMode} by the global ceiling)` : ""}`,
@@ -542,11 +580,11 @@ class MailKeeperService {
       "PROMOTED RULES (the only rules you may execute unattended):",
       promoted,
       "",
-      "Procedure (run from the workspace root; RUN_ID is the runId in your launch metadata, or a fresh UUID):",
-      `1. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account ${config.emailAccount} --since-last-run`,
-      `2. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account ${config.emailAccount} --run-id RUN_ID   # urgency first; hits are never touched`,
-      `3. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply --account ${config.emailAccount} --promoted-only --mode ${config.mode} --run-id RUN_ID`,
-      `4. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js propose --account ${config.emailAccount} --run-id RUN_ID   # dry-run the rest, emit proposals`,
+      "Procedure (run from the workspace root; RUN_ID is the runId in your launch metadata, or a fresh UUID). Repeat steps 1-4 for EVERY account listed above, passing --account <name> each time; submit once at the end:",
+      "1. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <name> --since-last-run",
+      "2. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account <name> --run-id RUN_ID   # urgency first; hits are never touched",
+      `3. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply --account <name> --promoted-only --mode ${config.mode} --run-id RUN_ID`,
+      "4. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js propose --account <name> --run-id RUN_ID   # dry-run the rest, emit proposals",
       "5. node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js submit --run-id RUN_ID --outcome completed --summary \"...\"   # exactly once; exit only after ok:true",
       "",
       "Never delete or trash. Never act on VIP senders, protected domains, or urgent hits. Never invent rules; propose them.",

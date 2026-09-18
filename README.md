@@ -28,7 +28,7 @@ It is **not** a mail client. It never reads message bodies into chat, never repl
 
 **Global** (plugin settings): `DEFAULT_MODE_CEILING`, `AUTO_FOLDER_PREFIX`, `PROTECTED_DOMAINS` (not overridable), `RETENTION_DAYS`.
 
-**Per workspace** (workspace settings → plugins): `EMAIL_ACCOUNT` (Himalaya account *name*, never an address), `MODE`, `CADENCE`, `AGE_THRESHOLD_DAYS`, `AGGRESSIVENESS`, `VIP_SENDERS`, `AGENT`, `MODEL`.
+**Per workspace** (workspace settings → plugins): `EMAIL_ACCOUNTS` (one or more Himalaya accounts, picked from a dropdown the plugin serves via `GET /accounts`), `MODE`, `CADENCE`, `AGE_THRESHOLD_DAYS`, `AGGRESSIVENESS`, `VIP_SENDERS`, `AGENT`, `MODEL` (host catalog pickers).
 
 Aggressiveness controls which passes are *promotable*: conservative = no-reply, calendar, sketchy TLDs; standard adds receipts, generic outreach, age; aggressive adds personalized outreach and repeat senders.
 
@@ -46,7 +46,7 @@ skills/mailbox-cleanup/
   scripts/mailbox-ops.js        self-contained CLI the agent runs in the workspace
 ```
 
-Workspace-side state lives in `<workspace>/.mailkeeper/`: `rules.json` (written by the plugin: effective config + promoted rules), `snapshot.json` (envelope cache), `runs/`, `outbox/` (receipts the plugin ingests on the next lifecycle event or status read).
+Workspace-side state lives in `<workspace>/.mailkeeper/`: `rules.json` (written by the plugin: effective config, per-account archive/sent folders, promoted rules), `snapshot-<account>.json` (envelope cache per account), `runs/`, `outbox/` (receipts the plugin ingests on the next lifecycle event or status read).
 
 ### Host dependencies
 
@@ -54,7 +54,7 @@ The plugin follows the built-in Dogfood pattern: workspace-scoped activation, a 
 
 That is a bridge, not the design. [realtimex-ai-app#1996](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/1996) proposes `api.workspaces` and `api.heartbeat` namespaces; `host.js` switches to them automatically when present and nothing else in the plugin changes. Nothing outside `host.js` may require `@/`.
 
-A second host request, [realtimex-ai-app#2001](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2001), covers the plugin config modal: schema-driven grouping, compact rows, correct required state, and `optionsRoutePath` for `select` fields so `EMAIL_ACCOUNT` can become a dropdown of Himalaya accounts.
+The account picker depends on `optionsRoutePath` support in the host config modal — [realtimex-ai-app#2001](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2001), which also brings schema-driven grouping, compact rows, and correct required state. On an older host the field renders as a plain multi-select with no options; `GET /accounts` still answers.
 
 ## Development
 

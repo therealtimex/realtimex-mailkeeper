@@ -109,6 +109,23 @@ module.exports = definePlugin({
       routeOptions
     );
 
+    // Options for the EMAIL_ACCOUNTS picker. A workspace configures the plugin
+    // before enabling it, so this must answer while inactive; it needs no
+    // workspace scope because the account list is host-wide.
+    api.registerRoute(
+      "GET",
+      "/accounts",
+      async (request, response) => {
+        try {
+          return response.status(200).json({ ok: true, ...(await service.accountOptions()) });
+        } catch (error) {
+          service.api.log?.error?.("MailKeeper account list failed", { error: error.message });
+          return errorResponse(response, error);
+        }
+      },
+      { ...routeOptions, availableWhenInactive: true }
+    );
+
     api.registerRoute(
       "POST",
       "/runs",

@@ -66,7 +66,7 @@ function resolveProfileConfig(raw = {}) {
     protectedDomains: list(raw.PROTECTED_DOMAINS),
     retentionDays: Number(raw.RETENTION_DAYS) || 90,
     // workspace
-    emailAccount: text(raw.EMAIL_ACCOUNT, 120),
+    emailAccounts: [...new Set(list(raw.EMAIL_ACCOUNTS))],
     requestedMode,
     mode: effectiveMode,
     modeCappedByCeiling: effectiveMode !== requestedMode,
@@ -83,11 +83,13 @@ function resolveProfileConfig(raw = {}) {
     PASSES_BY_AGGRESSIVENESS.conservative;
 
   const errors = [];
-  if (!config.emailAccount) errors.push("Email account is required.");
-  if (/[@\s]/.test(config.emailAccount)) {
-    errors.push(
-      "Email account must be a Himalaya account name, not an address."
-    );
+  if (!config.emailAccounts.length) errors.push("At least one email account is required.");
+  for (const account of config.emailAccounts) {
+    if (/[@\s]/.test(account)) {
+      errors.push(
+        `Email account "${account}" must be a Himalaya account name, not an address.`
+      );
+    }
   }
   if (!MODES.includes(config.modeCeiling)) errors.push("Mode ceiling is invalid.");
   if (!MODES.includes(config.requestedMode)) errors.push("Mode is invalid.");
