@@ -451,6 +451,7 @@ class MailKeeperService {
       snapshot: body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null,
       scope: runScope,
       accountOutcomes: Array.isArray(body.accountOutcomes) ? body.accountOutcomes : [],
+      failureCode: ["AGENT_UNAVAILABLE", "AGENT_SIGN_IN_REQUIRED", "AGENT_ACCESS_DENIED", "THREAD_UNAVAILABLE", "AGENT_LAUNCH_UNKNOWN"].includes(body.failureCode) ? body.failureCode : isPreview && outcome === "blocked" ? "AGENT_LAUNCH_UNKNOWN" : null,
       // Every mutation, by UID, so /undo can reverse it exactly.
       actions: Array.isArray(body.actions) ? body.actions.slice(0, 5000) : [],
       // Things the agent found but was not allowed to act on.

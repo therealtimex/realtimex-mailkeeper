@@ -154,3 +154,57 @@ test("error classifier reads chains and omits private stderr", () => {
   assert.equal(mailbox.classifyError({ stderr: "Error: genericError\n DNS TLS timeout" }).code, "CONNECTION_FAILED");
   assert.equal(mailbox.classifyError({ code: "ENOENT" }).code, "CLI_MISSING");
 });
+
+test("blocked launch settles its original receipt and preserves verified connection evidence", async (t) => {
+  const f = fixture(t); const before = await f.ready();
+  f.api.onboarding.dispatchPreview = async () => ({ terminalDispatchAccepted: false });
+  const result = await f.service.preview(f.workspace, {});
+  assert.equal(result.accepted, false); assert.equal(result.code, "PREVIEW_DISPATCH_BLOCKED");
+  const after = await f.service.setupStatus(f.workspace);
+  assert.equal(after.state, "ready"); assert.equal(after.verifiedAt, before.verifiedAt);
+  assert.equal(after.preview.runId, result.runId); assert.equal(after.preview.outcome, "blocked");
+  assert.equal(after.preview.failureCode, "AGENT_LAUNCH_UNKNOWN"); assert.equal(f.storeData.get("ws-1-active"), null);
+  const items = await f.service.previewReceiptItems(f.workspace, after.threadSlug);
+  assert.equal(items[0].id, result.runId); assert.equal(items[0].status.code, "blocked");
+  assert.equal(items[0].details.find((entry) => entry.id === "changes").value, 0);
+  assert.deepEqual(await f.service.previewReceiptItems(f.workspace, "foreign-thread"), []);
+  await f.service.disable(f.workspace);
+  assert.equal((await f.service.previewReceiptItems(f.workspace, after.threadSlug))[0].id, result.runId);
+});
+test("known agent failures retain curated recovery and unknown transport attempts remain reserved", async (t) => {
+  const f = fixture(t); await f.ready();
+  f.api.onboarding.dispatchPreview = async () => { throw Object.assign(new Error("private raw stderr"), { code: "AGENT_UNAVAILABLE", statusCode: 409 }); };
+  const blocked = await f.service.preview(f.workspace, {});
+  assert.equal(blocked.preview.failureCode, "AGENT_UNAVAILABLE");
+  assert.equal(JSON.stringify(blocked).includes("private raw stderr"), false);
+  f.api.onboarding.dispatchPreview = async () => { throw Error("uncertain network response"); };
+  const pending = await f.service.preview(f.workspace, {});
+  assert.equal(pending.uncertain, true);
+  assert.equal((await f.service.preview(f.workspace, {})).runId, pending.runId);
+  assert.equal((await f.service.setupStatus(f.workspace)).preview.outcome, "pending");
+});
+test("partial and empty outcomes are distinct and prior preview receipts survive a new attempt", async (t) => {
+  const f = fixture(t, { EMAIL_ACCOUNTS: ["a", "b"] }); await f.ready();
+  const first = await f.service.preview(f.workspace, {});
+  await f.service.submitRun(f.workspace, { runId: first.runId, mode: "report-only", outcome: "failed", snapshot: { checked: 4 }, accountOutcomes: [{ account: "a", outcome: "completed" }, { account: "b", outcome: "failed" }] });
+  assert.equal((await f.service.setupStatus(f.workspace)).preview.outcome, "partial");
+  const second = await f.service.preview(f.workspace, {});
+  await f.service.submitRun(f.workspace, { runId: second.runId, mode: "report-only", outcome: "completed", snapshot: { checked: 0 }, accountOutcomes: [{ account: "a", outcome: "completed" }, { account: "b", outcome: "completed" }] });
+  const setup = await f.service.setupStatus(f.workspace);
+  const items = await f.service.previewReceiptItems(f.workspace, setup.threadSlug);
+  assert.equal(items[0].status.code, "empty"); assert.equal(items.find((entry) => entry.id === first.runId).status.code, "partial");
+  assert.deepEqual(setup.scope.accounts, ["a", "b"]);
+});
+
+test("expired receipts retain scope but never claim a pending scan or zero findings", async (t) => {
+  const f = fixture(t); await f.ready();
+  const { runId } = await f.service.preview(f.workspace, {});
+  await f.api.getStore().set("ws-1-active", null);
+  const setup = await f.service.setupStatus(f.workspace);
+  assert.equal(setup.preview.runId, runId); assert.equal(setup.preview.outcome, "unavailable");
+  assert.equal(setup.checklist.find((entry) => entry.id === "preview").state, "awaiting");
+  const [item] = await f.service.previewReceiptItems(f.workspace, setup.threadSlug);
+  assert.equal(item.status.code, "unavailable");
+  assert.deepEqual(item.details.filter((entry) => ["checked", "urgent", "proposed", "changes"].includes(entry.id)), []);
+  assert.equal(item.details.find((entry) => entry.id === "accounts").value, "fixture");
+});

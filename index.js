@@ -109,6 +109,9 @@ module.exports = definePlugin({
     api.registerRoute("GET", "/setup/card", (request, response) =>
       withScope(service, request, response, async ({ workspace }) => response.json({ items: [await service.setupStatus(workspace)] }),
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
+    api.registerRoute("GET", "/setup/receipts", (request, response) =>
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: await service.previewReceiptItems(workspace, request.pluginContext?.scope?.threadSlug) }),
+        { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("POST", "/setup/action", (request, response) =>
       withScope(service, request, response, async ({ workspace, user }) => {
         const action = request.pluginContext.actionId;
@@ -121,11 +124,12 @@ module.exports = definePlugin({
         }
         if (action === "preview") return response.status(202).json({ ok: true, ...(await service.preview(workspace, { request, response })) });
         if (action === "schedule") return response.status(202).json({ ok: true, ...(await service.setSchedule(workspace, request.body?.payload || {}, user)) });
-        if (action === "open") {
+        if (action === "open" || action === "result") {
           const setup = await service.setupStatus(workspace);
           const thread = setup.threadSlug && await service.host.workspaces.getThread(workspace, { slug: setup.threadSlug });
           if (!thread || thread.archivedAt) return response.status(409).json({ ok: false, code: "THREAD_UNAVAILABLE" });
-          return response.json({ ok: true, navigation: { kind: "thread", threadSlug: thread.slug, runId: setup.preview?.runId || null } });
+          if (action === "result" && !setup.preview) return response.status(404).json({ ok: false, code: "PREVIEW_RESULT_UNAVAILABLE" });
+          return response.json({ ok: true, navigation: { kind: "thread", threadSlug: thread.slug, runId: action === "result" ? setup.preview.runId : null } });
         }
         return response.status(400).json({ ok: false, code: "ACTION_UNKNOWN" });
       }), { auth: "contribution" });

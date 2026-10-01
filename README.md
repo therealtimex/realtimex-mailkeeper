@@ -34,7 +34,7 @@ Aggressiveness controls which passes are *promotable*: conservative = no-reply, 
 
 ## First use and repair
 
-Enable MailKeeper for your workspace, then choose **Set up with AI** on its plugin card. The workspace-bound editor inspects Himalaya, offers installation with ordinary command approval, and guides account selection or repair. Saving the guide does not verify an account or enable maintenance.
+Enable MailKeeper for your workspace, then choose **Set up with AI** on its plugin card. **Set up MailKeeper · [workspace]** opens the same workspace-bound editor with an observed checklist for tools, connection, settings, preparation, preview and scheduling. It inspects Himalaya, offers installation with ordinary command approval, and guides account selection or repair. Saving the guide does not verify an account or enable maintenance. Configure's Doctor marks missing live evidence as unavailable; the card separately reports the actual connection check.
 
 The account picker, checks, preview and maintenance share one Himalaya target: `HIMALAYA_CONFIG`, then BizOps `EMAIL_CONFIG_FILE`, then `~/.config/himalaya/config.toml`. Confirm before editing an environment-selected target. Existing accounts, defaults, SMTP and BizOps metadata are preserved; new scaffolds contain IMAP settings only. MailKeeper does not enable the BizOps email channel.
 
@@ -44,9 +44,11 @@ Choose **Email accounts** and an installed **Maintenance agent** in Configure. *
 
 **Preview inbox** confirms the accounts, agent and scan bound. The first preview always reports only, even when the configured mode permits archiving. It scans INBOX only, at most five pages of 200 envelopes per account, triages urgency before proposals, and records zero actual changes. Empty inboxes complete successfully; any failed account makes the receipt failed. Repeating a pending preview attaches to the same run. Restarting the helper after its process was interrupted settles the original run as failed, retains completed account progress, and queues one receipt without rescanning. Review the result before deliberately starting another preview. A stored receipt establishes completion.
 
+**View last preview** opens the matching receipt in the maintenance conversation, including the original scope, time, scan limit, outcome and confirmed counts. **Open MailKeeper** opens the conversation separately. Blocked launches retain verified connection evidence and identify known agent recovery steps or an unknown cause. Partial results and failed runs stay distinct from a successful empty inbox. A missing receipt is explicitly unavailable; retrying navigation never runs another preview.
+
 Disabling MailKeeper keeps its read-only status and retained results accessible. Setup, connection checks, previews, private credential actions and scheduling are blocked until re-enabled. Runtime undo uses the shared Himalaya target and the receipt's accounts, even if workspace account selection has changed; a changed target path requires restoring the original configuration before undo.
 
-**Scheduled maintenance** is a separate human choice. `MAINTENANCE_ENABLED` is effectively false for a new workspace. The card shows actual pause state and next run when available; it never unpauses a workspace heartbeat. Existing maintenance intent and actual cadence migrate once. Conflicting historical task/profile state asks for a human decision.
+**Scheduled maintenance** is a separate human choice. `MAINTENANCE_ENABLED` is effectively false for a new workspace. Confirmation shows the selected accounts, agent/model, effective mode, timezone and active hours with a readable cadence. The card shows the saved intent separately from scheduler registration or workspace pause and reports the next run only when confirmed; it never unpauses a workspace heartbeat. Existing maintenance intent and actual cadence migrate once. Conflicting historical task/profile state asks for a human decision.
 
 The editor uses a self-contained, workspace-scoped helper:
 

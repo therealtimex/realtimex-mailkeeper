@@ -81,14 +81,21 @@ module.exports = {
     if (errors.length && !["checking", "preparing", "disabled"].includes(state)) state = "needs_setup";
     const active = await this.store.get(this.activeRunKey(workspace));
     const preview = profile.previewRunId ? await this.store.get(this.runKey(workspace, profile.previewRunId)) : null;
+    const reservation = profile.previewRunId ? await this.store.get(`ws-${workspace.id}-preview-${profile.previewRunId}`) : null;
     const schedule = await this.host.heartbeat.getManagedTaskStatus?.(workspace, { id: `mailkeeper-maintenance-${workspace.id}` }) || { exists: false };
+    const heartbeatSettings = await this.host.heartbeat.readSettings?.(workspace) || {};
+    const previewStatus = preview ? this.runProjection(preview) : active?.kind === "onboarding-preview" ? { runId: active.runId, outcome: "pending", scope: active.scope, startedAt: active.startedAt } : profile.previewRunId ? { runId: profile.previewRunId, outcome: "unavailable", scope: reservation?.scope, startedAt: reservation?.startedAt } : null;
     return { schemaVersion: 1, state, stale, blockers: profile.blockers || [],
       missingFields: errors.length ? [!config.emailAccounts.length && "EMAIL_ACCOUNTS", !config.agent && "AGENT"].filter(Boolean) : [],
       operationId: profile.operationId || null, verifiedAt: profile.verifiedAt || null,
       accountChecks: profile.accountChecks || {}, threadSlug: profile.threadSlug || null,
-      preview: preview ? this.runProjection(preview) : active?.kind === "onboarding-preview" ? { runId: active.runId, outcome: "pending" } : null,
-      scope: { accounts: config.emailAccounts, folders: ["INBOX"], agent: config.agent, mode: "report-only", maxPages: 5, pageSize: 200 },
-      schedule: { intent: config.maintenanceEnabled, cadence: config.cadence, ...schedule },
+      workspaceName: workspace.name || workspace.slug,
+      taskName: "MailKeeper",
+      preview: previewStatus,
+      scope: { accounts: config.emailAccounts, folders: ["INBOX"], agent: config.agent, model: config.model, mode: "report-only", maxPages: 5, pageSize: 200 },
+      maintenanceMode: config.mode,
+      checklist: this.setupChecklist({ state, stale, profile, config, errors, preview: previewStatus, schedule }),
+      schedule: { intent: config.maintenanceEnabled, cadence: config.cadence, timezone: heartbeatSettings.timezone, activeHours: heartbeatSettings.activeHours, ...schedule },
       hostSupported: Boolean(target && this.host.heartbeat.getManagedTaskStatus),
       emailTarget: target ? { source: target.source, revision: target.revision } : null,
     };
@@ -130,7 +137,7 @@ module.exports = {
       }
       const runId = crypto.randomUUID();
       const profile = await this.store.get(this.profileKey(workspace));
-      const reservation = { runId, kind: "onboarding-preview", startedAt: now(), scope: setup.scope, revision: profile.revision };
+      const reservation = { runId, kind: "onboarding-preview", startedAt: now(), scope: setup.scope, threadSlug: profile.threadSlug, revision: profile.revision };
       // Preserve the immutable ceiling even after another run becomes active.
       await this.store.set(`ws-${workspace.id}-preview-${runId}`, reservation);
       const rules = JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", "rules.json"), "utf8"));
@@ -144,8 +151,8 @@ module.exports = {
         const result = await this.host.dispatchPreview({ ...context, workspace, threadSlug: profile.threadSlug, taskId: profile.taskId, runId, prompt });
         if (result?.terminalDispatchAccepted !== true) {
           if (result?.code === "TERMINAL_DISPATCH_REQUIRED" || result?.terminalDispatchAccepted === false) {
-            await this.submitRun(workspace, { runId, outcome: "blocked", mode: "report-only", actions: [], summary: "Preview could not start. Review the maintenance agent." });
-            throw fault("PREVIEW_DISPATCH_BLOCKED");
+            await this.submitRun(workspace, { runId, outcome: "blocked", mode: "report-only", actions: [], failureCode: "AGENT_LAUNCH_UNKNOWN" });
+            return { accepted: false, runId, code: "PREVIEW_DISPATCH_BLOCKED", preview: (await this.setupStatus(workspace)).preview };
           }
           return { accepted: true, uncertain: true, runId };
         }
@@ -153,18 +160,75 @@ module.exports = {
       } catch (error) {
         // An unknown transport failure may follow dispatch. Preserve identity;
         // retries attach until the original receipt arrives.
-        if (error.statusCode && error.code !== "PREVIEW_DISPATCH_BLOCKED") await this.submitRun(workspace, { runId, outcome: "blocked", mode: "report-only", actions: [] });
-        throw fault(error.statusCode ? error.code || "PREVIEW_DISPATCH_BLOCKED" : "PREVIEW_STATUS_UNCERTAIN");
+        if (error.statusCode) {
+          await this.submitRun(workspace, { runId, outcome: "blocked", mode: "report-only", actions: [], failureCode: error.code });
+          return { accepted: false, runId, code: "PREVIEW_DISPATCH_BLOCKED", preview: (await this.setupStatus(workspace)).preview };
+        }
+        return { accepted: true, uncertain: true, code: "PREVIEW_STATUS_UNCERTAIN", runId };
       }
     });
   },
 
   runProjection(receipt) {
-    return { runId: receipt.runId, outcome: receipt.outcome, finishedAt: receipt.finishedAt,
+    const partial = receipt.outcome === "failed" && receipt.accountOutcomes?.some((entry) => entry.outcome === "completed");
+    return { runId: receipt.runId, outcome: partial ? "partial" : receipt.outcome, startedAt: receipt.startedAt, finishedAt: receipt.finishedAt,
+      failureCode: receipt.failureCode || (receipt.outcome === "blocked" ? "AGENT_LAUNCH_UNKNOWN" : null),
       checked: receipt.snapshot?.checked || 0, urgent: receipt.urgent.length,
       proposed: receipt.proposals.reduce((count, entry) => count + (Number(entry.count) || 0), 0),
       actualChanges: receipt.actions.filter((action) => !action.dryRun).length,
       scope: receipt.scope || null, accountOutcomes: receipt.accountOutcomes || [],
+    };
+  },
+
+  setupChecklist({ state, stale, profile, config, errors, preview, schedule }) {
+    const codes = (profile.blockers || []).map((entry) => entry.code);
+    const checked = Object.values(profile.accountChecks || {});
+    const connected = checked.length > 0 && checked.every((entry) => entry.ok) && !stale;
+    return [
+      { id: "tools", state: codes.includes("CLI_MISSING") ? "failed" : checked.length ? "completed" : "awaiting" },
+      { id: "connection", state: state === "checking" ? "active" : connected ? "completed" : codes.some((code) => ["CREDENTIAL_MISSING", "AUTH_FAILED", "CONNECTION_FAILED"].includes(code)) ? "failed" : "awaiting" },
+      { id: "settings", state: errors.length ? "awaiting" : "completed" },
+      { id: "prepare", state: state === "preparing" ? "active" : state === "ready" ? "completed" : codes.includes("PROVISION_FAILED") ? "failed" : "awaiting" },
+      { id: "preview", state: preview?.outcome === "completed" ? "completed" : ["blocked", "failed", "partial"].includes(preview?.outcome) ? "failed" : preview?.outcome === "pending" ? "active" : "awaiting" },
+      { id: "schedule", state: config.maintenanceEnabled && schedule?.exists && schedule?.runtimeState === "configured" ? "completed" : "awaiting" },
+    ];
+  },
+
+  async previewReceiptItems(workspace, threadSlug) {
+    const setup = await this.setupStatus(workspace);
+    if (!threadSlug || threadSlug !== setup.threadSlug || !setup.preview) return [];
+    const index = await this.store.get(this.runIndexKey(workspace)) || [];
+    const runs = [setup.preview];
+    for (const { runId } of index.slice(0, 20)) {
+      if (runId === setup.preview.runId) continue;
+      const reserved = await this.store.get(`ws-${workspace.id}-preview-${runId}`);
+      if (!reserved || reserved.threadSlug && reserved.threadSlug !== threadSlug) continue;
+      const receipt = await this.store.get(this.runKey(workspace, runId));
+      if (receipt) runs.push(this.runProjection(receipt));
+    }
+    return runs.map((run) => this.previewReceiptItem(run));
+  },
+
+  previewReceiptItem(run) {
+    const outcome = run.outcome === "completed" && run.checked === 0 ? "empty" : run.outcome;
+    const labelKey = `plugin-setup.outcome-${outcome}`;
+    const detail = (id, labelKey, value, type = "text") => ({ id, labelKey: `plugin-setup.${labelKey}`, value, type });
+    const recovery = { AGENT_UNAVAILABLE: "install", AGENT_SIGN_IN_REQUIRED: "sign-in", AGENT_ACCESS_DENIED: "access" }[run.failureCode] || "unknown";
+    return { id: run.runId, anchor: { timestamp: Date.parse(run.finishedAt || run.startedAt) || 0 },
+      status: { code: outcome, labelKey, summaryKey: labelKey, values: { agent: run.scope?.agent || "" }, tone: outcome === "completed" || outcome === "empty" ? "success" : outcome === "pending" ? "progress" : "warning" },
+      details: [
+        detail("time", "result-time", Date.parse(run.finishedAt || run.startedAt), "datetime"),
+        detail("accounts", "result-accounts", (run.scope?.accounts || []).join(", ")),
+        detail("folders", "result-folders", (run.scope?.folders || ["INBOX"]).join(", ")),
+        detail("limit", "result-limit", (run.scope?.maxPages || 5) * (run.scope?.pageSize || 200)),
+        detail("agent", "result-agent", run.scope?.agent || "—"),
+        { id: "model", labelKey: "chat_window.terminal_session_model_label", value: run.scope?.model || "—", type: "text" },
+        detail("mode", "effective-mode", "report-only"),
+        ...(!["pending", "unavailable"].includes(outcome) ? [detail("checked", "result-checked", run.checked ?? 0), detail("urgent", "result-urgent", run.urgent ?? 0),
+          detail("proposed", "result-proposed", run.proposed ?? 0), detail("changes", "result-changes", run.actualChanges ?? 0)] : []),
+        ...(["blocked", "failed", "partial", "pending"].includes(run.outcome) ? [detail("recovery", "result-recovery", run.outcome === "blocked" ? run.failureCode === "THREAD_UNAVAILABLE" ? "plugin-setup.thread-recovery" : `plugin-setup.agent-${recovery}` : run.outcome === "pending" ? "plugin-setup.preview-pending" : "plugin-setup.preview-failed", "translation")] : []),
+        ...(run.accountOutcomes || []).flatMap((entry, i) => [detail(`account-${i}`, "result-accounts", entry.account), detail(`outcome-${i}`, "result-outcome", `plugin-setup.outcome-${entry.outcome === "completed" ? "completed" : "failed"}`, "translation")]),
+      ], actions: [],
     };
   },
 };
