@@ -128,6 +128,16 @@ test("preview does not attach to active scheduled maintenance", async (t) => {
   const f = fixture(t); await f.ready(); await f.api.getStore().set("ws-1-active", { runId: "maintenance", kind: "maintenance" });
   await assert.rejects(f.service.preview(f.workspace, {}), { code: "RUN_BUSY" });
 });
+test("ingesting an interrupted preview receipt releases its reservation for a deliberate retry", async (t) => {
+  const f = fixture(t); await f.ready(); const { runId } = await f.service.preview(f.workspace, {});
+  const outbox = path.join(f.workspace.workingDirectory, ".mailkeeper", "outbox"); fs.mkdirSync(outbox);
+  fs.writeFileSync(path.join(outbox, `${runId}.json`), JSON.stringify({ runId, kind: "onboarding-preview", outcome: "failed", mode: "report-only",
+    actions: [], proposals: [], urgent: [], accountOutcomes: [{ account: "fixture", outcome: "failed", code: "PREVIEW_INTERRUPTED" }] }));
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.preview.runId, runId); assert.equal(status.preview.outcome, "failed");
+  assert.equal(f.storeData.get("ws-1-active"), null);
+  const retry = await f.service.preview(f.workspace, {}); assert.notEqual(retry.runId, runId);
+});
 test("setup config refuses global settings and schedule from AI", async (t) => {
   const f = fixture(t);
   await assert.rejects(f.service.configureSetup(f.workspace, { DEFAULT_MODE_CEILING: "archive-promoted" }), { code: "SETUP_CONFIG_INVALID" });

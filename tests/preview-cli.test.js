@@ -22,11 +22,14 @@ if(args[0]!=='envelope'||args[1]!=='list')process.exit(90);
 const account=args[args.indexOf('-a')+1]; if(account===${JSON.stringify(failAccount)})process.exit(91);
 const page=Number(args[args.indexOf('-p')+1]);
 const rows=${full ? "200" : "0"}; console.log(JSON.stringify(Array.from({length:rows},(_,i)=>({id:page*200+i,from:{addr:'noreply@example.test'},subject:i===0?'Final notice':'Notification',date:'2020-01-01',flags:[]}))));`, { mode: 0o700 });
-  return { root, state, rules, execute(runId) {
+  return { root, state, rules, invoke(runId) {
     const result = spawnSync(process.execPath, [cli, "onboarding-preview", "--run-id", runId], { cwd: root, env: { ...process.env, MAILKEEPER_HIMALAYA_BIN: binary, HIMALAYA_CONFIG: "/wrong/environment.toml" }, encoding: "utf8" });
     assert.equal(result.status, 0, result.stderr);
+    return result;
+  }, execute(runId) {
+    const result = this.invoke(runId);
     return { result, receipt: JSON.parse(fs.readFileSync(path.join(state, "outbox", `${runId}.json`))),
-      commands: fs.readFileSync(path.join(root, "commands.jsonl"), "utf8").trim().split("\n").map(JSON.parse) };
+      commands: fs.existsSync(path.join(root, "commands.jsonl")) ? fs.readFileSync(path.join(root, "commands.jsonl"), "utf8").trim().split("\n").map(JSON.parse) : [] };
   } };
 }
 
@@ -70,4 +73,43 @@ test("a durable preview reservation preserves its accounts and shared target aft
   assert.deepEqual(receipt.scope.accounts, ["a"]);
   assert.equal(commands[0][commands[0].indexOf("-a") + 1], "a");
   assert.equal(commands[0][commands[0].indexOf("-c") + 1], "/fixture/shared.toml");
+});
+
+test("restart settles interrupted account progress once under the original preview identity", (t) => {
+  const f = fixture(t, ["a", "b"]);
+  fs.mkdirSync(path.join(f.state, "runs"));
+  const runPath = path.join(f.state, "runs/interrupted.json");
+  fs.writeFileSync(runPath, JSON.stringify({ runId: "interrupted", kind: "onboarding-preview", mode: "report-only",
+    scope: { accounts: ["a", "b"], folders: ["INBOX"], maxPages: 5, pageSize: 200 }, startedAt: "2026-01-01T00:00:00Z",
+    snapshot: { checked: 2 }, accountOutcomes: [{ account: "a", outcome: "completed", checked: 2 }],
+    actions: [], proposals: [{ account: "a", count: 1 }], urgent: [{ account: "a", uid: "2" }], passes: [] }));
+  const { receipt, commands } = f.execute("interrupted");
+  assert.equal(receipt.runId, "interrupted"); assert.equal(receipt.outcome, "failed");
+  assert.equal(receipt.snapshot.checked, 2); assert.equal(receipt.proposals.length, 1); assert.equal(receipt.urgent.length, 1);
+  assert.deepEqual(receipt.accountOutcomes[1], { account: "b", outcome: "failed", code: "PREVIEW_INTERRUPTED" });
+  assert.deepEqual(commands, [], "interrupted account must not be scanned again");
+  const originalReceipt = fs.readFileSync(path.join(f.state, "outbox/interrupted.json"), "utf8");
+  f.execute("interrupted");
+  assert.equal(fs.readFileSync(path.join(f.state, "outbox/interrupted.json"), "utf8"), originalReceipt);
+  assert.deepEqual(fs.readdirSync(path.join(f.state, "outbox")), ["interrupted.json"]);
+});
+
+test("restart after reservation file creation produces a failed receipt for every account", (t) => {
+  const f = fixture(t, ["a"]);
+  fs.mkdirSync(path.join(f.state, "runs"));
+  fs.writeFileSync(path.join(f.state, "runs/initial.json"), JSON.stringify({ runId: "initial", kind: "onboarding-preview", mode: "report-only",
+    scope: { accounts: ["a"] }, accountOutcomes: [], snapshot: { checked: 0 }, actions: [], proposals: [], urgent: [] }));
+  const { receipt } = f.execute("initial");
+  assert.equal(receipt.outcome, "failed"); assert.equal(receipt.accountOutcomes[0].code, "PREVIEW_INTERRUPTED");
+});
+
+test("duplicate preview attaches while the original process is still alive", (t) => {
+  const f = fixture(t, ["a"]);
+  fs.mkdirSync(path.join(f.state, "runs"));
+  fs.writeFileSync(path.join(f.state, "runs/running.json"), JSON.stringify({ runId: "running", kind: "onboarding-preview", mode: "report-only",
+    runnerPid: process.pid, scope: { accounts: ["a"] }, actions: [], proposals: [], urgent: [] }));
+  const result = JSON.parse(f.invoke("running").stdout);
+  assert.deepEqual(result, { ok: true, runId: "running", reused: true, outcome: "pending" });
+  assert.equal(fs.existsSync(path.join(f.state, "outbox")), false);
+  assert.equal(fs.existsSync(path.join(f.root, "commands.jsonl")), false);
 });

@@ -435,6 +435,12 @@ class MailKeeperService {
         400
       );
     }
+    const reservedScope = await this.store.get(`ws-${workspace.id}-scope-${runId}`);
+    const target = !isPreview && !reservedScope && await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
+    const runScope = isPreview ? previewScope : reservedScope || (active?.runId === runId && active.scope) || {
+      accounts: this.profileConfig(workspace).config.emailAccounts,
+      configPath: target?.configPath || null,
+    };
     const receipt = {
       runId,
       workspaceId: workspace.id,
@@ -443,7 +449,7 @@ class MailKeeperService {
       startedAt: text(body.startedAt, 40),
       finishedAt: new Date().toISOString(),
       snapshot: body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null,
-      scope: isPreview ? previewScope : null,
+      scope: runScope,
       accountOutcomes: Array.isArray(body.accountOutcomes) ? body.accountOutcomes : [],
       // Every mutation, by UID, so /undo can reverse it exactly.
       actions: Array.isArray(body.actions) ? body.actions.slice(0, 5000) : [],
@@ -491,17 +497,27 @@ class MailKeeperService {
     if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILKEEPER_RUN_UNKNOWN", 404);
     if (receipt.undoneAt)
       return { runId, reused: true, undoneAt: receipt.undoneAt };
-    const { config, errors } = this.profileConfig(workspace);
-    if (errors.length)
-      throw codedError(errors.join(" "), "MAILKEEPER_CONFIG_NOT_READY", 409);
+    const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
+    if (!target?.configPath) throw codedError("Upgrade RealTimeX to undo against the shared email target", "HOST_UNSUPPORTED", 409);
+    if (receipt.scope?.configPath && receipt.scope.configPath !== target.configPath) {
+      throw codedError("Restore the run's email configuration before undoing it", "MAILKEEPER_TARGET_CHANGED", 409);
+    }
+    // Account selection may have changed since the run. Reverse the accounts
+    // actually recorded, and only infer an untagged legacy action when unique.
+    const scopeAccounts = receipt.scope?.accounts || [];
+    const actionsByAccount = new Map();
+    for (const action of receipt.actions) {
+      if (action.kind !== "move" || action.dryRun) continue;
+      const account = action.account || (scopeAccounts.length === 1 && scopeAccounts[0]);
+      if (!account) throw codedError("The receipt does not identify this action's account", "MAILKEEPER_UNDO_SCOPE_UNKNOWN", 409);
+      if (!actionsByAccount.has(account)) actionsByAccount.set(account, []);
+      actionsByAccount.get(account).push(action);
+    }
     const result = { reversed: 0, skipped: [], dryRun: body.dryRun === true };
-    for (const account of config.emailAccounts) {
-      const actions = receipt.actions.filter(
-        (action) => (action.account || config.emailAccounts[0]) === account
-      );
-      if (!actions.length) continue;
+    for (const [account, actions] of actionsByAccount) {
       const partial = await mailbox.undoActions(account, actions, {
         dryRun: result.dryRun,
+        configPath: target.configPath,
       });
       result.reversed += partial.reversed;
       result.skipped.push(...partial.skipped.map((entry) => ({ account, ...entry })));
@@ -600,10 +616,13 @@ class MailKeeperService {
       return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
     }
     const runId = crypto.randomUUID();
+    const scope = { accounts: config.emailAccounts, configPath: (await this.api.email.getHimalayaTarget({ workspaceId: workspace.id })).configPath };
+    await this.store.set(`ws-${workspace.id}-scope-${runId}`, scope);
     await this.store.set(this.activeRunKey(workspace), {
       runId,
       heartbeatRunId: context.heartbeatRunId || null,
       startedAt: new Date().toISOString(),
+      scope,
     });
     return { mailkeeperRunId: runId };
     });

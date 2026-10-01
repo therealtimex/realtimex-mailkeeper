@@ -158,13 +158,13 @@ function normalizeEnvelope(row, folder) {
  * Move a set of UIDs from one folder to another. Returns the action records
  * that go into the run receipt so /undo can reverse them.
  */
-async function move(account, uids, { from = "INBOX", to, dryRun = false } = {}) {
+async function move(account, uids, { from = "INBOX", to, dryRun = false, configPath } = {}) {
   if (!to) throw new Error("move requires a target folder");
   const actions = [];
   for (let i = 0; i < uids.length; i += BATCH) {
     const chunk = uids.slice(i, i + BATCH);
     if (!dryRun) {
-      await himalaya(account, ["message", "move", "-f", from, to, ...chunk]);
+      await himalaya(account, ["message", "move", "-f", from, to, ...chunk], { configPath });
     }
     for (const uid of chunk) {
       actions.push({ kind: "move", uid, from, to, dryRun });
@@ -178,7 +178,7 @@ async function move(account, uids, { from = "INBOX", to, dryRun = false } = {}) 
  * moving back; UIDs may change across folders on some servers, in which case
  * we report the ones we could not find instead of guessing.
  */
-async function undoActions(account, actions, { dryRun = false } = {}) {
+async function undoActions(account, actions, { dryRun = false, configPath } = {}) {
   const byPair = new Map();
   for (const action of actions) {
     if (action.kind !== "move" || action.dryRun) continue;
@@ -194,10 +194,11 @@ async function undoActions(account, actions, { dryRun = false } = {}) {
         from: group.from,
         to: group.to,
         dryRun,
+        configPath,
       });
       reversed.push(...done);
     } catch (error) {
-      skipped.push({ ...group, error: firstLine(error) });
+      skipped.push({ ...group, error: classifyError(error).error });
     }
   }
   return { reversed: reversed.length, skipped, dryRun };

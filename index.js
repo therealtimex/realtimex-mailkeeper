@@ -107,7 +107,8 @@ module.exports = definePlugin({
         return response.json({ ok: true, configured: result.configured, revision: result.revision });
       }), routeOptions);
     api.registerRoute("GET", "/setup/card", (request, response) =>
-      withScope(service, request, response, async ({ workspace }) => response.json({ items: [await service.setupStatus(workspace)] })), { auth: "contribution" });
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [await service.setupStatus(workspace)] }),
+        { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("POST", "/setup/action", (request, response) =>
       withScope(service, request, response, async ({ workspace, user }) => {
         const action = request.pluginContext.actionId;

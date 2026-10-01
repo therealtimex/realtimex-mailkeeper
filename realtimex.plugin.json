@@ -84,7 +84,8 @@
       {
         "method": "GET",
         "path": "/setup/card",
-        "auth": "contribution"
+        "auth": "contribution",
+        "availableWhenInactive": true
       },
       {
         "method": "POST",

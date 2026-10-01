@@ -146,7 +146,9 @@ function readJson(file, fallback = null) {
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, file);
 }
 
 function himalaya(account, args, { json = true } = {}) {
@@ -308,7 +310,37 @@ const commands = {
     if (!/^[a-zA-Z0-9-]{1,80}$/.test(runId)) fail("invalid run id");
     const existing = readJson(runFile(runId));
     if (existing) {
-      console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: existing.outcome || "pending" }));
+      const queued = readJson(path.join(STATE, "outbox", `${runId}.json`));
+      if (existing.submittedAt || queued) {
+        if (queued && !existing.submittedAt) writeJson(runFile(runId), { ...existing, submittedAt: queued.finishedAt, outcome: queued.outcome });
+        console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: queued?.outcome || existing.outcome }));
+        return;
+      }
+      if (existing.kind !== "onboarding-preview" || existing.mode !== "report-only") fail("run is not an onboarding preview");
+      if (Number.isInteger(existing.runnerPid) && existing.runnerPid > 0) {
+        let running = true;
+        try { process.kill(existing.runnerPid, 0); } catch (error) { running = error.code !== "ESRCH"; }
+        if (running) {
+          console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: "pending" }));
+          return;
+        }
+      }
+      // A restarted command cannot know how far an interrupted account got.
+      // Settle the original identity instead of rescanning past its ceiling.
+      const terminal = ["completed", "blocked", "failed"].includes(existing.outcome);
+      if (!terminal) {
+        const accounts = existing.scope?.accounts;
+        if (!Array.isArray(accounts) || !accounts.length) fail("preview scope is missing");
+        existing.accountOutcomes ||= [];
+        for (const account of accounts) {
+          if (!existing.accountOutcomes.some((entry) => entry.account === account)) {
+            existing.accountOutcomes.push({ account, outcome: "failed", code: "PREVIEW_INTERRUPTED" });
+          }
+        }
+        writeJson(runFile(runId), existing);
+      }
+      commands.submit({ "run-id": runId, outcome: terminal ? existing.outcome : "failed",
+        summary: "Preview interrupted. Recorded progress retained; actual mailbox changes: 0. Start a new preview deliberately after reviewing this result." });
       return;
     }
     const reservation = readJson(path.join(STATE, "previews", `${runId}.json`));
@@ -316,6 +348,7 @@ const commands = {
     const rules = loadRules();
     const run = loadRun(runId, { create: true });
     run.kind = "onboarding-preview";
+    run.runnerPid = process.pid;
     run.mode = "report-only";
     run.scope = { accounts: rules.config.emailAccounts, folders: ["INBOX"], maxPages: 5, pageSize: BATCH };
     run.snapshot = { checked: 0 };
