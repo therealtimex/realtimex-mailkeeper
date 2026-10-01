@@ -32,7 +32,7 @@ function errorResponse(response, error) {
  */
 async function resolveWorkspace(service, request, response, { allowInactive = false } = {}) {
   const claimed = request.body?.workspaceSlug || request.query?.workspaceSlug;
-  const bound = request.terminalSession?.context?.workspaceSlug;
+  const bound = request.pluginContext?.scope?.workspaceSlug || request.terminalSession?.context?.workspaceSlug;
   if (claimed && bound && claimed !== bound) {
     return { error: "Claimed workspace does not match the terminal session", status: 403 };
   }
@@ -64,10 +64,7 @@ async function withScope(service, request, response, handler, options = {}) {
   try {
     return await handler(resolved);
   } catch (error) {
-    service.api.log?.error?.(
-      `MailKeeper route failed: ${error.message}`,
-      { code: error?.code || null }
-    );
+    service.api.log?.error?.("MailKeeper request failed", { code: error?.code || "MAILKEEPER_INTERNAL_ERROR" });
     return errorResponse(response, error);
   }
 }
@@ -91,6 +88,53 @@ module.exports = definePlugin({
   register(api) {
     const service = serviceFor(api);
     const routeOptions = { auth: "internalOrAppId" };
+
+    const setupScope = (request, response, handler) => {
+      if (!request.pluginContext?.scope?.workspaceSlug && !request.terminalSession?.context?.workspaceSlug && !response.locals?.user?.id) {
+        return response.status(403).json({ ok: false, code: "SETUP_SCOPE_REQUIRED" });
+      }
+      return withScope(service, request, response, handler);
+    };
+    api.registerRoute("GET", "/setup/status", (request, response) =>
+      setupScope(request, response, async ({ workspace }) => response.json({ ok: true, ...(await service.setupStatus(workspace)) })), routeOptions);
+    api.registerRoute("POST", "/setup/check", (request, response) =>
+      setupScope(request, response, async ({ workspace }) => response.status(202).json({ ok: true, ...(await service.beginSetup(workspace)) })), routeOptions);
+    api.registerRoute("POST", "/setup/configure", (request, response) =>
+      setupScope(request, response, async ({ workspace }) => response.status(202).json({ ok: true, ...(await service.configureSetup(workspace, request.body?.config)) })), routeOptions);
+    api.registerRoute("POST", "/setup/account", (request, response) =>
+      setupScope(request, response, async () => {
+        const result = await api.email.configureHimalayaAccount(request.body?.account);
+        return response.json({ ok: true, configured: result.configured, revision: result.revision });
+      }), routeOptions);
+    api.registerRoute("GET", "/setup/card", (request, response) =>
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [await service.setupStatus(workspace)] })), { auth: "contribution" });
+    api.registerRoute("POST", "/setup/action", (request, response) =>
+      withScope(service, request, response, async ({ workspace, user }) => {
+        const action = request.pluginContext.actionId;
+        if (action === "setup") return response.json({ ok: true, navigation: { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" } });
+        if (action === "check") return response.status(202).json({ ok: true, ...(await service.beginSetup(workspace)) });
+        if (action === "credential") {
+          const { config } = service.profileConfig(workspace);
+          const references = await Promise.all(config.emailAccounts.map(async (accountRef) => ({ accountRef, ...(await api.email.getCredentialReference(accountRef)) })));
+          return response.json({ ok: true, credentials: references });
+        }
+        if (action === "preview") return response.status(202).json({ ok: true, ...(await service.preview(workspace, { request, response })) });
+        if (action === "schedule") return response.status(202).json({ ok: true, ...(await service.setSchedule(workspace, request.body?.payload || {}, user)) });
+        if (action === "open") {
+          const setup = await service.setupStatus(workspace);
+          const thread = setup.threadSlug && await service.host.workspaces.getThread(workspace, { slug: setup.threadSlug });
+          if (!thread || thread.archivedAt) return response.status(409).json({ ok: false, code: "THREAD_UNAVAILABLE" });
+          return response.json({ ok: true, navigation: { kind: "thread", threadSlug: thread.slug, runId: setup.preview?.runId || null } });
+        }
+        return response.status(400).json({ ok: false, code: "ACTION_UNKNOWN" });
+      }), { auth: "contribution" });
+    api.registerRoute("GET", "/runs", (request, response) =>
+      withScope(service, request, response, async ({ workspace }) => {
+        await service.ingestOutbox(workspace);
+        const index = await service.store.get(service.runIndexKey(workspace)) || [];
+        const runs = await Promise.all(index.slice(0, 20).map(async ({ runId }) => service.runProjection(await service.store.get(service.runKey(workspace, runId)))));
+        return response.json({ ok: true, runs });
+      }), routeOptions);
 
     api.registerWorkspaceSkillProvider("mailkeeper-workspace-skill", async () => [
       {
@@ -189,8 +233,8 @@ module.exports = definePlugin({
               .status(403)
               .json({ ok: false, error: "Authenticated human required" });
           }
-          const result = await service.provision(workspace);
-          return response.status(200).json({ ok: true, ...result });
+          const result = await service.beginSetup(workspace);
+          return response.status(202).json({ ok: true, ...result });
         }),
       routeOptions
     );
@@ -202,12 +246,12 @@ module.exports = definePlugin({
 
   async activateWorkspace(api, { workspace }) {
     const resolved = await serviceFor(api).host.workspaces.get({ id: workspace.id });
-    await serviceFor(api).provision(resolved || workspace);
+    await serviceFor(api).beginSetup(resolved || workspace);
   },
 
   async configureWorkspace(api, { workspace }) {
     const resolved = await serviceFor(api).host.workspaces.get({ id: workspace.id });
-    await serviceFor(api).provision(resolved || workspace);
+    await serviceFor(api).beginSetup(resolved || workspace);
   },
 
   async deactivateWorkspace(api, { workspace }) {

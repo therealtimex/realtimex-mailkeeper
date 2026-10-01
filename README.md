@@ -32,6 +32,36 @@ It is **not** a mail client. It never reads message bodies into chat, never repl
 
 Aggressiveness controls which passes are *promotable*: conservative = no-reply, calendar, sketchy TLDs; standard adds receipts, generic outreach, age; aggressive adds personalized outreach and repeat senders.
 
+## First use and repair
+
+Enable MailKeeper for your workspace, then choose **Set up with AI** on its plugin card. The workspace-bound editor inspects Himalaya, offers installation with ordinary command approval, and guides account selection or repair. Saving the guide does not verify an account or enable maintenance.
+
+The account picker, checks, preview and maintenance share one Himalaya target: `HIMALAYA_CONFIG`, then BizOps `EMAIL_CONFIG_FILE`, then `~/.config/himalaya/config.toml`. Confirm before editing an environment-selected target. Existing accounts, defaults, SMTP and BizOps metadata are preserved; new scaffolds contain IMAP settings only. MailKeeper does not enable the BizOps email channel.
+
+For supported macOS password accounts, enter the password or app password privately in **Keychain Access** using the service and account shown by **Private credential**. Never paste credentials into chat, terminal commands or TOML. The host writes only a Keychain reference. Unrecognized legacy credential formats, OAuth, Windows and Linux private-entry routes require separate private setup and remain unverified by this guided flow.
+
+Choose **Email accounts** and an installed **Maintenance agent** in Configure. **Check connection** starts a resumable check; cached status reads do not contact IMAP. Ready requires every selected account plus readback of the owned maintenance conversation, `MAILBOX.md`, rules and task. Existing policy and promoted rules are retained. Configuration changes invalidate readiness; archived conversations require explicit repair.
+
+**Preview inbox** confirms the accounts, agent and scan bound. The first preview always reports only, even when the configured mode permits archiving. It scans INBOX only, at most five pages of 200 envelopes per account, triages urgency before proposals, and records zero actual changes. Empty inboxes complete successfully; any failed account makes the receipt failed. Repeating a pending preview attaches to the same run. A stored receipt establishes completion.
+
+**Scheduled maintenance** is a separate human choice. `MAINTENANCE_ENABLED` is effectively false for a new workspace. The card shows actual pause state and next run when available; it never unpauses a workspace heartbeat. Existing maintenance intent and actual cadence migrate once. Conflicting historical task/profile state asks for a human decision.
+
+The editor uses a self-contained, workspace-scoped helper:
+
+```sh
+node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js status
+node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js check
+node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js configure '{"EMAIL_ACCOUNTS":["personal"],"AGENT":"cursor","MODE":"report-only"}'
+```
+
+The host injects the loopback URL, terminal-session authorization and workspace context. The helper accepts non-secret account/settings fields only and cannot enable maintenance. It does not read credential files or assume a server port.
+
+### Rollout and downgrade
+
+`0.2.0-dev.1` requires host support from [RealTimeX #2199](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2199): setup cards, workspace-bound editors, shared email configuration and explicit terminal preview dispatch. Deploy the host support before the new plugin manifest. No database migration or additional dependency is required. This development package has not been published to Marketplace.
+
+Before downgrading to 0.1.1, disable MailKeeper in the workspace and retain its files and receipts. Version 0.1.1 does not understand maintenance intent and may provision an enabled task during activation. Re-enable only after reviewing the owned heartbeat task and cadence.
+
 ## Architecture
 
 ```
@@ -50,7 +80,7 @@ Workspace-side state lives in `<workspace>/.mailkeeper/`: `rules.json` (written 
 
 ### Host dependencies
 
-The plugin follows the built-in Dogfood pattern: workspace-scoped activation, a managed task in the workspace `HEARTBEAT.md`, a plugin-owned thread, and clean teardown. The public `PluginAPI` does not yet expose workspace/thread/heartbeat operations, so `runtime/host.js` bridges to server internals through the `@/` shim the loader already provides for plugin entrypoints.
+The plugin follows the built-in Dogfood pattern: workspace-scoped activation, a managed task in the workspace `HEARTBEAT.md`, a plugin-owned thread, and clean teardown. `runtime/host.js` prefers the public workspace/thread/heartbeat SDK and retains a legacy server shim. Guided setup additionally requires the new host capabilities described above.
 
 That is a bridge, not the design. [realtimex-ai-app#1996](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/1996) proposes `api.workspaces` and `api.heartbeat` namespaces; `host.js` switches to them automatically when present and nothing else in the plugin changes. Nothing outside `host.js` may require `@/`.
 

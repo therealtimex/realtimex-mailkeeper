@@ -2,8 +2,8 @@
   "id": "com.realtimex.mailkeeper",
   "name": "realtimex-mailkeeper",
   "displayName": "RealTimeX MailKeeper",
-  "version": "0.1.1",
-  "description": "Keeps your inbox clean on a schedule: rules you promote, everything else proposed, every run reversible. Any IMAP provider via the Himalaya account configured in BizOps.",
+  "version": "0.2.0-dev.1",
+  "description": "AI-guided inbox maintenance: verify accounts, preview safely, then choose whether to schedule promoted rules.",
   "author": {
     "name": "RealTimeX Team"
   },
@@ -60,10 +60,126 @@
         "path": "/repair",
         "auth": "internalOrAppId",
         "description": "Explicitly re-provision the profile-owned thread, contract file, and managed heartbeat task."
+      },
+      {
+        "method": "GET",
+        "path": "/setup/status",
+        "auth": "internalOrAppId"
+      },
+      {
+        "method": "POST",
+        "path": "/setup/check",
+        "auth": "internalOrAppId"
+      },
+      {
+        "method": "POST",
+        "path": "/setup/configure",
+        "auth": "internalOrAppId"
+      },
+      {
+        "method": "POST",
+        "path": "/setup/account",
+        "auth": "internalOrAppId"
+      },
+      {
+        "method": "GET",
+        "path": "/setup/card",
+        "auth": "contribution"
+      },
+      {
+        "method": "POST",
+        "path": "/setup/action",
+        "auth": "contribution"
+      },
+      {
+        "method": "GET",
+        "path": "/runs",
+        "auth": "internalOrAppId"
+      }
+    ],
+    "ui_contributions": [
+      {
+        "id": "workspace-setup",
+        "surface": "workspace-plugin-card",
+        "component": "setup-status",
+        "source": {
+          "method": "GET",
+          "path": "/setup/card"
+        },
+        "actions": [
+          {
+            "id": "setup",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
+            "id": "check",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
+            "id": "preview",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
+            "id": "open",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
+            "id": "schedule",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
+            "id": "credential",
+            "method": "POST",
+            "path": "/setup/action"
+          }
+        ]
       }
     ]
   },
   "configSchema": [
+    {
+      "key": "MAILKEEPER_SETUP_FILE",
+      "scope": "workspace",
+      "label": "AI-guided setup",
+      "type": "file",
+      "uiGroup": "onboarding",
+      "uiGroupComponent": "dependency-onboarding",
+      "uiGroupComponentOptions": {
+        "doctor": {
+          "fieldKey": "MAILKEEPER_SETUP_FILE"
+        },
+        "summary": {
+          "title": "Set up MailKeeper",
+          "description": "Install email tools, connect accounts privately, verify settings, and run your first report-only preview."
+        },
+        "dependencies": [
+          {
+            "id": "himalaya",
+            "cli": "Himalaya",
+            "icon": "mail",
+            "title": "Email via Himalaya",
+            "description": "Read IMAP mail through the shared email configuration.",
+            "fileFieldKey": "MAILKEEPER_SETUP_FILE",
+            "doctorTitle": "Himalaya setup",
+            "doctorDescription": "Check the real binary, install with approval, and configure non-secret IMAP settings."
+          }
+        ]
+      },
+      "editor": {
+        "mode": "ai-editor",
+        "hideFileTree": true,
+        "defaultRightCollapsed": false,
+        "fileName": "mailkeeper-setup.md",
+        "chatTitle": "MailKeeper setup",
+        "initialContent": "# MailKeeper setup\n\nEmail tools → Account connection → MailKeeper settings → Prepare → First preview → Schedule\n\nConnection checks and preparation are verified by the plugin. Saving this guide does not verify or schedule anything.\n",
+        "prompt": "Guide the user through MailKeeper setup in this exact workspace. Use node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js status to inspect current state and the shared email target revision. Check command -v himalaya, himalaya --version, and himalaya --help. For a missing CLI, propose the supported platform install command and request ordinary command approval; verify the actual binary after installation. Never run account doctor --fix automatically. Ask only for non-secret provider/IMAP details. Offer reuse of existing account names before adding an account. For macOS password accounts, use the setup helper account command with JSON fields name,email,displayName,host,port,encryption,login,revision; an environment target requires explicit confirmOverride. The host preserves unrelated accounts, defaults, SMTP and BizOps sections. Never read raw shared TOML into the AI transcript, write credentials, or ask for passwords/tokens/app passwords. Direct the user to the workspace plugin card private credential panel for native Keychain Access entry, then Check again. Other platforms and unsupported auth references remain pending; do not invent OAuth or vault integration. Have the user choose Email accounts, Maintenance agent, optional model, and report-only mode using Configure, or save validated non-secret workspace fields using the helper configure command. The host-selected agent must be installed; do not change the workspace default agent. Run helper check to start resumable preparation; status reads are cached and do not probe. Explain typed blockers and resume the same operation. Ready requires all selected accounts and readback of the maintenance thread, MAILBOX.md, rules and disabled managed task. Use the card Preview inbox action with explicit human confirmation. It performs a finite five-page-per-account INBOX report-only preview and writes a receipt, even if stored MODE is higher. Never move, delete, send, add folders, promote rules, or enable scheduling during setup. Scheduling is a separate human action on the card after successful verification. Preserve existing accounts, rules, MAILBOX.md, receipts and scheduler pause/cadence. Do not claim successful setup or preview from AI prose; check the stored plugin status and receipt."
+      }
+    },
     {
       "key": "DEFAULT_MODE_CEILING",
       "label": "Mode ceiling",
@@ -234,6 +350,13 @@
       "type": "terminal-agent-model",
       "description": "Optional. Empty means the agent's default model.",
       "agentKey": "AGENT"
+    },
+    {
+      "key": "MAINTENANCE_ENABLED",
+      "scope": "workspace",
+      "label": "Scheduled maintenance",
+      "type": "boolean",
+      "description": "Off for a new workspace. Existing maintenance intent is migrated once. Setup and first preview do not enable scheduling."
     }
   ],
   "permissions": []

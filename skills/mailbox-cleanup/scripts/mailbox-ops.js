@@ -34,6 +34,7 @@ const STATE = path.join(ROOT, ".mailkeeper");
 // terminal, not the plugin host; the Himalaya binary and TOML path are runtime
 // discovery injected by the environment, never plugin configuration.
 const HIMALAYA = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
+let previewRules = null;
 const BATCH = 200;
 
 // ---------------------------------------------------------------------------
@@ -150,7 +151,8 @@ function writeJson(file, value) {
 
 function himalaya(account, args, { json = true } = {}) {
   // `-a` / `-c` / `-o` are per-subcommand options in Himalaya, so they go last.
-  const tail = ["-a", account, ...(json ? ["-o", "json"] : []), ...(process.env.HIMALAYA_CONFIG ? ["-c", process.env.HIMALAYA_CONFIG] : [])];
+  const configPath = loadRules().config.himalayaConfigPath || process.env.HIMALAYA_CONFIG;
+  const tail = ["-a", account, ...(json ? ["-o", "json"] : []), ...(configPath ? ["-c", configPath] : [])];
   const out = execFileSync(HIMALAYA, [...args, ...tail], {
     encoding: "utf8",
     maxBuffer: 64 * 1024 * 1024,
@@ -175,10 +177,10 @@ function normalize(row, folder, now) {
   };
 }
 
-function listAll(account, folder, query) {
+function listAll(account, folder, query, { maxPages = 2000 } = {}) {
   const out = [];
   const now = Date.now();
-  for (let page = 1; page <= 2000; page += 1) {
+  for (let page = 1; page <= maxPages; page += 1) {
     let rows;
     try {
       rows = himalaya(account, ["envelope", "list", "-f", folder, "-p", String(page), "-s", String(BATCH), ...(query ? [query] : [])]);
@@ -196,6 +198,7 @@ function listAll(account, folder, query) {
 }
 
 function loadRules() {
+  if (previewRules) return previewRules;
   const rules = readJson(path.join(STATE, "rules.json"));
   if (!rules?.config) fail(".mailkeeper/rules.json missing — the MailKeeper plugin writes it on provision. Is the plugin enabled for this workspace?");
   return rules;
@@ -300,6 +303,45 @@ function loadRun(runId, { create = false } = {}) {
 // ---------------------------------------------------------------------------
 
 const commands = {
+  "onboarding-preview"(args) {
+    const runId = args["run-id"] || fail("--run-id required");
+    if (!/^[a-zA-Z0-9-]{1,80}$/.test(runId)) fail("invalid run id");
+    const existing = readJson(runFile(runId));
+    if (existing) {
+      console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: existing.outcome || "pending" }));
+      return;
+    }
+    const reservation = readJson(path.join(STATE, "previews", `${runId}.json`));
+    if (reservation?.runId === runId && reservation.kind === "onboarding-preview") previewRules = reservation.rules;
+    const rules = loadRules();
+    const run = loadRun(runId, { create: true });
+    run.kind = "onboarding-preview";
+    run.mode = "report-only";
+    run.scope = { accounts: rules.config.emailAccounts, folders: ["INBOX"], maxPages: 5, pageSize: BATCH };
+    run.snapshot = { checked: 0 };
+    run.accountOutcomes = [];
+    writeJson(runFile(runId), run);
+    for (const account of rules.config.emailAccounts) {
+      try {
+        const envelopes = listAll(account, "INBOX", "", { maxPages: 5 });
+        const snapshot = { account, folder: "INBOX", takenAt: new Date().toISOString(), envelopes, repliedTo: [], sentDomains: [] };
+        const urgent = urgentHits(snapshot);
+        const ctx = buildContext(rules, snapshot);
+        run.urgent.push(...urgent.map((entry) => ({ account, uid: entry.uid })));
+        for (const pass of rules.config.promotablePasses || []) {
+          const matches = candidates(pass, ctx, snapshot, urgent);
+          if (matches.length) run.proposals.push({ account, pass, count: matches.length, query: PASSES[pass].describe(ctx), action: "report-only" });
+        }
+        run.snapshot.checked += envelopes.length;
+        run.accountOutcomes.push({ account, outcome: "completed", checked: envelopes.length, limitReached: envelopes.length === 5 * BATCH });
+      } catch {
+        run.accountOutcomes.push({ account, outcome: "failed", code: "PREVIEW_ACCOUNT_FAILED" });
+      }
+      writeJson(runFile(runId), run);
+    }
+    const failed = run.accountOutcomes.some((entry) => entry.outcome !== "completed");
+    commands.submit({ "run-id": runId, outcome: failed ? "failed" : "completed", summary: "First report-only preview. Actual mailbox changes: 0." });
+  },
   snapshot(args) {
     const account = args.account || fail("--account required");
     const folder = args.folder || "INBOX";
@@ -375,10 +417,10 @@ const commands = {
     const rules = loadRules();
     const snapshot = loadSnapshot(account);
     const ctx = buildContext(rules, snapshot);
-    const mode = args.mode || rules.config.mode;
+    const run = loadRun(runId, { create: true });
+    const mode = run.kind === "onboarding-preview" ? "report-only" : args.mode || rules.config.mode;
     const dryRun = args["dry-run"] === true || mode === "report-only";
     const urgent = urgentHits(snapshot);
-    const run = loadRun(runId, { create: true });
     run.mode = mode;
 
     let plan;
@@ -446,8 +488,12 @@ const commands = {
     const receipt = {
       schemaVersion: 1,
       runId,
+      kind: run.kind || null,
       outcome,
       mode: run.mode || null,
+      scope: run.scope || null,
+      snapshot: run.snapshot || null,
+      accountOutcomes: run.accountOutcomes || [],
       startedAt: run.startedAt,
       finishedAt: new Date().toISOString(),
       actions: run.actions.filter((a) => !a.dryRun),
@@ -501,5 +547,5 @@ if (!command || !commands[command]) {
 try {
   commands[command](args);
 } catch (error) {
-  fail(String(error.stderr || error.message).split("\n").slice(0, 3).join(" "));
+  fail("Mailbox operation failed. Check the account connection and try again.");
 }

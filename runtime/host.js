@@ -220,6 +220,7 @@ function publicBackend(api) {
     backend: "public",
     workspaces: api.workspaces,
     heartbeat: api.heartbeat,
+    dispatchPreview: (options) => api.onboarding.dispatchPreview(options),
   };
 }
 

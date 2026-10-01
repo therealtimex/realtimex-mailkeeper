@@ -37,6 +37,8 @@ class MailKeeperService {
     this.api = api;
     this.host = hostFor(api);
     this.store = api.getStore();
+    this.setupJobs = new Map();
+    this.locks = new Map();
   }
 
   // -------------------------------------------------------------------------
@@ -76,9 +78,22 @@ class MailKeeperService {
   // Provisioning
   // -------------------------------------------------------------------------
 
-  async provision(workspace) {
+  async provision(workspace, operation = null) {
     const { config, errors } = this.profileConfig(workspace);
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
+    const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
+    if (!target) throw codedError("Upgrade RealTimeX to use guided setup", "HOST_UNSUPPORTED", 409);
+    config.himalayaConfigPath = target.configPath;
+    const revision = this.setupRevision(config, target);
+    const current = async () => {
+      const latest = await this.store.get(this.profileKey(workspace));
+      const latestTarget = await this.api.email.getHimalayaTarget({ workspaceId: workspace.id });
+      if (latest?.state === "disabled" || (operation && latest?.operationId !== operation) ||
+          revision !== this.setupRevision(this.profileConfig(workspace).config, latestTarget)) {
+        if (latest?.state === "disabled") await this.host.heartbeat.removeManagedTask(workspace, { id: taskIdentity(workspace.id) });
+        throw codedError("Setup changed. Check again.", "SETUP_CHANGED", 409);
+      }
+    };
 
     if (errors.length) {
       // Not ready: make sure nothing runs, but keep prior state for repair.
@@ -87,7 +102,8 @@ class MailKeeperService {
       });
       await this.store.set(this.profileKey(workspace), {
         ...profile,
-        state: "config_invalid",
+        state: "needs_setup", schemaVersion: 1,
+        blockers: errors.map((error) => ({ code: "CONFIG_REQUIRED", safeMessage: error, retryable: true })),
         errors,
         updatedAt: new Date().toISOString(),
       });
@@ -101,7 +117,9 @@ class MailKeeperService {
     const readiness = {};
     const authErrors = [];
     for (const account of config.emailAccounts) {
-      const probe = await mailbox.checkAccount(account);
+      const probe = await mailbox.checkAccount(account, target);
+      await current();
+      probe.checkedAt = new Date().toISOString();
       readiness[account] = probe;
       if (!probe.ok) authErrors.push(probe.error);
     }
@@ -111,14 +129,22 @@ class MailKeeperService {
       });
       await this.store.set(this.profileKey(workspace), {
         ...profile,
-        state: "auth_missing",
+        state: "needs_repair", schemaVersion: 1,
+        blockers: Object.entries(readiness).filter(([, check]) => !check.ok).map(([accountRef, check]) => ({
+          accountRef, code: check.code, safeMessage: check.error, retryable: true, actionId: "check",
+        })),
+        accountChecks: readiness, revision,
         errors: authErrors,
         updatedAt: new Date().toISOString(),
       });
-      return { state: "auth_missing", errors: authErrors };
+      return { state: "needs_repair", errors: authErrors };
     }
 
-    const thread = await this.host.workspaces.ensureThread(workspace, {
+    await current();
+    await this.store.set(this.profileKey(workspace), { ...profile, state: "preparing", accountChecks: readiness });
+    let thread = profile.threadSlug && await this.host.workspaces.getThread?.(workspace, { slug: profile.threadSlug });
+    if (thread?.archivedAt) throw codedError("Open or restore the maintenance thread, then check again.", "THREAD_ARCHIVED", 409);
+    thread = thread || await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
       name: `MailKeeper: ${config.emailAccounts.join(", ")}`.slice(0, 180),
     });
@@ -127,11 +153,12 @@ class MailKeeperService {
 
     const rules = await this.ensureRules(workspace, config);
     this.syncRulesFile(workspace, config, rules, readiness);
+    await current();
 
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
       name: `MailKeeper maintenance (${config.emailAccounts.join(", ")})`.slice(0, 120),
-      interval: config.cadence,
+      interval: config.maintenanceEnabled ? config.cadence : "disabled",
       executor: "agent",
       agent: config.agent,
       ...(config.model ? { model: config.model } : {}),
@@ -146,7 +173,9 @@ class MailKeeperService {
     });
 
     const next = {
-      state: heartbeat.explicitlyPaused ? "paused_by_heartbeat" : "ready",
+      ...profile, schemaVersion: 1, state: "ready",
+      blockers: [], accountChecks: readiness, revision,
+      verifiedAt: new Date().toISOString(), operationId: operation,
       errors: [],
       emailAccounts: config.emailAccounts,
       mode: config.mode,
@@ -156,19 +185,27 @@ class MailKeeperService {
       hostBackend: this.host.backend,
       updatedAt: new Date().toISOString(),
     };
+    await current();
+    const resources = await this.host.heartbeat.getManagedTaskStatus(workspace, { id: next.taskId });
+    const readback = await this.host.workspaces.getThread(workspace, { slug: thread.slug });
+    if (!resources.exists || !readback || readback.archivedAt ||
+        !fs.existsSync(path.join(workspace.workingDirectory, config.contractPath))) {
+      throw codedError("Preparation did not finish. Check again.", "PROVISION_FAILED", 409);
+    }
+    await current();
     await this.store.set(this.profileKey(workspace), next);
     return next;
   }
 
   async disable(workspace) {
-    await this.host.heartbeat.removeManagedTask(workspace, {
-      id: taskIdentity(workspace.id),
-    });
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
     await this.store.set(this.profileKey(workspace), {
       ...profile,
       state: "disabled",
       updatedAt: new Date().toISOString(),
+    });
+    await this.host.heartbeat.removeManagedTask(workspace, {
+      id: taskIdentity(workspace.id),
     });
     // Thread, contract file, rules and run receipts are intentionally kept:
     // they are the user's audit trail and survive re-enable.
@@ -183,12 +220,12 @@ class MailKeeperService {
     const workspaces = await this.host.workspaces.listEnabledForPlugin();
     for (const workspace of workspaces) {
       try {
-        await this.provision(workspace);
+        await this.beginSetup(workspace);
       } catch (error) {
         // Message carries the detail: the host log line prints only the message.
         this.api.log?.error?.(
-          `MailKeeper boot provision failed for ${workspace.slug}: ${error.message}`,
-          { workspace: workspace.slug, stack: error.stack }
+          "MailKeeper setup unavailable",
+          { code: "PROVISION_FAILED" }
         );
       }
     }
@@ -196,7 +233,10 @@ class MailKeeperService {
 
   seedContract(workspace, config) {
     const target = path.join(workspace.workingDirectory, config.contractPath);
-    if (fs.existsSync(target)) return false; // never overwrite user edits
+    if (fs.existsSync(target)) {
+      fs.readFileSync(target, "utf8"); // fail closed for unreadable human policy
+      return false;
+    }
     const template = fs.readFileSync(
       path.join(TEMPLATE_DIR, "MAILBOX.md"),
       "utf8"
@@ -235,6 +275,7 @@ class MailKeeperService {
       };
     }
     const target = path.join(workspace.workingDirectory, ".mailkeeper", "rules.json");
+    if (fs.existsSync(target)) JSON.parse(fs.readFileSync(target, "utf8"));
     fs.mkdirSync(path.dirname(target), { recursive: true });
     fs.writeFileSync(
       target,
@@ -243,6 +284,7 @@ class MailKeeperService {
           revision: rules.revision,
           writtenAt: new Date().toISOString(),
           config: {
+            himalayaConfigPath: config.himalayaConfigPath || null,
             emailAccounts: config.emailAccounts,
             accounts,
             mode: config.mode,
@@ -276,7 +318,7 @@ class MailKeeperService {
       try {
         body = JSON.parse(fs.readFileSync(full, "utf8"));
       } catch (error) {
-        this.api.log?.warn?.("MailKeeper receipt unreadable", { file, error: error.message });
+        this.api.log?.warn?.("MailKeeper receipt unreadable", { file, code: "RECEIPT_UNREADABLE" });
         fs.renameSync(full, `${full}.invalid`);
         continue;
       }
@@ -285,7 +327,7 @@ class MailKeeperService {
         fs.unlinkSync(full);
         ingested += 1;
       } catch (error) {
-        this.api.log?.warn?.("MailKeeper receipt rejected", { file, error: error.message });
+        this.api.log?.warn?.("MailKeeper receipt rejected", { file, code: "RECEIPT_REJECTED" });
         fs.renameSync(full, `${full}.rejected`);
       }
     }
@@ -369,11 +411,23 @@ class MailKeeperService {
    */
   async submitRun(workspace, body) {
     const runId = text(body.runId, 80);
-    if (!runId) throw codedError("runId is required", "MAILKEEPER_RUN_INVALID", 400);
+    if (!/^[a-zA-Z0-9-]{1,80}$/.test(runId)) throw codedError("Valid runId is required", "MAILKEEPER_RUN_INVALID", 400);
     const existing = await this.store.get(this.runKey(workspace, runId));
     if (existing) return { runId, reused: true };
 
-    const outcome = text(body.outcome, 20);
+    let outcome = text(body.outcome, 20);
+    const active = await this.store.get(this.activeRunKey(workspace));
+    const profile = await this.store.get(this.profileKey(workspace));
+    const reservation = await this.store.get(`ws-${workspace.id}-preview-${runId}`);
+    const previewScope = reservation?.scope || (active?.runId === runId ? active.scope : null);
+    const isPreview = Boolean(reservation || active?.runId === runId && active.kind === "onboarding-preview" || profile?.previewRunId === runId);
+    if (isPreview && (body.mode !== "report-only" || (body.actions || []).some((action) => action.dryRun !== true))) {
+      throw codedError("Preview receipts must have zero mailbox changes", "PREVIEW_RECEIPT_INVALID", 400);
+    }
+    if (isPreview && outcome === "completed" && (!Array.isArray(body.accountOutcomes) ||
+        !previewScope?.accounts?.length || previewScope.accounts.some((account) => !body.accountOutcomes.some((entry) => entry.account === account && entry.outcome === "completed")))) {
+      throw codedError("Preview requires every selected account outcome", "PREVIEW_RECEIPT_INVALID", 400);
+    }
     if (!["completed", "blocked", "failed"].includes(outcome)) {
       throw codedError(
         "outcome must be completed, blocked, or failed",
@@ -389,6 +443,8 @@ class MailKeeperService {
       startedAt: text(body.startedAt, 40),
       finishedAt: new Date().toISOString(),
       snapshot: body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null,
+      scope: isPreview ? previewScope : null,
+      accountOutcomes: Array.isArray(body.accountOutcomes) ? body.accountOutcomes : [],
       // Every mutation, by UID, so /undo can reverse it exactly.
       actions: Array.isArray(body.actions) ? body.actions.slice(0, 5000) : [],
       // Things the agent found but was not allowed to act on.
@@ -422,7 +478,8 @@ class MailKeeperService {
       await this.store.set(this.rulesKey(workspace), rules);
     }
 
-    await this.store.set(this.activeRunKey(workspace), null);
+    const latestActive = await this.store.get(this.activeRunKey(workspace));
+    if (latestActive?.runId === runId) await this.store.set(this.activeRunKey(workspace), null);
     return { runId, reused: false, actions: receipt.actions.length };
   }
 
@@ -462,7 +519,8 @@ class MailKeeperService {
   // -------------------------------------------------------------------------
 
   async accountOptions() {
-    const accounts = await mailbox.listAccounts();
+    const target = await this.api.email?.getHimalayaTarget();
+    const accounts = await mailbox.listAccounts(target || {});
     return {
       options: accounts.map((account) => ({
         value: account.name,
@@ -528,12 +586,17 @@ class MailKeeperService {
     if (!workspace) {
       return { skipLaunch: true, skipReason: "workspace missing" };
     }
-    const { errors } = this.profileConfig(workspace);
+    return this.exclusive(workspace, async () => {
+    const { config, errors } = this.profileConfig(workspace);
+    const setup = await this.setupStatus(workspace);
+    if (!config.maintenanceEnabled || setup.state !== "ready") {
+      return { skipLaunch: true, skipReason: "setup or schedule not ready" };
+    }
     if (errors.length) {
       return { skipLaunch: true, skipReason: `config_invalid: ${errors.join(" ")}` };
     }
     const active = await this.store.get(this.activeRunKey(workspace));
-    if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {
+    if (active && (active.kind === "onboarding-preview" || Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000)) {
       return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
     }
     const runId = crypto.randomUUID();
@@ -543,6 +606,7 @@ class MailKeeperService {
       startedAt: new Date().toISOString(),
     });
     return { mailkeeperRunId: runId };
+    });
   }
 
   async recordHeartbeatDispatch(context) {
@@ -563,7 +627,8 @@ class MailKeeperService {
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
     if (!workspace) return;
     await this.ingestOutbox(workspace); // submitRun clears the lock on success
-    await this.store.set(this.activeRunKey(workspace), null);
+    const active = await this.store.get(this.activeRunKey(workspace));
+    if (active?.kind !== "onboarding-preview") await this.store.set(this.activeRunKey(workspace), null);
   }
 
   async resolveHeartbeatLaunchPolicy() {
@@ -611,6 +676,8 @@ class MailKeeperService {
     ].join("\n");
   }
 }
+
+Object.assign(MailKeeperService.prototype, require("./onboarding"));
 
 function ruleIdFor(proposal) {
   return crypto
