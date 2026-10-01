@@ -2,7 +2,7 @@
   "id": "com.realtimex.mailkeeper",
   "name": "realtimex-mailkeeper",
   "displayName": "RealTimeX MailKeeper",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Keeps your inbox clean on a schedule: rules you promote, everything else proposed, every run reversible. Any IMAP provider via the Himalaya account configured in BizOps.",
   "author": {
     "name": "RealTimeX Team"
