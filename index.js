@@ -4,6 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { definePlugin } = require("@realtimex/plugin-sdk");
 const { MailKeeperService, PLUGIN_ID } = require("./runtime/service");
+const { setupPresentation, credentialDialog } = require("./runtime/setupPresentation");
 
 const SKILL_DIR = path.join(__dirname, "skills", "mailbox-cleanup");
 
@@ -107,7 +108,7 @@ module.exports = definePlugin({
         return response.json({ ok: true, configured: result.configured, revision: result.revision });
       }), routeOptions);
     api.registerRoute("GET", "/setup/card", (request, response) =>
-      withScope(service, request, response, async ({ workspace }) => response.json({ items: [await service.setupStatus(workspace)] }),
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [setupPresentation(await service.setupStatus(workspace), service)] }),
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("GET", "/setup/receipts", (request, response) =>
       withScope(service, request, response, async ({ workspace }) => response.json({ items: await service.previewReceiptItems(workspace, request.pluginContext?.scope?.threadSlug) }),
@@ -120,7 +121,7 @@ module.exports = definePlugin({
         if (action === "credential") {
           const { config } = service.profileConfig(workspace);
           const references = await Promise.all(config.emailAccounts.map(async (accountRef) => ({ accountRef, ...(await api.email.getCredentialReference(accountRef)) })));
-          return response.json({ ok: true, credentials: references });
+          return response.json({ ok: true, dialog: credentialDialog(references) });
         }
         if (action === "preview") return response.status(202).json({ ok: true, ...(await service.preview(workspace, { request, response })) });
         if (action === "schedule") return response.status(202).json({ ok: true, ...(await service.setSchedule(workspace, request.body?.payload || {}, user)) });

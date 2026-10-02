@@ -211,8 +211,8 @@ module.exports = {
 
   previewReceiptItem(run) {
     const outcome = run.outcome === "completed" && run.checked === 0 ? "empty" : run.outcome;
-    const labelKey = `plugin-setup.outcome-${outcome}`;
-    const detail = (id, labelKey, value, type = "text") => ({ id, labelKey: `plugin-setup.${labelKey}`, value, type });
+    const labelKey = `mailkeeper-setup.outcome-${outcome}`;
+    const detail = (id, labelKey, value, type = "text") => ({ id, labelKey: `mailkeeper-setup.${labelKey}`, value, type });
     const recovery = { AGENT_UNAVAILABLE: "install", AGENT_SIGN_IN_REQUIRED: "sign-in", AGENT_ACCESS_DENIED: "access" }[run.failureCode] || "unknown";
     return { id: run.runId, anchor: { timestamp: Date.parse(run.finishedAt || run.startedAt) || 0 },
       status: { code: outcome, labelKey, summaryKey: labelKey, values: { agent: run.scope?.agent || "" }, tone: outcome === "completed" || outcome === "empty" ? "success" : outcome === "pending" ? "progress" : "warning" },
@@ -226,8 +226,8 @@ module.exports = {
         detail("mode", "effective-mode", "report-only"),
         ...(!["pending", "unavailable"].includes(outcome) ? [detail("checked", "result-checked", run.checked ?? 0), detail("urgent", "result-urgent", run.urgent ?? 0),
           detail("proposed", "result-proposed", run.proposed ?? 0), detail("changes", "result-changes", run.actualChanges ?? 0)] : []),
-        ...(["blocked", "failed", "partial", "pending"].includes(run.outcome) ? [detail("recovery", "result-recovery", run.outcome === "blocked" ? run.failureCode === "THREAD_UNAVAILABLE" ? "plugin-setup.thread-recovery" : `plugin-setup.agent-${recovery}` : run.outcome === "pending" ? "plugin-setup.preview-pending" : "plugin-setup.preview-failed", "translation")] : []),
-        ...(run.accountOutcomes || []).flatMap((entry, i) => [detail(`account-${i}`, "result-accounts", entry.account), detail(`outcome-${i}`, "result-outcome", `plugin-setup.outcome-${entry.outcome === "completed" ? "completed" : "failed"}`, "translation")]),
+        ...(["blocked", "failed", "partial", "pending"].includes(run.outcome) ? [detail("recovery", "result-recovery", run.outcome === "blocked" ? run.failureCode === "THREAD_UNAVAILABLE" ? "mailkeeper-setup.thread-recovery" : `mailkeeper-setup.agent-${recovery}` : run.outcome === "pending" ? "mailkeeper-setup.preview-pending" : "mailkeeper-setup.preview-failed", "translation")] : []),
+        ...(run.accountOutcomes || []).flatMap((entry, i) => [detail(`account-${i}`, "result-accounts", entry.account), detail(`outcome-${i}`, "result-outcome", `mailkeeper-setup.outcome-${entry.outcome === "completed" ? "completed" : "failed"}`, "translation")]),
       ], actions: [],
     };
   },

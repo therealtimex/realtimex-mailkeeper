@@ -62,6 +62,8 @@ The host injects the loopback URL, terminal-session authorization and workspace 
 
 ### Rollout and downgrade
 
+MailKeeper supplies its setup and receipt labels, translations, checkpoints, counters, confirmation bounds and schedule choices through the host's version 2 `setup-status` contribution contract. The host renders these declarations with shared cards, choice dialogs, editor checklists and receipt navigation. Other plugins can use the same pattern with their own prerequisites and results; email-specific presentation lives in `runtime/setupPresentation.js` and the plugin manifest. Status reads remain cached, while actions retain workspace authorization and the declared route checks.
+
 `0.2.0-dev.1` requires host support from [RealTimeX #2199](https://rtgit.rta.vn/rtlab/rtwebteam/realtimex-ai-app/-/issues/2199): setup cards, workspace-bound editors, shared email configuration and explicit terminal preview dispatch. Deploy the host support before the new plugin manifest. No database migration or additional dependency is required. This development package has not been published to Marketplace.
 
 Before downgrading to 0.1.1, disable MailKeeper in the workspace and retain its files and receipts. Version 0.1.1 does not understand maintenance intent and may provision an enabled task during activation. Re-enable only after reviewing the owned heartbeat task and cadence.
