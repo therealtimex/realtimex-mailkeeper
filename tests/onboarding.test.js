@@ -48,6 +48,29 @@ test("status is cached and does not probe a mailbox", async (t) => {
   const f = fixture(t); mailbox.checkAccount = async () => { throw Error("must not probe"); };
   assert.equal((await f.service.setupStatus(f.workspace)).state, "needs_setup");
 });
+test("inactive projection retains facts without reading the email target or ingesting receipts", async (t) => {
+  const f = fixture(t); await f.ready();
+  const before = structuredClone([...f.storeData]);
+  f.api.email.getHimalayaTarget = async () => { throw Error("must not read target"); };
+  f.service.ingestOutbox = async () => { throw Error("must not ingest"); };
+  const status = await f.service.setupStatus(f.workspace, { cached: true });
+  assert.equal(status.state, "disabled"); assert.equal(status.stale, true);
+  assert.equal(status.hostSupported, true); assert.ok(status.threadSlug);
+  assert.deepEqual([...f.storeData], before);
+});
+test("disable and re-enable retain saved schedule intent without resuming execution", async (t) => {
+  const f = fixture(t); await f.ready();
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "3d" }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(f.task().interval, "3d");
+  await f.service.disable(f.workspace); assert.equal(f.task(), null);
+  await f.ready();
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.state, "ready");
+  assert.equal(status.schedule.intent, true); assert.equal(status.schedule.cadence, "3d");
+  assert.equal(status.schedule.suspendedForRepair, true);
+  assert.equal(f.task().interval, "disabled");
+});
 test("duplicate checks reuse the durable operation", async (t) => {
   const f = fixture(t); let release;
   mailbox.checkAccount = () => new Promise((resolve) => { release = resolve; });

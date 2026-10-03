@@ -108,17 +108,19 @@ module.exports = definePlugin({
         return response.json({ ok: true, configured: result.configured, revision: result.revision });
       }), routeOptions);
     api.registerRoute("GET", "/setup/card", (request, response) =>
-      withScope(service, request, response, async ({ workspace }) => response.json({ items: [setupPresentation(await service.setupStatus(workspace), service)] }),
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [setupPresentation(await service.setupStatus(workspace, { cached: request.pluginContext?.readOnly === true }), service)] }),
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("GET", "/setup/journey", (request, response) =>
-      withScope(service, request, response, async ({ workspace }) => response.json({ items: [journeyPresentation(await service.setupStatus(workspace), service)] })),
-      { auth: "contribution" });
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [journeyPresentation(await service.setupStatus(workspace, { cached: request.pluginContext?.readOnly === true }), service)] }),
+        { allowInactive: request.pluginContext?.readOnly === true }),
+      { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("GET", "/setup/receipts", (request, response) =>
       withScope(service, request, response, async ({ workspace }) => {
-        const setup = await service.setupStatus(workspace);
+        const options = { cached: request.pluginContext?.readOnly === true };
+        const setup = await service.setupStatus(workspace, options);
         const threadSlug = request.pluginContext?.scope?.threadSlug;
         if (!threadSlug || threadSlug !== setup.threadSlug) return response.json({ items: [] });
-        return response.json({ items: [usagePresentation(setup, service), ...await service.previewReceiptItems(workspace, threadSlug)] });
+        return response.json({ items: [usagePresentation(setup, service), ...await service.previewReceiptItems(workspace, threadSlug, options)] });
       },
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("POST", "/setup/action", (request, response) =>

@@ -48,8 +48,10 @@ test("ready card leads into usage without requiring preview or scheduling", () =
   assert.equal(JSON.stringify(raw), before);
   assert.equal(view.status.labelKey, "mailkeeper-setup.ready");
   assert.deepEqual(view.checklist, []);
-  assert.deepEqual(view.actions.map((entry) => entry.id), ["open"]);
+  assert.deepEqual(view.actions.map((entry) => entry.id), ["open", "setup"]);
   assert.equal(view.actions[0].variant, "primary");
+  assert.equal(view.actions[1].variant, "outline");
+  assert.deepEqual(view.actions[1].navigation, { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" });
   const usage = usagePresentation(raw, service);
   assert.equal(usage.expanded, true);
   assert.equal(usage.actionContract, 2);
@@ -85,7 +87,7 @@ test("pending and unavailable runs remain distinct from a successful empty previ
     });
     const card = setupPresentation(raw, service);
     assert.equal(card.status.labelKey, "mailkeeper-setup.ready");
-    assert.deepEqual(card.actions.map((entry) => entry.id), ["open"]);
+    assert.deepEqual(card.actions.map((entry) => entry.id), ["open", "setup"]);
     const view = usagePresentation(raw, service);
     const result = view.details.find((entry) => entry.id === "status-preview");
     assert.equal(result.value, `mailkeeper-setup.outcome-${outcome}`);

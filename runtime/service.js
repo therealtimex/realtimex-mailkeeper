@@ -217,6 +217,7 @@ class MailKeeperService {
     await this.store.set(this.profileKey(workspace), {
       ...profile,
       state: "disabled",
+      ...(this.profileConfig(workspace).config.maintenanceEnabled ? { scheduleSuspendedForRepair: true } : {}),
       updatedAt: new Date().toISOString(),
     });
     await this.host.heartbeat.removeManagedTask(workspace, {

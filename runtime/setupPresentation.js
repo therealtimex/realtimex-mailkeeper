@@ -369,9 +369,14 @@ function setupPresentation(setup, service) {
       .map((section) => ({ ...section, details: section.id === "connection"
         ? section.details.filter((row) => row.id !== "verified") : [] })),
     actions: canOpen
-      ? full.actions.filter((entry) => entry.id === "open").map((entry) => ({ ...entry, variant: "primary" }))
+      ? [
+          ...full.actions.filter((entry) => entry.id === "open").map((entry) => ({ ...entry, variant: "primary" })),
+          action("setup", "setup", { variant: "outline", kind: "navigate", navigation: { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" } }),
+        ]
       : [action("setup", failed?.code === "CONNECTION_FAILED" ? "retry-connection"
-        : failed ? "reconnect-account" : setupStarted ? "continue" : "setup", { variant: "primary" })],
+        : failed ? "reconnect-account" : setupStarted ? "continue" : "setup", {
+          variant: "primary", kind: "navigate", navigation: { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" },
+        })],
   };
 }
 

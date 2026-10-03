@@ -96,11 +96,11 @@ module.exports = {
     });
   },
 
-  async setupStatus(workspace) {
-    await this.ingestOutbox(workspace);
+  async setupStatus(workspace, { cached = false } = {}) {
+    if (!cached) await this.ingestOutbox(workspace);
     const profile = await this.store.get(this.profileKey(workspace)) || {};
     const { config, errors } = this.profileConfig(workspace);
-    const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
+    const target = cached ? null : await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
     let state = profile.schemaVersion === 1 ? profile.state : "needs_setup";
     const stale = Boolean(profile.revision && target && profile.revision !== this.setupRevision(config, target));
     if (stale && state === "ready") state = "needs_repair";
@@ -114,7 +114,7 @@ module.exports = {
       (config.maintenanceEnabled && (state === "needs_repair" || (state === "needs_setup" && profile.schemaVersion === 1))));
     const heartbeatSettings = await this.host.heartbeat.readSettings?.(workspace) || {};
     const previewStatus = preview ? this.runProjection(preview) : active?.kind === "onboarding-preview" ? { runId: active.runId, outcome: "pending", scope: active.scope, startedAt: active.startedAt } : profile.previewRunId ? { runId: profile.previewRunId, outcome: "unavailable", scope: reservation?.scope, startedAt: reservation?.startedAt } : null;
-    return { schemaVersion: 1, state, stale, blockers: profile.blockers || [],
+    return { schemaVersion: 1, state: cached ? "disabled" : state, stale: cached || stale, blockers: profile.blockers || [],
       missingFields: errors.length ? [!config.emailAccounts.length && "EMAIL_ACCOUNTS", !config.agent && "AGENT"].filter(Boolean) : [],
       operationId: profile.operationId || null, setupStarted: profile.setupStarted === true, verifiedAt: profile.verifiedAt || null,
       accountChecks: profile.accountChecks || {}, threadSlug: profile.threadSlug || null,
@@ -128,7 +128,7 @@ module.exports = {
         suspendedForRepair,
         ...(suspendedForRepair ? { nextScheduledRunAt: null } : {}),
       },
-      hostSupported: Boolean(target && this.host.heartbeat.getManagedTaskStatus),
+      hostSupported: Boolean((cached ? this.api.email : target) && this.host.heartbeat.getManagedTaskStatus),
       emailTarget: target ? { source: target.source, revision: target.revision } : null,
     };
   },
@@ -234,8 +234,8 @@ module.exports = {
     ];
   },
 
-  async previewReceiptItems(workspace, threadSlug) {
-    const setup = await this.setupStatus(workspace);
+  async previewReceiptItems(workspace, threadSlug, options = {}) {
+    const setup = await this.setupStatus(workspace, options);
     if (!threadSlug || threadSlug !== setup.threadSlug || !setup.preview) return [];
     const index = await this.store.get(this.runIndexKey(workspace)) || [];
     const runs = [setup.preview];
