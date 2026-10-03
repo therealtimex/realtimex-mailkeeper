@@ -24,19 +24,19 @@ const execFileAsync = promisify(execFile);
 const HIMALAYA_BIN = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const BATCH = 200;
 
-function tailArgs(account) {
+function tailArgs(account, configPath) {
   // `-a` / `-c` / `-o` are per-subcommand options in Himalaya, so they go last.
   return [
     "-a", account,
     "-o", "json",
-    ...(process.env.HIMALAYA_CONFIG ? ["-c", process.env.HIMALAYA_CONFIG] : []),
+    ...(configPath || process.env.HIMALAYA_CONFIG ? ["-c", configPath || process.env.HIMALAYA_CONFIG] : []),
   ];
 }
 
-async function himalaya(account, args, { timeoutMs = 120_000 } = {}) {
+async function himalaya(account, args, { timeoutMs = 120_000, configPath } = {}) {
   const { stdout } = await execFileAsync(
     HIMALAYA_BIN,
-    [...args, ...tailArgs(account)],
+    [...args, ...tailArgs(account, configPath)],
     { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 }
   );
   return stdout.trim() ? JSON.parse(stdout) : null;
@@ -46,12 +46,12 @@ async function himalaya(account, args, { timeoutMs = 120_000 } = {}) {
  * Accounts declared in the Himalaya TOML. Names only — never hosts, addresses
  * or secrets — which is exactly what the EMAIL_ACCOUNTS picker needs.
  */
-async function listAccounts() {
+async function listAccounts({ configPath } = {}) {
   const { stdout } = await execFileAsync(
     HIMALAYA_BIN,
     [
       "account", "list", "-o", "json",
-      ...(process.env.HIMALAYA_CONFIG ? ["-c", process.env.HIMALAYA_CONFIG] : []),
+      ...(configPath || process.env.HIMALAYA_CONFIG ? ["-c", configPath || process.env.HIMALAYA_CONFIG] : []),
     ],
     { timeout: 30_000, maxBuffer: 1024 * 1024 }
   );
@@ -68,18 +68,41 @@ async function listAccounts() {
 /**
  * Cheap readiness probe: can we list folders for this account?
  */
-async function checkAccount(account) {
+async function checkAccount(account, { configPath } = {}) {
   try {
     const folders = await himalaya(account, ["folder", "list"], {
       timeoutMs: 30_000,
+      configPath,
     });
     return { ok: true, folders: Array.isArray(folders) ? folders.map((f) => f.name) : [] };
   } catch (error) {
     return {
       ok: false,
-      error: `Himalaya account "${account}" is not usable: ${firstLine(error)}`,
+      ...classifyError(error),
     };
   }
+}
+
+// Only allowlisted summaries cross the process boundary. Error chains often
+// start with a generic heading; inspect the whole chain, never persist stderr.
+function classifyError(error) {
+  const detail = String(error?.stderr || error?.message || "")
+    .replace(/\u001b\[[0-9;]*m/g, "");
+  let code = "CONNECTION_FAILED";
+  if (error?.code === "ENOENT") code = "CLI_MISSING";
+  else if (/toml|parse.*config|invalid.*config/i.test(detail)) code = "CONFIG_INVALID";
+  else if (/account.*(?:not found|does not exist|unknown)|unknown account/i.test(detail)) code = "ACCOUNT_NOT_FOUND";
+  else if (/security:.*(?:could not be found|specified item)|(?:keychain|security|find-generic-password)[\s\S]*\b44\b/i.test(detail)) code = "CREDENTIAL_MISSING";
+  else if (/authentication failed|auth(?:entication)?failed|invalid credentials|login failed/i.test(detail)) code = "AUTH_FAILED";
+  const messages = {
+    CLI_MISSING: "Install Himalaya, then check again.",
+    CONFIG_INVALID: "Repair the email configuration, then check again.",
+    ACCOUNT_NOT_FOUND: "Add the selected email account, then check again.",
+    CREDENTIAL_MISSING: "Save the credential privately, then check again.",
+    AUTH_FAILED: "Review the private credential and provider authentication settings.",
+    CONNECTION_FAILED: "Check the connection and provider settings, then retry.",
+  };
+  return { code, error: messages[code], retryable: true };
 }
 
 function firstLine(error) {
@@ -135,13 +158,13 @@ function normalizeEnvelope(row, folder) {
  * Move a set of UIDs from one folder to another. Returns the action records
  * that go into the run receipt so /undo can reverse them.
  */
-async function move(account, uids, { from = "INBOX", to, dryRun = false } = {}) {
+async function move(account, uids, { from = "INBOX", to, dryRun = false, configPath } = {}) {
   if (!to) throw new Error("move requires a target folder");
   const actions = [];
   for (let i = 0; i < uids.length; i += BATCH) {
     const chunk = uids.slice(i, i + BATCH);
     if (!dryRun) {
-      await himalaya(account, ["message", "move", "-f", from, to, ...chunk]);
+      await himalaya(account, ["message", "move", "-f", from, to, ...chunk], { configPath });
     }
     for (const uid of chunk) {
       actions.push({ kind: "move", uid, from, to, dryRun });
@@ -155,7 +178,7 @@ async function move(account, uids, { from = "INBOX", to, dryRun = false } = {}) 
  * moving back; UIDs may change across folders on some servers, in which case
  * we report the ones we could not find instead of guessing.
  */
-async function undoActions(account, actions, { dryRun = false } = {}) {
+async function undoActions(account, actions, { dryRun = false, configPath } = {}) {
   const byPair = new Map();
   for (const action of actions) {
     if (action.kind !== "move" || action.dryRun) continue;
@@ -171,10 +194,11 @@ async function undoActions(account, actions, { dryRun = false } = {}) {
         from: group.from,
         to: group.to,
         dryRun,
+        configPath,
       });
       reversed.push(...done);
     } catch (error) {
-      skipped.push({ ...group, error: firstLine(error) });
+      skipped.push({ ...group, error: classifyError(error).error });
     }
   }
   return { reversed: reversed.length, skipped, dryRun };
@@ -198,4 +222,5 @@ module.exports = {
   undoActions,
   ensureFolder,
   normalizeEnvelope,
+  classifyError,
 };
