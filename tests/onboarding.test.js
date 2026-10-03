@@ -41,6 +41,8 @@ test("new setup verifies resources and creates a disabled task", async (t) => {
   assert.equal(status.state, "ready"); assert.equal(f.task().interval, "disabled");
   assert.equal(f.api.getConfig().MAINTENANCE_ENABLED, false);
   assert.ok(fs.existsSync(path.join(f.workspace.workingDirectory, "MAILBOX.md")));
+  assert.equal(status.preview, null);
+  assert.ok(!status.checklist.some((step) => ["preview", "schedule"].includes(step.id)));
 });
 test("status is cached and does not probe a mailbox", async (t) => {
   const f = fixture(t); mailbox.checkAccount = async () => { throw Error("must not probe"); };
@@ -148,6 +150,21 @@ test("heartbeat admission requires readiness and explicit schedule", async (t) =
   await f.service.setSchedule(f.workspace, { enabled: true, cadence: "1d" }, { id: 1 }); await f.service.setupJobs.get(1)?.promise;
   assert.ok((await f.service.admitHeartbeat({ workspace: { id: 1 } })).mailkeeperRunId);
 });
+test("unchanged setup Apply and cadence-only edits preserve a healthy saved schedule", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "4h" });
+  const before = await f.ready();
+  for (const patch of [{ AGENT: "cursor" }, { CADENCE: "12h" }]) {
+    await f.service.configureSetup(f.workspace, patch);
+    await f.service.setupJobs.get(1)?.promise;
+    const status = await f.service.setupStatus(f.workspace);
+    assert.equal(status.state, "ready");
+    assert.equal(status.schedule.suspendedForRepair, false);
+    assert.equal(status.schedule.intent, true);
+    assert.equal(status.threadSlug, before.threadSlug);
+    assert.equal(status.preview, null);
+    assert.equal(f.task().interval, f.api.getConfig().CADENCE);
+  }
+});
 test("error classifier reads chains and omits private stderr", () => {
   const error = mailbox.classifyError({ stderr: "Error: genericError\nsecurity: SecKeychainSearchCopyNext: The specified item could not be found in the keychain.\n private-user@test.local token" });
   assert.equal(error.code, "CREDENTIAL_MISSING"); assert.equal(JSON.stringify(error).includes("private-user"), false);
@@ -202,9 +219,111 @@ test("expired receipts retain scope but never claim a pending scan or zero findi
   await f.api.getStore().set("ws-1-active", null);
   const setup = await f.service.setupStatus(f.workspace);
   assert.equal(setup.preview.runId, runId); assert.equal(setup.preview.outcome, "unavailable");
-  assert.equal(setup.checklist.find((entry) => entry.id === "preview").state, "awaiting");
+  assert.equal(setup.state, "ready");
   const [item] = await f.service.previewReceiptItems(f.workspace, setup.threadSlug);
   assert.equal(item.status.code, "unavailable");
   assert.deepEqual(item.details.filter((entry) => ["checked", "urgent", "proposed", "changes"].includes(entry.id)), []);
   assert.equal(item.details.find((entry) => entry.id === "accounts").value, "fixture");
+});
+
+test("scheduled repair keeps intent but checks and Apply cannot resume execution", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "4h", MODE: "label-only" });
+  await f.ready();
+  assert.equal(f.task().interval, "4h");
+  await f.ready();
+  assert.equal(f.task().interval, "4h", "healthy existing schedule stays healthy");
+  mailbox.checkAccount = async () => ({ ok: false, code: "AUTH_FAILED", error: "Review authentication." });
+  const failed = await f.ready();
+  assert.equal(failed.schedule.intent, true);
+  assert.equal(failed.schedule.cadence, "4h");
+  assert.equal(failed.schedule.suspendedForRepair, true);
+  assert.equal(failed.schedule.exists, false);
+  assert.equal(failed.schedule.nextScheduledRunAt, null);
+  mailbox.checkAccount = async () => ({ ok: true, folders: ["INBOX"] });
+  const repaired = await f.ready();
+  assert.equal(repaired.state, "ready");
+  assert.equal(f.task().interval, "disabled");
+  await f.service.configureSetup(f.workspace, { AGENT: "cursor" });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(f.task().interval, "disabled");
+  assert.equal(f.api.getConfig().MODE, "label-only");
+  assert.equal(f.api.getConfig().MAINTENANCE_ENABLED, true);
+  assert.equal((await f.service.admitHeartbeat({ workspace: { id: 1 } })).skipLaunch, true);
+  await assert.rejects(f.service.setSchedule(f.workspace, { enabled: true, cadence: "4h" }, { id: 1 }), { code: "SCHEDULE_SUSPENDED" });
+  await assert.rejects(f.service.setSchedule(f.workspace, { enabled: true, cadence: "4h", resume: true }, {}), { code: "HUMAN_REQUIRED" });
+  await assert.rejects(f.service.setSchedule(f.workspace, { enabled: true, cadence: "1d", resume: true }, { id: 1 }), { code: "SCHEDULE_CHANGED" });
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "4h", resume: true }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(f.task().interval, "4h");
+  assert.equal((await f.service.setupStatus(f.workspace)).schedule.suspendedForRepair, false);
+});
+
+test("an already-failed saved schedule is conservatively suspended after restart", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "12h" });
+  await f.api.getStore().set("ws-1-profile", { schemaVersion: 1, scheduleMigrated: true, state: "needs_repair", taskId: "mailkeeper-maintenance-1" });
+  const ready = await f.ready();
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.schedule.suspendedForRepair, true);
+  assert.equal(f.task().interval, "disabled");
+});
+
+test("resume preserves workspace pause and rejects a stale queued occurrence", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "4h" });
+  await f.ready();
+  mailbox.checkAccount = async () => ({ ok: false, code: "AUTH_FAILED", error: "Review authentication." });
+  await f.ready();
+  mailbox.checkAccount = async () => ({ ok: true, folders: ["INBOX"] });
+  const upsert = f.api.heartbeat.upsertManagedTask;
+  f.api.heartbeat.upsertManagedTask = async (workspace, value) => { await upsert(workspace, { ...value, interval: "disabled" }); return { explicitlyPaused: true }; };
+  const read = f.api.heartbeat.getManagedTaskStatus;
+  f.api.heartbeat.getManagedTaskStatus = async () => ({ ...await read(), paused: true, pauseReason: "workspace_paused" });
+  f.api.heartbeat.readSettings = async () => ({ enabled: false, timezone: "UTC" });
+  await f.ready();
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "4h", resume: true }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.state, "ready");
+  assert.equal(status.schedule.suspendedForRepair, false);
+  assert.equal(status.schedule.pauseReason, "workspace_paused");
+  assert.equal(f.task().interval, "disabled");
+  assert.equal(f.api.getConfig().MAINTENANCE_ENABLED, true);
+  assert.equal((await f.service.admitHeartbeat({ workspace: { id: 1 } })).skipLaunch, true);
+});
+
+test("failed resume readback restores suspension before removing the owned task", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "4h" });
+  await f.ready();
+  mailbox.checkAccount = async () => ({ ok: false, code: "AUTH_FAILED", error: "Review authentication." });
+  await f.ready();
+  mailbox.checkAccount = async () => ({ ok: true, folders: ["INBOX"] });
+  await f.ready();
+  const read = f.api.heartbeat.getManagedTaskStatus;
+  f.api.heartbeat.getManagedTaskStatus = async () => ({ ...await read(), interval: "disabled" });
+  const remove = f.api.heartbeat.removeManagedTask;
+  let persistedBeforeRemoval = false;
+  f.api.heartbeat.removeManagedTask = async (...args) => { persistedBeforeRemoval = f.storeData.get("ws-1-profile").scheduleSuspendedForRepair === true; return remove(...args); };
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "4h", resume: true }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal((await f.service.setupStatus(f.workspace)).state, "needs_repair");
+  assert.equal(persistedBeforeRemoval, true);
+  assert.equal(f.task(), null);
+  assert.equal(f.api.getConfig().CADENCE, "4h");
+});
+
+test("disable waits for scheduler reconciliation and keeps the latest repair suspension", async (t) => {
+  const f = fixture(t, { MAINTENANCE_ENABLED: true, CADENCE: "4h" });
+  await f.ready();
+  await f.api.getStore().set("ws-1-profile", { ...f.storeData.get("ws-1-profile"), scheduleSuspendedForRepair: true });
+  let release, started;
+  const began = new Promise((resolve) => { started = resolve; });
+  const upsert = f.api.heartbeat.upsertManagedTask;
+  f.api.heartbeat.upsertManagedTask = async (...args) => { started(); await new Promise((resolve) => { release = resolve; }); return upsert(...args); };
+  await f.service.beginSetup(f.workspace);
+  const job = f.service.setupJobs.get(1).promise;
+  await began;
+  const disable = f.service.disable(f.workspace);
+  release(); await Promise.all([job, disable]);
+  assert.equal(f.storeData.get("ws-1-profile").state, "disabled");
+  assert.equal(f.storeData.get("ws-1-profile").scheduleSuspendedForRepair, true);
+  assert.equal(f.task(), null);
 });

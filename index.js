@@ -4,7 +4,7 @@ const fs = require("fs");
 const path = require("path");
 const { definePlugin } = require("@realtimex/plugin-sdk");
 const { MailKeeperService, PLUGIN_ID } = require("./runtime/service");
-const { setupPresentation, credentialDialog } = require("./runtime/setupPresentation");
+const { setupPresentation, journeyPresentation, usagePresentation, credentialDialog } = require("./runtime/setupPresentation");
 
 const SKILL_DIR = path.join(__dirname, "skills", "mailbox-cleanup");
 
@@ -110,18 +110,45 @@ module.exports = definePlugin({
     api.registerRoute("GET", "/setup/card", (request, response) =>
       withScope(service, request, response, async ({ workspace }) => response.json({ items: [setupPresentation(await service.setupStatus(workspace), service)] }),
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
+    api.registerRoute("GET", "/setup/journey", (request, response) =>
+      withScope(service, request, response, async ({ workspace }) => response.json({ items: [journeyPresentation(await service.setupStatus(workspace), service)] })),
+      { auth: "contribution" });
     api.registerRoute("GET", "/setup/receipts", (request, response) =>
-      withScope(service, request, response, async ({ workspace }) => response.json({ items: await service.previewReceiptItems(workspace, request.pluginContext?.scope?.threadSlug) }),
+      withScope(service, request, response, async ({ workspace }) => {
+        const setup = await service.setupStatus(workspace);
+        const threadSlug = request.pluginContext?.scope?.threadSlug;
+        if (!threadSlug || threadSlug !== setup.threadSlug) return response.json({ items: [] });
+        return response.json({ items: [usagePresentation(setup, service), ...await service.previewReceiptItems(workspace, threadSlug)] });
+      },
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
     api.registerRoute("POST", "/setup/action", (request, response) =>
       withScope(service, request, response, async ({ workspace, user }) => {
         const action = request.pluginContext.actionId;
-        if (action === "setup") return response.json({ ok: true, navigation: { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" } });
-        if (action === "check") return response.status(202).json({ ok: true, ...(await service.beginSetup(workspace)) });
+        const payload = request.body?.payload || {};
+        if (request.pluginContext.surface === "chat-history") {
+          const setup = await service.setupStatus(workspace);
+          if (!setup.threadSlug || request.pluginContext.scope.threadSlug !== setup.threadSlug)
+            return response.status(403).json({ ok: false, code: "USAGE_SCOPE_REQUIRED" });
+        }
+        if (action === "setup") {
+          await service.exclusive(workspace, async () => {
+            const profile = await service.store.get(service.profileKey(workspace)) || {};
+            await service.store.set(service.profileKey(workspace), { ...profile, setupStarted: true });
+          });
+          return response.json({ ok: true, navigation: { kind: "ai-editor", fieldKey: "MAILKEEPER_SETUP_FILE" } });
+        }
+        if (action === "check") {
+          if (payload.accountRef && !service.profileConfig(workspace).config.emailAccounts.includes(payload.accountRef))
+            return response.status(400).json({ ok: false, code: "ACCOUNT_NOT_SELECTED" });
+          return response.status(202).json({ ok: true, ...(await service.beginSetup(workspace)) });
+        }
         if (action === "credential") {
-          const { config } = service.profileConfig(workspace);
-          const references = await Promise.all(config.emailAccounts.map(async (accountRef) => ({ accountRef, ...(await api.email.getCredentialReference(accountRef)) })));
-          return response.json({ ok: true, dialog: credentialDialog(references) });
+          const setup = await service.setupStatus(workspace);
+          const accountRef = payload.accountRef;
+          if (!setup.scope.accounts.includes(accountRef)) return response.status(400).json({ ok: false, code: "ACCOUNT_NOT_SELECTED" });
+          if (!setup.blockers.some((entry) => entry.accountRef === accountRef && ["CREDENTIAL_MISSING", "AUTH_FAILED"].includes(entry.code)))
+            return response.status(409).json({ ok: false, code: "ACCOUNT_AUTHENTICATION_NOT_REQUIRED" });
+          return response.json({ ok: true, dialog: credentialDialog([{ accountRef, ...(await api.email.getCredentialReference(accountRef)) }]) });
         }
         if (action === "preview") return response.status(202).json({ ok: true, ...(await service.preview(workspace, { request, response })) });
         if (action === "schedule") return response.status(202).json({ ok: true, ...(await service.setSchedule(workspace, request.body?.payload || {}, user)) });

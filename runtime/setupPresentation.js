@@ -68,7 +68,12 @@ function scheduleDetails(setup) {
         : "translation",
     ),
   ];
-  if (schedule.intent)
+  if (schedule.suspendedForRepair) {
+    rows.push(detail("next", "next-at-label", "mailkeeper-setup.execution-stopped", "translation"),
+      detail("task", "task-state", `mailkeeper-setup.${schedule.exists ? "execution-stopped" : "task-unavailable"}`, "translation"));
+    if (schedule.pauseReason === "workspace_paused")
+      rows.push(detail("pause", "schedule", "mailkeeper-setup.heartbeat-paused", "translation"));
+  } else if (schedule.intent)
     rows.push(
       schedule.nextScheduledRunAt
         ? detail(
@@ -96,7 +101,7 @@ function scheduleDetails(setup) {
   return rows;
 }
 
-function setupPresentation(setup, service) {
+function fullPresentation(setup, service) {
   const pending =
     ["checking", "preparing"].includes(setup.state) ||
     setup.preview?.outcome === "pending";
@@ -143,8 +148,10 @@ function setupPresentation(setup, service) {
   sections.push({
     id: "schedule",
     title: label("schedule"),
-    status: label(setup.schedule.intent ? "schedule-saved" : "not-scheduled"),
-    details: setup.schedule.intent
+    status: label(setup.schedule.suspendedForRepair
+      ? setup.state === "ready" ? "schedule-stopped-ready" : "schedule-stopped-repair"
+      : setup.schedule.intent ? "schedule-saved" : "not-scheduled"),
+    details: setup.schedule.intent || setup.schedule.suspendedForRepair
       ? [
           detail(
             "cadence",
@@ -227,7 +234,6 @@ function setupPresentation(setup, service) {
         },
       }),
     );
-  actions.push(action("credential", "private-credential"));
   if (
     ["ready", "disabled"].includes(setup.state) ||
     setup.blockers.some((entry) => entry.code === "SCHEDULE_CONFLICT")
@@ -259,6 +265,7 @@ function setupPresentation(setup, service) {
               actionId: "schedule",
               payload: { enabled: true },
               variant: "primary",
+              disabled: setup.schedule.suspendedForRepair,
             }),
           ],
         },
@@ -271,6 +278,17 @@ function setupPresentation(setup, service) {
         navigation: { kind: "heartbeat-settings" },
       }),
     );
+  if (setup.state === "ready" && setup.schedule.suspendedForRepair)
+    actions.push(action("resume-schedule", "resume-schedule", {
+      form: {
+        title: label("resume-schedule"), description: label("resume-confirm"),
+        details: [detail("cadence", "schedule", `mailkeeper-setup.cadence-${setup.schedule.cadence}`, "translation"), ...scheduleDetails(setup)],
+        actions: [action("resume", "resume-schedule", {
+          actionId: "schedule", variant: "primary",
+          payload: { enabled: true, cadence: setup.schedule.cadence, resume: true },
+        })],
+      },
+    }));
   return {
     schemaVersion: 2,
     state: setup.state,
@@ -323,12 +341,79 @@ function credentialDialog(references) {
         ],
   );
   return {
-    title: label("private-credential"),
+    title: label("sign-in-account", { account: references[0]?.accountRef || "" }),
     description: label("keychain-instructions"),
     details,
-    notices: [{ id: "update", ...label("keychain-edit") }],
-    actions: [action("check", "saved-check", { variant: "primary" })],
+    notices: [{ id: "update", ...label("keychain-edit") }, { id: "return", ...label("credential-return") }],
+    actions: [action("check", "saved-check", { variant: "primary",
+      payload: { accountRef: references[0]?.accountRef },
+      disabled: references.some((entry) => !entry.supported || entry.route !== "keychain-access"),
+    })],
   };
 }
 
-module.exports = { setupPresentation, credentialDialog };
+function setupPresentation(setup, service) {
+  const full = fullPresentation(setup, service);
+  const setupStarted = setup.setupStarted || Boolean(setup.verifiedAt);
+  const connected = setup.state === "ready" && !setup.stale;
+  const failed = (setup.blockers || []).find((entry) => ["AUTH_FAILED", "CREDENTIAL_MISSING", "CONNECTION_FAILED"].includes(entry.code));
+  const canOpen = connected || (setup.state === "disabled" && setup.threadSlug);
+  return {
+    ...full, checklist: [], missingFields: [], notices: [],
+    status: connected ? label("ready") : failed
+      ? label(failed.code === "CONNECTION_FAILED" ? "retry-connection" : "sign-in-account", { account: failed.accountRef }) : setupStarted
+      ? label(setup.missingFields?.length ? "next-settings" : states[setup.state] || "needs-setup")
+      : label("connect-invite"),
+    sections: full.sections.filter((section) => section.id === "connection" && (connected || failed)
+      || section.id === "schedule" && (setup.schedule.intent || setup.schedule.suspendedForRepair))
+      .map((section) => ({ ...section, details: section.id === "connection"
+        ? section.details.filter((row) => row.id !== "verified") : [] })),
+    actions: canOpen
+      ? full.actions.filter((entry) => entry.id === "open").map((entry) => ({ ...entry, variant: "primary" }))
+      : [action("setup", failed?.code === "CONNECTION_FAILED" ? "retry-connection"
+        : failed ? "reconnect-account" : setupStarted ? "continue" : "setup", { variant: "primary" })],
+  };
+}
+
+function journeyPresentation(setup, service) {
+  const full = fullPresentation(setup, service);
+  const pending = ["checking", "preparing"].includes(setup.state);
+  const repairs = (setup.blockers || []).filter((entry) => entry.accountRef && ["CREDENTIAL_MISSING", "AUTH_FAILED", "CONNECTION_FAILED"].includes(entry.code));
+  const repairActions = repairs.map((entry, i) => action(`repair-${i}`,
+    entry.code === "CONNECTION_FAILED" ? "retry-connection" : "sign-in-account", {
+      values: { account: entry.accountRef },
+      actionId: entry.code === "CONNECTION_FAILED" ? "check" : "credential",
+      payload: { accountRef: entry.accountRef }, disabled: pending,
+    }));
+  return { ...full, pending,
+    notices: full.notices.map((notice) => notice.labelKey === "mailkeeper-setup.credential-recovery"
+      ? { id: notice.id, ...label("credential-return") } : notice),
+    sections: full.sections.filter((section) => section.id === "connection"),
+    actions: [
+      ...repairActions,
+      ...full.actions.filter((entry) => (entry.id === "check" && !repairs.length && !setup.missingFields?.length)
+        || (entry.id === "open" && setup.state === "ready")).map((entry) => entry.id === "check" ? { ...entry, disabled: pending } : entry),
+    ],
+  };
+}
+
+function usagePresentation(setup, service) {
+  const full = fullPresentation(setup, service);
+  return {
+    id: "mailkeeper-usage", expanded: true, actionContract: 2,
+    status: { code: full.pending ? "pending" : setup.state, ...label("open"),
+      values: { name: "MailKeeper" }, summaryKey: "mailkeeper-setup.usage-intro" },
+    details: full.sections.flatMap((section) => [
+      { id: `status-${section.id}`, ...section.title, value: section.status.labelKey, type: "translation" },
+      ...(section.details || []).map((row) => ({ ...row, id: `${section.id}-${row.id}` })),
+    ]),
+    handledActionIds: full.handledActionIds,
+    actions: [
+      ...full.actions.filter((entry) => ["preview", "result", "schedule", "resume-schedule", "agent-settings", "heartbeat-settings"].includes(entry.id)),
+      ...setupPresentation(setup, service).actions.filter((entry) => entry.id === "setup")
+        .map((entry) => ({ ...entry, variant: "outline" })),
+    ],
+  };
+}
+
+module.exports = { setupPresentation, journeyPresentation, usagePresentation, credentialDialog };

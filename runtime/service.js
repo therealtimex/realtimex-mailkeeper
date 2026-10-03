@@ -97,16 +97,16 @@ class MailKeeperService {
 
     if (errors.length) {
       // Not ready: make sure nothing runs, but keep prior state for repair.
+      await this.suspendScheduleForRepair(workspace, operation);
       await this.host.heartbeat.removeManagedTask(workspace, {
         id: taskIdentity(workspace.id),
       });
-      await this.store.set(this.profileKey(workspace), {
-        ...profile,
+      await this.updateSetupProfile(workspace, {
         state: "needs_setup", schemaVersion: 1,
         blockers: errors.map((error) => ({ code: "CONFIG_REQUIRED", safeMessage: error, retryable: true })),
         errors,
         updatedAt: new Date().toISOString(),
-      });
+      }, operation);
       this.api.log?.warn?.("MailKeeper profile not ready", {
         workspace: workspace.slug,
         errors,
@@ -124,11 +124,11 @@ class MailKeeperService {
       if (!probe.ok) authErrors.push(probe.error);
     }
     if (authErrors.length) {
+      await this.suspendScheduleForRepair(workspace, operation);
       await this.host.heartbeat.removeManagedTask(workspace, {
         id: taskIdentity(workspace.id),
       });
-      await this.store.set(this.profileKey(workspace), {
-        ...profile,
+      await this.updateSetupProfile(workspace, {
         state: "needs_repair", schemaVersion: 1,
         blockers: Object.entries(readiness).filter(([, check]) => !check.ok).map(([accountRef, check]) => ({
           accountRef, code: check.code, safeMessage: check.error, retryable: true, actionId: "check",
@@ -136,12 +136,12 @@ class MailKeeperService {
         accountChecks: readiness, revision,
         errors: authErrors,
         updatedAt: new Date().toISOString(),
-      });
+      }, operation);
       return { state: "needs_repair", errors: authErrors };
     }
 
     await current();
-    await this.store.set(this.profileKey(workspace), { ...profile, state: "preparing", accountChecks: readiness });
+    await this.updateSetupProfile(workspace, { state: "preparing", accountChecks: readiness }, operation);
     let thread = profile.threadSlug && await this.host.workspaces.getThread?.(workspace, { slug: profile.threadSlug });
     if (thread?.archivedAt) throw codedError("Open or restore the maintenance thread, then check again.", "THREAD_ARCHIVED", 409);
     thread = thread || await this.host.workspaces.ensureThread(workspace, {
@@ -155,10 +155,17 @@ class MailKeeperService {
     this.syncRulesFile(workspace, config, rules, readiness);
     await current();
 
+    // Commit scheduler reconciliation and the ready profile under the same
+    // lock as suspension, schedule choices and disablement.
+    return this.exclusive(workspace, async () => {
+    await current();
+    const latest = await this.store.get(this.profileKey(workspace));
+    const scheduleConfig = this.profileConfig(workspace).config;
+    const interval = scheduleConfig.maintenanceEnabled && !latest.scheduleSuspendedForRepair ? scheduleConfig.cadence : "disabled";
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
       name: `MailKeeper maintenance (${config.emailAccounts.join(", ")})`.slice(0, 120),
-      interval: config.maintenanceEnabled ? config.cadence : "disabled",
+      interval,
       executor: "agent",
       agent: config.agent,
       ...(config.model ? { model: config.model } : {}),
@@ -173,7 +180,7 @@ class MailKeeperService {
     });
 
     const next = {
-      ...profile, schemaVersion: 1, state: "ready",
+      schemaVersion: 1, state: "ready",
       blockers: [], accountChecks: readiness, revision,
       verifiedAt: new Date().toISOString(), operationId: operation,
       errors: [],
@@ -188,16 +195,24 @@ class MailKeeperService {
     await current();
     const resources = await this.host.heartbeat.getManagedTaskStatus(workspace, { id: next.taskId });
     const readback = await this.host.workspaces.getThread(workspace, { slug: thread.slug });
-    if (!resources.exists || !readback || readback.archivedAt ||
+    const expectedInterval = heartbeat.explicitlyPaused ? "disabled" : interval;
+    const freshSchedule = this.profileConfig(workspace).config;
+    if (!resources.exists || resources.interval !== expectedInterval ||
+        freshSchedule.maintenanceEnabled !== scheduleConfig.maintenanceEnabled || freshSchedule.cadence !== scheduleConfig.cadence ||
+        !readback || readback.archivedAt ||
         !fs.existsSync(path.join(workspace.workingDirectory, config.contractPath))) {
       throw codedError("Preparation did not finish. Check again.", "PROVISION_FAILED", 409);
     }
     await current();
-    await this.store.set(this.profileKey(workspace), next);
-    return next;
+    const fresh = await this.store.get(this.profileKey(workspace));
+    const saved = { ...fresh, ...next };
+    await this.store.set(this.profileKey(workspace), saved);
+    return saved;
+    });
   }
 
   async disable(workspace) {
+    return this.exclusive(workspace, async () => {
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
     await this.store.set(this.profileKey(workspace), {
       ...profile,
@@ -209,6 +224,7 @@ class MailKeeperService {
     });
     // Thread, contract file, rules and run receipts are intentionally kept:
     // they are the user's audit trail and survive re-enable.
+    });
   }
 
   async disableAll() {
@@ -606,7 +622,8 @@ class MailKeeperService {
     return this.exclusive(workspace, async () => {
     const { config, errors } = this.profileConfig(workspace);
     const setup = await this.setupStatus(workspace);
-    if (!config.maintenanceEnabled || setup.state !== "ready") {
+    if (!config.maintenanceEnabled || setup.state !== "ready" || setup.schedule.suspendedForRepair ||
+        setup.schedule.paused || setup.schedule.interval === "disabled" || setup.schedule.pauseReason === "workspace_paused") {
       return { skipLaunch: true, skipReason: "setup or schedule not ready" };
     }
     if (errors.length) {

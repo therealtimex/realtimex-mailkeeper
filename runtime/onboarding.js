@@ -24,6 +24,22 @@ module.exports = {
     return crypto.createHash("sha256").update(JSON.stringify({ verificationConfig, target })).digest("hex");
   },
 
+  async updateSetupProfile(workspace, patch, operationId) {
+    return this.exclusive(workspace, async () => {
+      const profile = await this.store.get(this.profileKey(workspace)) || {};
+      if (profile.state === "disabled" || (operationId && profile.operationId !== operationId)) throw fault("SETUP_CHANGED");
+      const next = { ...profile, ...(typeof patch === "function" ? patch(profile) : patch) };
+      await this.store.set(this.profileKey(workspace), next);
+      return next;
+    });
+  },
+
+  async suspendScheduleForRepair(workspace, operationId) {
+    return this.updateSetupProfile(workspace, () =>
+      this.profileConfig(workspace).config.maintenanceEnabled
+        ? { scheduleSuspendedForRepair: true } : {}, operationId);
+  },
+
   async migrateSchedule(workspace) {
     const profile = await this.store.get(this.profileKey(workspace)) || {};
     if (profile.scheduleMigrated) return;
@@ -56,15 +72,25 @@ module.exports = {
       await this.migrateSchedule(workspace);
       const profile = await this.store.get(this.profileKey(workspace)) || {};
       if (profile.scheduleConflict) throw fault("SCHEDULE_CONFLICT");
+      const before = await this.setupStatus(workspace);
+      const suspend = before.schedule.intent &&
+        (before.state === "needs_repair" || (before.state === "needs_setup" && profile.schemaVersion === 1) ||
+          (profile.taskId && (!before.schedule.exists || before.missingFields.length)));
       const operationId = profile.state === "checking" || profile.state === "preparing" ? profile.operationId || crypto.randomUUID() : crypto.randomUUID();
-      await this.store.set(this.profileKey(workspace), { ...profile, schemaVersion: 1, state: "checking", operationId, blockers: [], updatedAt: now() });
+      await this.store.set(this.profileKey(workspace), { ...profile, schemaVersion: 1, state: "checking", operationId, blockers: [],
+        ...(suspend ? { scheduleSuspendedForRepair: true } : {}), updatedAt: now() });
       const job = { operationId };
       this.setupJobs.set(workspace.id, job);
       job.promise = Promise.resolve().then(() => this.provision(workspace, operationId)).catch(async (error) => {
-        const current = await this.store.get(this.profileKey(workspace)) || {};
-        if (current.operationId !== operationId || current.state === "disabled") return;
-        await this.store.set(this.profileKey(workspace), { ...current, state: "needs_repair",
-          blockers: [{ code: ["THREAD_ARCHIVED", "SETUP_CHANGED"].includes(error.code) ? error.code : "PROVISION_FAILED", retryable: true, actionId: "check" }], updatedAt: now() });
+        await this.exclusive(workspace, async () => {
+          const current = await this.store.get(this.profileKey(workspace)) || {};
+          if (current.operationId !== operationId || current.state === "disabled") return;
+          const { config } = this.profileConfig(workspace);
+          await this.store.set(this.profileKey(workspace), { ...current, state: "needs_repair",
+            ...(config.maintenanceEnabled ? { scheduleSuspendedForRepair: true } : {}),
+            blockers: [{ code: ["THREAD_ARCHIVED", "SETUP_CHANGED"].includes(error.code) ? error.code : "PROVISION_FAILED", retryable: true, actionId: "check" }], updatedAt: now() });
+          await this.host.heartbeat.removeManagedTask(workspace, { id: `mailkeeper-maintenance-${workspace.id}` });
+        });
       }).finally(() => { if (this.setupJobs.get(workspace.id) === job) this.setupJobs.delete(workspace.id); });
       return { accepted: true, operationId, reused: false };
     });
@@ -83,11 +109,14 @@ module.exports = {
     const preview = profile.previewRunId ? await this.store.get(this.runKey(workspace, profile.previewRunId)) : null;
     const reservation = profile.previewRunId ? await this.store.get(`ws-${workspace.id}-preview-${profile.previewRunId}`) : null;
     const schedule = await this.host.heartbeat.getManagedTaskStatus?.(workspace, { id: `mailkeeper-maintenance-${workspace.id}` }) || { exists: false };
+    if (state === "ready" && !schedule.exists) state = "needs_repair";
+    const suspendedForRepair = Boolean(profile.scheduleSuspendedForRepair ||
+      (config.maintenanceEnabled && (state === "needs_repair" || (state === "needs_setup" && profile.schemaVersion === 1))));
     const heartbeatSettings = await this.host.heartbeat.readSettings?.(workspace) || {};
     const previewStatus = preview ? this.runProjection(preview) : active?.kind === "onboarding-preview" ? { runId: active.runId, outcome: "pending", scope: active.scope, startedAt: active.startedAt } : profile.previewRunId ? { runId: profile.previewRunId, outcome: "unavailable", scope: reservation?.scope, startedAt: reservation?.startedAt } : null;
     return { schemaVersion: 1, state, stale, blockers: profile.blockers || [],
       missingFields: errors.length ? [!config.emailAccounts.length && "EMAIL_ACCOUNTS", !config.agent && "AGENT"].filter(Boolean) : [],
-      operationId: profile.operationId || null, verifiedAt: profile.verifiedAt || null,
+      operationId: profile.operationId || null, setupStarted: profile.setupStarted === true, verifiedAt: profile.verifiedAt || null,
       accountChecks: profile.accountChecks || {}, threadSlug: profile.threadSlug || null,
       workspaceName: workspace.name || workspace.slug,
       taskName: "MailKeeper",
@@ -95,7 +124,10 @@ module.exports = {
       scope: { accounts: config.emailAccounts, folders: ["INBOX"], agent: config.agent, model: config.model, mode: "report-only", maxPages: 5, pageSize: 200 },
       maintenanceMode: config.mode,
       checklist: this.setupChecklist({ state, stale, profile, config, errors, preview: previewStatus, schedule }),
-      schedule: { intent: config.maintenanceEnabled, cadence: config.cadence, timezone: heartbeatSettings.timezone, activeHours: heartbeatSettings.activeHours, ...schedule },
+      schedule: { intent: config.maintenanceEnabled, cadence: config.cadence, timezone: heartbeatSettings.timezone, activeHours: heartbeatSettings.activeHours, ...schedule,
+        suspendedForRepair,
+        ...(suspendedForRepair ? { nextScheduledRunAt: null } : {}),
+      },
       hostSupported: Boolean(target && this.host.heartbeat.getManagedTaskStatus),
       emailTarget: target ? { source: target.source, revision: target.revision } : null,
     };
@@ -103,26 +135,36 @@ module.exports = {
 
   async configureSetup(workspace, patch) {
     if (!patch || Array.isArray(patch) || typeof patch !== "object" || Object.keys(patch).some((key) => !editable.has(key))) throw fault("SETUP_CONFIG_INVALID", 400);
-    const raw = this.api.getConfig({ workspaceId: workspace.id });
-    const candidate = resolveProfileConfig({ ...raw, ...patch });
-    if (candidate.errors.length) throw fault("SETUP_CONFIG_INVALID", 400);
     await this.exclusive(workspace, async () => {
+      const raw = this.api.getConfig({ workspaceId: workspace.id });
+      const before = resolveProfileConfig(raw).config;
+      const candidate = resolveProfileConfig({ ...raw, ...patch });
+      if (candidate.errors.length) throw fault("SETUP_CONFIG_INVALID", 400);
+      const verificationChanged = this.setupRevision(before, null) !== this.setupRevision(candidate.config, null);
       await this.api.updateConfig(patch, { workspaceId: workspace.id, workspaceSlug: workspace.slug });
       const profile = await this.store.get(this.profileKey(workspace)) || {};
-      await this.store.set(this.profileKey(workspace), { ...profile, state: "needs_setup", operationId: null });
+      await this.store.set(this.profileKey(workspace), { ...profile,
+        ...(verificationChanged ? { state: "needs_setup", operationId: null } : {}),
+      });
     });
     return this.beginSetup(workspace);
   },
 
   async setSchedule(workspace, payload, user) {
     if (!user?.id) throw fault("HUMAN_REQUIRED", 403);
-    if (typeof payload.enabled !== "boolean" || !["4h", "12h", "1d", "3d", "7d"].includes(payload.cadence)) throw fault("SCHEDULE_INVALID", 400);
-    const setup = await this.setupStatus(workspace);
-    const before = await this.store.get(this.profileKey(workspace));
-    if (setup.state !== "ready" && !before?.scheduleConflict) throw fault("SETUP_NOT_READY");
-    await this.api.updateConfig({ MAINTENANCE_ENABLED: payload.enabled, CADENCE: payload.cadence }, { workspaceId: workspace.id, workspaceSlug: workspace.slug });
-    const profile = await this.store.get(this.profileKey(workspace));
-    await this.store.set(this.profileKey(workspace), { ...profile, scheduleConflict: false, scheduleMigrated: true });
+    if (typeof payload.enabled !== "boolean" || (payload.resume !== undefined && typeof payload.resume !== "boolean") ||
+      !["4h", "12h", "1d", "3d", "7d"].includes(payload.cadence)) throw fault("SCHEDULE_INVALID", 400);
+    await this.exclusive(workspace, async () => {
+      const setup = await this.setupStatus(workspace);
+      const before = await this.store.get(this.profileKey(workspace)) || {};
+      if (this.setupJobs.has(workspace.id) || (setup.state !== "ready" && !before.scheduleConflict)) throw fault("SETUP_NOT_READY");
+      if (payload.enabled && before.scheduleSuspendedForRepair && payload.resume !== true) throw fault("SCHEDULE_SUSPENDED");
+      if (payload.resume && (!payload.enabled || !before.scheduleSuspendedForRepair || payload.cadence !== setup.schedule.cadence)) throw fault("SCHEDULE_CHANGED");
+      await this.api.updateConfig({ MAINTENANCE_ENABLED: payload.enabled, CADENCE: payload.cadence }, { workspaceId: workspace.id, workspaceSlug: workspace.slug });
+      await this.store.set(this.profileKey(workspace), { ...before, scheduleConflict: false, scheduleMigrated: true,
+        ...(payload.resume === true ? { scheduleSuspendedForRepair: false } : {}),
+      });
+    });
     return this.beginSetup(workspace);
   },
 
@@ -189,8 +231,6 @@ module.exports = {
       { id: "connection", state: state === "checking" ? "active" : connected ? "completed" : codes.some((code) => ["CREDENTIAL_MISSING", "AUTH_FAILED", "CONNECTION_FAILED"].includes(code)) ? "failed" : "awaiting" },
       { id: "settings", state: errors.length ? "awaiting" : "completed" },
       { id: "prepare", state: state === "preparing" ? "active" : state === "ready" ? "completed" : codes.includes("PROVISION_FAILED") ? "failed" : "awaiting" },
-      { id: "preview", state: preview?.outcome === "completed" ? "completed" : ["blocked", "failed", "partial"].includes(preview?.outcome) ? "failed" : preview?.outcome === "pending" ? "active" : "awaiting" },
-      { id: "schedule", state: config.maintenanceEnabled && schedule?.exists && schedule?.runtimeState === "configured" ? "completed" : "awaiting" },
     ];
   },
 
