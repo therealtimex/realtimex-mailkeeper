@@ -40,6 +40,9 @@ const STATE = path.join(ROOT, ".mailkeeper");
 // terminal, not the plugin host; which rtxexec to launch is runtime discovery
 // injected by the environment, never plugin configuration.
 const RTXEXEC = process.env.MAILKEEPER_RTXEXEC_BIN || "rtxexec";
+// `rtxexec himalaya` arrived in 0.4.0; an older rtxexec rejects it as a usage error.
+const RTXEXEC_INSTALL = "npm install -g @realtimex/rtxexec@0.4.0";
+let rtxexecReady = false;
 let previewRules = null;
 const BATCH = 200;
 
@@ -163,10 +166,25 @@ function emailError(code, extra = {}) {
   return Object.assign(new Error(safe), { code: safe, ...extra });
 }
 
+// Checked once, before the first host call: missing or too old fails with a typed code.
+function ensureRtxexec() {
+  if (rtxexecReady) return;
+  let version = "";
+  try {
+    version = execFileSync(RTXEXEC, ["--version"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch (error) {
+    if (error.code === "ENOENT") throw emailError("RTXEXEC_UNAVAILABLE");
+  }
+  const [major, minor] = (version.match(/^(\d+)\.(\d+)\.\d+/) || []).slice(1).map(Number);
+  if (!(major > 0 || minor >= 4)) throw emailError("RTXEXEC_UPGRADE_REQUIRED");
+  rtxexecReady = true;
+}
+
 // One bounded operation: folders | envelopes | move | add-folder.
 function himalaya(account, request) {
   const config = loadRules().config;
   if (!config.pluginId) fail("rules.json predates authenticated email access. Open MailKeeper setup and check again.");
+  ensureRtxexec();
   const options = {
     plugin: config.pluginId, account, binding: config.emailBindings?.[account], operation: request.operation,
     folder: request.folder, from: request.from, to: request.to, uids: request.uids?.join(","),
@@ -642,5 +660,8 @@ if (!command || !commands[command]) {
 }
 Promise.resolve().then(() => commands[command](args)).catch((error) => {
   const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || "") ? ` (${error.code})` : "";
-  fail(`Mailbox operation failed${code}. Check the account connection and try again.`);
+  const next = ["RTXEXEC_UNAVAILABLE", "RTXEXEC_UPGRADE_REQUIRED"].includes(error?.code)
+    ? `Install rtxexec 0.4.0 or later with \`${RTXEXEC_INSTALL}\`, then run the command again.`
+    : "Check the account connection and try again.";
+  fail(`Mailbox operation failed${code}. ${next}`);
 });

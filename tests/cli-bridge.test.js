@@ -33,7 +33,8 @@ function fixture(t, { count = 0, config = {} } = {}) {
   // "crash" logs the move as dispatched, then kills the CLI before it can
   // record the outcome.
   fs.writeFileSync(binary, `#!${process.execPath}
-const fs=require('fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+'\\n');
+const fs=require('fs'); const args=process.argv.slice(2); if(args[0]==='--version'){console.log(process.env.FAKE_RTXEXEC_VERSION||'0.4.0');process.exit(0);}
+fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+'\\n');
 const option=(name)=>args[args.indexOf('--'+name)+1]; const operation=option('operation');
 const out=(value,code=0)=>{console.log(JSON.stringify(value));process.exit(code);};
 if(operation==='folders')out({ok:true,code:'EMAIL_OPERATION_OK',data:[{name:'INBOX'}]});
@@ -209,11 +210,27 @@ test("missing rtxexec or pre-bridge rules fail safely without launching Himalaya
   const f = fixture(t);
   const missing = f.runWith({ MAILKEEPER_RTXEXEC_BIN: path.join(os.tmpdir(), "no-such-rtxexec") }, "snapshot", "--account", "a");
   assert.notEqual(missing.status, 0);
-  assert.match(missing.stderr, /\(RTXEXEC_UNAVAILABLE\)/);
+  assert.match(missing.stderr, /\(RTXEXEC_UNAVAILABLE\)\. Install rtxexec 0\.4\.0 or later with `npm install -g @realtimex\/rtxexec@0\.4\.0`/);
 
   const old = fixture(t, { config: { pluginId: undefined } });
   const stale = old.run("snapshot", "--account", "a");
   assert.notEqual(stale.status, 0);
   assert.match(stale.stderr, /predates authenticated email access/);
   assert.deepEqual(old.commands(), []);
+});
+
+test("an rtxexec older than 0.4.0 is refused with the install remedy before any host call", (t) => {
+  for (const version of ["0.3.0", "0.4", "rtxexec"]) {
+    const f = fixture(t);
+    const old = f.runWith({ MAILKEEPER_RTXEXEC_BIN: path.join(f.state, "..", "rtxexec"), FAKE_RTXEXEC_VERSION: version }, "snapshot", "--account", "a");
+    assert.notEqual(old.status, 0, version);
+    assert.match(old.stderr, /\(RTXEXEC_UPGRADE_REQUIRED\)\. Install rtxexec 0\.4\.0 or later with `npm install -g @realtimex\/rtxexec@0\.4\.0`, then run the command again\./);
+    assert.deepEqual(f.commands(), []);
+  }
+  for (const version of ["0.4.0", "0.10.2", "1.0.0"]) {
+    const f = fixture(t);
+    const current = f.runWith({ MAILKEEPER_RTXEXEC_BIN: path.join(f.state, "..", "rtxexec"), FAKE_RTXEXEC_VERSION: version }, "snapshot", "--account", "a");
+    assert.doesNotMatch(current.stderr, /RTXEXEC_UPGRADE_REQUIRED/, version);
+    assert.equal(f.commands()[0][0], "himalaya", version);
+  }
 });

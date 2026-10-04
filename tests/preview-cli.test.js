@@ -19,7 +19,7 @@ function fixture(t, accounts, { full = false, failAccount = "" } = {}) {
   fs.writeFileSync(path.join(state, "rules.json"), JSON.stringify(rules));
   // Fake `rtxexec himalaya`: logs its arguments and answers like the bridge.
   const binary = path.join(root, "rtxexec");
-  fs.writeFileSync(binary, `#!${process.execPath}\nconst fs=require('fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(path.join(root, "commands.jsonl"))},JSON.stringify(args)+'\\n');
+  fs.writeFileSync(binary, `#!${process.execPath}\nconst fs=require('fs'); const args=process.argv.slice(2); if(args[0]==='--version'){console.log('0.4.0');process.exit(0);} fs.appendFileSync(${JSON.stringify(path.join(root, "commands.jsonl"))},JSON.stringify(args)+'\\n');
 const option=(name)=>args[args.indexOf('--'+name)+1];
 if(args[0]!=='himalaya'||option('operation')!=='envelopes')process.exit(90);
 if(option('account')===${JSON.stringify(failAccount)}){console.log(JSON.stringify({ok:false,code:'EMAIL_AUTH_FAILED'}));process.exit(1);}
