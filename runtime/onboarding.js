@@ -85,6 +85,14 @@ module.exports = {
         await this.exclusive(workspace, async () => {
           const current = await this.store.get(this.profileKey(workspace)) || {};
           if (current.operationId !== operationId || current.state === "disabled") return;
+          if (error.code === "CONTEXT_REQUIRED") {
+            // Nothing was verified (for example at plugin activation). Keep the
+            // last result and leave the schedule and its task as they were.
+            await this.store.set(this.profileKey(workspace), { ...current,
+              state: ["checking", "preparing"].includes(profile.state) ? "needs_setup" : profile.state || "needs_setup",
+              blockers: profile.blockers || [], updatedAt: now() });
+            return;
+          }
           const { config } = this.profileConfig(workspace);
           await this.store.set(this.profileKey(workspace), { ...current, state: "needs_repair",
             ...(config.maintenanceEnabled ? { scheduleSuspendedForRepair: true } : {}),

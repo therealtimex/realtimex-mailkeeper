@@ -117,7 +117,10 @@ class MailKeeperService {
     const readiness = {};
     const authErrors = [];
     for (const account of config.emailAccounts) {
-      const probe = await mailbox.checkAccount(account, target);
+      const probe = await mailbox.checkAccount(account, { email: this.host.email, bindingId: profile.emailBindings?.[account] });
+      // Without an authenticated caller (for example plugin activation) a
+      // check says nothing about the account; leave readiness untouched.
+      if (probe.code === "CONTEXT_REQUIRED") throw codedError(probe.error, "CONTEXT_REQUIRED", 409);
       await current();
       probe.checkedAt = new Date().toISOString();
       readiness[account] = probe;
@@ -516,10 +519,14 @@ class MailKeeperService {
     if (receipt.undoneAt)
       return { runId, reused: true, undoneAt: receipt.undoneAt };
     const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
-    if (!target?.configPath) throw codedError("Upgrade RealTimeX to undo against the shared email target", "HOST_UNSUPPORTED", 409);
+    if (!target?.configPath || !this.host.email.supported) throw codedError("Upgrade RealTimeX to undo against the shared email target", "HOST_UNSUPPORTED", 409);
     if (receipt.scope?.configPath && receipt.scope.configPath !== target.configPath) {
       throw codedError("Restore the run's email configuration before undoing it", "MAILKEEPER_TARGET_CHANGED", 409);
     }
+    const profile = (await this.store.get(this.profileKey(workspace))) || {};
+    // Moves an earlier interrupted undo already confirmed are never sent again.
+    const actionKey = (account, uid, from, to) => JSON.stringify([account, String(uid), from, to]);
+    const confirmed = new Set(receipt.undo?.reversed || []);
     // Account selection may have changed since the run. Reverse the accounts
     // actually recorded, and only infer an untagged legacy action when unique.
     const scopeAccounts = receipt.scope?.accounts || [];
@@ -528,21 +535,36 @@ class MailKeeperService {
       if (action.kind !== "move" || action.dryRun) continue;
       const account = action.account || (scopeAccounts.length === 1 && scopeAccounts[0]);
       if (!account) throw codedError("The receipt does not identify this action's account", "MAILKEEPER_UNDO_SCOPE_UNKNOWN", 409);
+      if (confirmed.has(actionKey(account, action.uid, action.from, action.to))) continue;
       if (!actionsByAccount.has(account)) actionsByAccount.set(account, []);
       actionsByAccount.get(account).push(action);
     }
     const result = { reversed: 0, skipped: [], dryRun: body.dryRun === true };
+    const reversedKeys = [];
     for (const [account, actions] of actionsByAccount) {
       const partial = await mailbox.undoActions(account, actions, {
         dryRun: result.dryRun,
-        configPath: target.configPath,
+        email: this.host.email,
+        bindingId: profile.emailBindings?.[account],
       });
       result.reversed += partial.reversed;
       result.skipped.push(...partial.skipped.map((entry) => ({ account, ...entry })));
+      // A reversal moves `to` back to `from`; key it by the original action.
+      reversedKeys.push(...partial.reversedActions.map((done) => actionKey(account, done.uid, done.to, done.from)));
     }
     if (!body.dryRun) {
-      receipt.undoneAt = new Date().toISOString();
-      receipt.undoneBy = user.id;
+      // Record every attempt, including the operation identity and outcome of
+      // an interrupted move, so a retry only targets what was not confirmed.
+      receipt.undo = {
+        reversed: [...confirmed, ...reversedKeys],
+        attempts: [...(receipt.undo?.attempts || []), {
+          at: new Date().toISOString(), by: user.id, reversed: result.reversed, skipped: result.skipped,
+        }].slice(-20),
+      };
+      if (!result.skipped.length) {
+        receipt.undoneAt = new Date().toISOString();
+        receipt.undoneBy = user.id;
+      }
       await this.store.set(this.runKey(workspace, runId), receipt);
     }
     return { runId, reused: false, ...result };

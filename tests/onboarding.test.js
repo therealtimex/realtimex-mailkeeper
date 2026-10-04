@@ -108,6 +108,18 @@ test("preparation preserves human policy and reuses maintenance thread", async (
   await f.ready(); await f.ready();
   assert.equal(fs.readFileSync(path.join(f.workspace.workingDirectory, "MAILBOX.md"), "utf8"), "human policy"); assert.equal(f.threads.size, 1);
 });
+test("a check without an authenticated caller keeps readiness and the saved schedule", async (t) => {
+  const f = fixture(t); await f.ready();
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "3d" }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  const before = await f.service.setupStatus(f.workspace);
+  mailbox.checkAccount = async () => ({ ok: false, code: "CONTEXT_REQUIRED", error: "Open setup." });
+  await f.service.activateAll(); await f.service.setupJobs.get(1)?.promise;
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.state, "ready"); assert.equal(status.verifiedAt, before.verifiedAt);
+  assert.equal(status.schedule.suspendedForRepair, false); assert.equal(f.task().interval, "3d");
+  assert.deepEqual(status.blockers, []);
+});
 test("unreadable rules fail without overwriting them", async (t) => {
   const f = fixture(t); fs.mkdirSync(path.join(f.workspace.workingDirectory, ".mailkeeper"));
   const file = path.join(f.workspace.workingDirectory, ".mailkeeper", "rules.json"); fs.writeFileSync(file, "broken JSON");
