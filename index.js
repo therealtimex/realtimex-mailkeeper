@@ -107,6 +107,12 @@ module.exports = definePlugin({
         const result = await api.email.configureHimalayaAccount(request.body?.account);
         return response.json({ ok: true, configured: result.configured, revision: result.revision });
       }), routeOptions);
+    // The setup task links a Login the human selected privately; no secret
+    // value or Secrets reference is accepted from the caller.
+    api.registerRoute("POST", "/setup/connect", (request, response) =>
+      setupScope(request, response, async ({ workspace }) =>
+        response.status(202).json({ ok: true, ...(await service.connectAccount(workspace, {
+          login: request.body?.login, account: request.body?.account })) })), routeOptions);
     api.registerRoute("GET", "/setup/card", (request, response) =>
       withScope(service, request, response, async ({ workspace }) => response.json({ items: [setupPresentation(await service.setupStatus(workspace, { cached: request.pluginContext?.readOnly === true }), service)] }),
         { allowInactive: request.pluginContext?.readOnly === true }), { auth: "contribution", availableWhenInactive: true });
@@ -151,6 +157,10 @@ module.exports = definePlugin({
           if (!setup.blockers.some((entry) => entry.accountRef === accountRef && ["CREDENTIAL_MISSING", "AUTH_FAILED"].includes(entry.code)))
             return response.status(409).json({ ok: false, code: "ACCOUNT_AUTHENTICATION_NOT_REQUIRED" });
           return response.json({ ok: true, dialog: credentialDialog([{ accountRef, ...(await api.email.getCredentialReference(accountRef)) }]) });
+        }
+        if (action === "select-login") {
+          if (request.pluginContext.surface !== "workspace-plugin-editor") return response.status(400).json({ ok: false, code: "ACTION_UNKNOWN" });
+          return response.json({ ok: true, ...(await service.selectLogin(workspace, payload)) });
         }
         if (action === "preview") return response.status(202).json({ ok: true, ...(await service.preview(workspace, { request, response })) });
         if (action === "schedule") return response.status(202).json({ ok: true, ...(await service.setSchedule(workspace, request.body?.payload || {}, user)) });

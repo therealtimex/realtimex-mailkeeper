@@ -8,6 +8,17 @@ const { resolveProfileConfig } = require("./config");
 const fault = (code, statusCode = 409) => Object.assign(new Error(code), { code, statusCode });
 const now = () => new Date().toISOString();
 const editable = new Set(["EMAIL_ACCOUNTS", "AGENT", "MODEL", "MODE", "CADENCE", "AGE_THRESHOLD_DAYS", "AGGRESSIVENESS", "VIP_SENDERS"]);
+const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+// IMAP defaults for the providers the host recognizes; other providers need
+// explicit server details from the setup task.
+const PROVIDER_IMAP = {
+  gmail: { host: "imap.gmail.com", port: 993, encryption: "tls" },
+  outlook: { host: "outlook.office365.com", port: 993, encryption: "tls" },
+  icloud: { host: "imap.mail.me.com", port: 993, encryption: "tls" },
+  yahoo: { host: "imap.mail.yahoo.com", port: 993, encryption: "tls" },
+};
+// Host failure codes are allowlisted already; pass them through to the setup task.
+const hostFault = (error) => fault(/^(EMAIL|SECRET)_[A-Z_]+$|^PRIVATE_CONFIG_REVIEW_REQUIRED$/.test(error?.code || "") ? error.code : "EMAIL_CONFIG_WRITE_FAILED");
 
 module.exports = {
   async exclusive(workspace, operation) {
@@ -104,6 +115,75 @@ module.exports = {
     });
   },
 
+  // A Login the human picked in the host's private picker. Only non-secret
+  // selection facts are kept; the setup task connects it next. Re-choosing the
+  // Login an account already uses (after updating its sign-in) re-checks it.
+  async selectLogin(workspace, payload = {}) {
+    const selection = payload.selection;
+    if (!selection || typeof selection !== "object" || Array.isArray(selection) ||
+        Object.keys(selection).some((key) => !["id", "reference", "passwordField"].includes(key)) ||
+        !/^[A-Za-z0-9_-]{1,128}$/.test(selection.id || "") || typeof selection.reference !== "string" ||
+        selection.passwordField !== "password") throw fault("LOGIN_SELECTION_INVALID", 400);
+    let choices;
+    try { choices = await this.host.email.getLoginChoices(); } catch (error) { throw hostFault(error); }
+    const choice = (choices || []).find((entry) => entry.id === selection.id && entry.reference === selection.reference);
+    if (!choice) throw fault("LOGIN_UNAVAILABLE");
+    const email = choice.email || (typeof payload.email === "string" ? payload.email.trim() : "");
+    if (!EMAIL.test(email) || email.length > 254) throw fault("LOGIN_EMAIL_REQUIRED", 400);
+    const profile = await this.store.get(this.profileKey(workspace)) || {};
+    const account = Object.entries(profile.emailLoginIds || {}).find(([, loginId]) => loginId === choice.id)?.[0];
+    if (account && payload.account === account) return { selected: true, account, ...(await this.beginSetup(workspace)) };
+    await this.exclusive(workspace, async () => {
+      const latest = await this.store.get(this.profileKey(workspace)) || {};
+      await this.store.set(this.profileKey(workspace), { ...latest, setupStarted: true,
+        emailLoginSelections: { ...(latest.emailLoginSelections || {}), [choice.id]: {
+          loginId: choice.id, reference: choice.reference, passwordField: choice.passwordField, email,
+          displayName: String(choice.displayName || "").slice(0, 200), providerHint: choice.providerHint || "custom",
+          selectedAt: now() } } });
+    });
+    return { selected: true, email, providerHint: choice.providerHint || "custom" };
+  },
+
+  // Called by the setup task: link a selected Login to a Himalaya account
+  // through the host, store the binding before any check, then check it.
+  async connectAccount(workspace, body = {}) {
+    const account = body.account && typeof body.account === "object" ? body.account : {};
+    const profile = await this.store.get(this.profileKey(workspace)) || {};
+    const selected = profile.emailLoginSelections?.[body.login];
+    if (!selected) throw fault("LOGIN_NOT_SELECTED", 404);
+    if (!/^[A-Za-z0-9_-]{1,80}$/.test(account.name || "")) throw fault("ACCOUNT_NAME_INVALID", 400);
+    const preset = PROVIDER_IMAP[selected.providerHint] || {};
+    const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
+    if (!target || !this.host.email.supported) throw fault("HOST_UNSUPPORTED");
+    const patch = {
+      name: account.name, email: selected.email, login: account.login || selected.email,
+      host: account.host || preset.host, port: account.port ?? preset.port,
+      encryption: account.encryption || preset.encryption, revision: target.revision,
+      ...(account.displayName ? { displayName: String(account.displayName).slice(0, 120) } : {}),
+      ...(account.confirmOverride === true ? { confirmOverride: true } : {}),
+      ...(account.confirmReplace === true ? { confirmReplace: true } : {}),
+    };
+    if (!patch.host || !Number.isInteger(patch.port) || !["tls", "start-tls"].includes(patch.encryption)) {
+      throw fault("ACCOUNT_SERVER_REQUIRED", 400);
+    }
+    let result;
+    try {
+      result = await this.host.email.configureSecretsAccount({ account: patch,
+        selection: { id: selected.loginId, reference: selected.reference, passwordField: selected.passwordField } });
+    } catch (error) { throw hostFault(error); }
+    await this.exclusive(workspace, async () => {
+      const latest = await this.store.get(this.profileKey(workspace)) || {};
+      const { [selected.loginId]: _connected, ...pending } = latest.emailLoginSelections || {};
+      await this.store.set(this.profileKey(workspace), { ...latest, emailLoginSelections: pending,
+        emailBindings: { ...(latest.emailBindings || {}), [patch.name]: result.bindingId },
+        emailLoginIds: { ...(latest.emailLoginIds || {}), [patch.name]: selected.loginId } });
+    });
+    const accounts = this.profileConfig(workspace).config.emailAccounts;
+    const check = accounts.includes(patch.name) ? await this.beginSetup(workspace)
+      : await this.configureSetup(workspace, { EMAIL_ACCOUNTS: [...accounts, patch.name] });
+    return { configured: true, account: patch.name, email: selected.email, ...check };
+  },
+
   async setupStatus(workspace, { cached = false } = {}) {
     if (!cached) await this.ingestOutbox(workspace);
     const profile = await this.store.get(this.profileKey(workspace)) || {};
@@ -138,6 +218,13 @@ module.exports = {
       },
       hostSupported: Boolean((cached ? this.api.email : target) && this.host.heartbeat.getManagedTaskStatus),
       emailTarget: target ? { source: target.source, revision: target.revision } : null,
+      // Non-secret facts the setup task needs: Logins chosen but not yet
+      // connected, and which accounts are linked to a Secrets Login.
+      emailLogins: {
+        selected: Object.values(profile.emailLoginSelections || {}).map(({ loginId, email, displayName, providerHint }) =>
+          ({ login: loginId, email, displayName, providerHint })),
+        linked: Object.entries(profile.emailLoginIds || {}).map(([account, login]) => ({ account, login })),
+      },
     };
   },
 

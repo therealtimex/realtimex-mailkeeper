@@ -413,3 +413,78 @@ test("disable waits for scheduler reconciliation and keeps the latest repair sus
   assert.equal(f.storeData.get("ws-1-profile").scheduleSuspendedForRepair, true);
   assert.equal(f.task(), null);
 });
+
+// Secrets setup: the host picker sends only the selection; MailKeeper keeps
+// non-secret facts, and the setup task links the Login through the host.
+function withLogins(f, { choices, configure } = {}) {
+  const calls = [];
+  Object.assign(f.api.email, {
+    executeHimalaya: async () => ({ ok: true, data: [] }),
+    getLoginChoices: async () => choices || [
+      { id: "login-1", reference: "secret://work#password", passwordField: "password", email: "person@example.test", displayName: "Work", providerHint: "gmail" },
+      { id: "login-2", reference: "secret://bare#password", passwordField: "password", email: "", needsMetadata: true, displayName: "Bare", providerHint: "custom" },
+    ],
+    configureSecretsAccount: async (input) => { calls.push(input); if (configure) return configure(input); return { configured: true, bindingId: "binding-9", bindingRevision: "r", target: {} }; },
+  });
+  return calls;
+}
+const pick = { id: "login-1", reference: "secret://work#password", passwordField: "password" };
+
+test("a chosen Login is kept as non-secret facts and validated against the host's choices", async (t) => {
+  const f = fixture(t); withLogins(f);
+  assert.deepEqual(await f.service.selectLogin(f.workspace, { selection: pick }), { selected: true, email: "person@example.test", providerHint: "gmail" });
+  const profile = await f.api.getStore().get("ws-1-profile");
+  assert.deepEqual(Object.keys(profile.emailLoginSelections["login-1"]).sort(),
+    ["displayName", "email", "loginId", "passwordField", "providerHint", "reference", "selectedAt"]);
+  assert.deepEqual((await f.service.setupStatus(f.workspace)).emailLogins.selected,
+    [{ login: "login-1", email: "person@example.test", displayName: "Work", providerHint: "gmail" }]);
+  await assert.rejects(f.service.selectLogin(f.workspace, { selection: { ...pick, password: "x" } }), { code: "LOGIN_SELECTION_INVALID" });
+  await assert.rejects(f.service.selectLogin(f.workspace, { selection: { ...pick, reference: "secret://other#password" } }), { code: "LOGIN_UNAVAILABLE" });
+  const bare = { id: "login-2", reference: "secret://bare#password", passwordField: "password" };
+  await assert.rejects(f.service.selectLogin(f.workspace, { selection: bare }), { code: "LOGIN_EMAIL_REQUIRED" });
+  assert.equal((await f.service.selectLogin(f.workspace, { selection: bare, email: "bare@example.test" })).email, "bare@example.test");
+});
+
+test("connecting stores the binding before the check and adds the account", async (t) => {
+  const f = fixture(t); const calls = withLogins(f);
+  await f.service.selectLogin(f.workspace, { selection: pick });
+  const seen = [];
+  mailbox.checkAccount = async (name, options) => { seen.push([name, options.bindingId]); return { ok: true, folders: ["INBOX"] }; };
+  const result = await f.service.connectAccount(f.workspace, { login: "login-1", account: { name: "work" } });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(result.configured, true);
+  assert.deepEqual(calls, [{ account: { name: "work", email: "person@example.test", login: "person@example.test",
+    host: "imap.gmail.com", port: 993, encryption: "tls", revision: "test" }, selection: pick }]);
+  const profile = await f.api.getStore().get("ws-1-profile");
+  assert.deepEqual([profile.emailBindings, profile.emailLoginIds, profile.emailLoginSelections],
+    [{ work: "binding-9" }, { work: "login-1" }, {}]);
+  assert.ok(f.api.getConfig().EMAIL_ACCOUNTS.includes("work"));
+  assert.ok(seen.some(([name, binding]) => name === "work" && binding === "binding-9"), "the check uses the stored binding");
+  assert.equal((await f.service.setupStatus(f.workspace)).state, "ready");
+});
+
+test("connect refuses unknown Logins, missing server details and host failures without storing a binding", async (t) => {
+  const f = fixture(t);
+  withLogins(f, { configure: () => { throw Object.assign(new Error("raw"), { code: "SECRET_SCOPE_DENIED" }); } });
+  await assert.rejects(f.service.connectAccount(f.workspace, { login: "login-1", account: { name: "work" } }), { code: "LOGIN_NOT_SELECTED" });
+  await f.service.selectLogin(f.workspace, { selection: { id: "login-2", reference: "secret://bare#password", passwordField: "password" }, email: "bare@example.test" });
+  await assert.rejects(f.service.connectAccount(f.workspace, { login: "login-2", account: { name: "bare" } }), { code: "ACCOUNT_SERVER_REQUIRED" });
+  await assert.rejects(f.service.connectAccount(f.workspace, { login: "login-2", account: { name: "bad name" } }), { code: "ACCOUNT_NAME_INVALID" });
+  await assert.rejects(f.service.connectAccount(f.workspace, { login: "login-2",
+    account: { name: "bare", host: "imap.example.test", port: 993, encryption: "tls" } }), { code: "SECRET_SCOPE_DENIED" });
+  const profile = await f.api.getStore().get("ws-1-profile");
+  assert.equal(profile.emailBindings, undefined);
+  assert.ok(profile.emailLoginSelections["login-2"], "a failed connect keeps the selection for a retry");
+});
+
+test("choosing the Login an account already uses re-checks it after a sign-in update", async (t) => {
+  const f = fixture(t); const calls = withLogins(f);
+  await f.service.selectLogin(f.workspace, { selection: pick });
+  await f.service.connectAccount(f.workspace, { login: "login-1", account: { name: "work" } });
+  await f.service.setupJobs.get(1)?.promise;
+  const again = await f.service.selectLogin(f.workspace, { selection: pick, account: "work" });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(again.account, "work"); assert.equal(again.accepted, true);
+  assert.equal(calls.length, 1, "no second configuration");
+  assert.deepEqual((await f.api.getStore().get("ws-1-profile")).emailLoginSelections, {});
+});

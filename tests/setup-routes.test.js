@@ -80,3 +80,15 @@ test("setup entry only saves non-secret continuation and opens the bound declare
   assert.deepEqual(f.data.get("ws-1-profile"), { setupStarted: true });
   assert.deepEqual(f.references, []);
 });
+
+test("a Login is selected only from the setup editor surface, as non-secret facts", async (t) => {
+  const f = fixture(t);
+  const selection = { id: "login-1", reference: "secret://work#password", passwordField: "password" };
+  f.service.api.email.getLoginChoices = async () => [{ ...selection, email: "person@example.test", displayName: "Work", providerHint: "gmail" }];
+  const card = await f.invoke("POST", "/setup/action", { actionId: "select-login", surface: "workspace-plugin-card", payload: { selection } });
+  assert.equal(card.statusCode, 400);
+  const editor = await f.invoke("POST", "/setup/action", { actionId: "select-login", payload: { selection } });
+  assert.equal(editor.statusCode, 200);
+  assert.deepEqual(editor.body, { ok: true, selected: true, email: "person@example.test", providerHint: "gmail" });
+  assert.equal(f.data.get("ws-1-profile").emailLoginSelections["login-1"].email, "person@example.test");
+});

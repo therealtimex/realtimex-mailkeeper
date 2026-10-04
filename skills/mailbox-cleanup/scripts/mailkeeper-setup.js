@@ -10,14 +10,25 @@ async function main(argv, env = process.env, fetchImpl = fetch) {
   const token = env.REALTIMEX_TERMINAL_SESSION_TOKEN;
   if (context.schemaVersion !== 1 || !workspaceSlug || !token || !env.REALTIMEX_BASE_URL) throw Error("SETUP_SESSION_REQUIRED");
   const [command, json] = argv;
-  const routes = { status: ["GET", "/setup/status"], check: ["POST", "/setup/check"], configure: ["POST", "/setup/configure"], account: ["POST", "/setup/account"] };
-  if (!routes[command]) throw Error("Use status, check, configure <JSON>, or account <JSON>.");
+  const routes = { status: ["GET", "/setup/status"], check: ["POST", "/setup/check"], configure: ["POST", "/setup/configure"],
+    account: ["POST", "/setup/account"], connect: ["POST", "/setup/connect"] };
+  if (!routes[command]) throw Error("Use status, check, configure <JSON>, account <JSON>, or connect <JSON>.");
   const [method, route] = routes[command];
   const body = { workspaceSlug };
   if (command === "configure" || command === "account") {
     const parsed = JSON.parse(json || "{}");
     if (Object.keys(parsed).some((key) => /password|secret|token|auth|cmd/i.test(key))) throw Error("PRIVATE_CREDENTIAL_REQUIRED");
     body[command === "configure" ? "config" : "account"] = parsed;
+  }
+  // connect '{"login":"<login id from status>","account":{"name":"work","host":...}}'
+  // links a Login the user chose in setup; it never carries a credential.
+  if (command === "connect") {
+    const parsed = JSON.parse(json || "{}");
+    const account = parsed.account || {};
+    if (typeof parsed.login !== "string" || Object.keys(parsed).some((key) => !["login", "account"].includes(key)) ||
+        Object.keys(account).some((key) => /password|secret|token|auth|cmd|reference/i.test(key))) throw Error("PRIVATE_CREDENTIAL_REQUIRED");
+    body.login = parsed.login;
+    body.account = account;
   }
   const root = env.REALTIMEX_BASE_URL.replace(/\/+$/, "").replace(/\/cli$/, "");
   const url = new URL(`${root.endsWith("/api") ? root : `${root}/api`}/plugins/com.realtimex.mailkeeper/routes${route}`);

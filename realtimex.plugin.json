@@ -82,6 +82,11 @@
         "auth": "internalOrAppId"
       },
       {
+        "method": "POST",
+        "path": "/setup/connect",
+        "auth": "internalOrAppId"
+      },
+      {
         "method": "GET",
         "path": "/setup/card",
         "auth": "contribution",
@@ -2832,6 +2837,11 @@
         },
         "actions": [
           {
+            "id": "select-login",
+            "method": "POST",
+            "path": "/setup/action"
+          },
+          {
             "id": "check",
             "method": "POST",
             "path": "/setup/action"
@@ -2896,7 +2906,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Harmonogram zatrzymany — gotowy do wznowienia",
               "mailkeeper-setup.execution-stopped": "Wykonywanie zatrzymane",
               "mailkeeper-setup.task-state": "Zaplanowane zadanie",
-              "mailkeeper-setup.task-unavailable": "Zadanie niedostępne"
+              "mailkeeper-setup.task-unavailable": "Zadanie niedostępne",
+              "mailkeeper-setup.choose-account": "Wybierz konto e-mail",
+              "mailkeeper-setup.update-sign-in": "Zaktualizuj logowanie dla {{account}}"
             },
             "vi": {
               "mailkeeper-setup.setup": "Thiết lập email với AI",
@@ -2944,7 +2956,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Lịch đã dừng — sẵn sàng tiếp tục",
               "mailkeeper-setup.execution-stopped": "Đã dừng thực thi",
               "mailkeeper-setup.task-state": "Tác vụ theo lịch",
-              "mailkeeper-setup.task-unavailable": "Tác vụ không khả dụng"
+              "mailkeeper-setup.task-unavailable": "Tác vụ không khả dụng",
+              "mailkeeper-setup.choose-account": "Chọn tài khoản email",
+              "mailkeeper-setup.update-sign-in": "Cập nhật đăng nhập cho {{account}}"
             },
             "he": {
               "mailkeeper-setup.setup": "הגדרת דוא״ל עם AI",
@@ -2992,7 +3006,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "לוח הזמנים הופסק — מוכן לחידוש",
               "mailkeeper-setup.execution-stopped": "הביצוע הופסק",
               "mailkeeper-setup.task-state": "משימה מתוזמנת",
-              "mailkeeper-setup.task-unavailable": "המשימה אינה זמינה"
+              "mailkeeper-setup.task-unavailable": "המשימה אינה זמינה",
+              "mailkeeper-setup.choose-account": "בחירת חשבון דוא״ל",
+              "mailkeeper-setup.update-sign-in": "עדכון פרטי ההתחברות של {{account}}"
             },
             "da": {
               "mailkeeper-setup.setup": "Opsæt e-mail med AI",
@@ -3040,7 +3056,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Tidsplan stoppet — klar til at genoptage",
               "mailkeeper-setup.execution-stopped": "Kørsel stoppet",
               "mailkeeper-setup.task-state": "Planlagt opgave",
-              "mailkeeper-setup.task-unavailable": "Opgave utilgængelig"
+              "mailkeeper-setup.task-unavailable": "Opgave utilgængelig",
+              "mailkeeper-setup.choose-account": "Vælg e-mailkonto",
+              "mailkeeper-setup.update-sign-in": "Opdater login for {{account}}"
             },
             "pt_BR": {
               "mailkeeper-setup.setup": "Configurar e-mail com IA",
@@ -3088,7 +3106,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Agendamento interrompido — pronto para retomar",
               "mailkeeper-setup.execution-stopped": "Execução interrompida",
               "mailkeeper-setup.task-state": "Tarefa agendada",
-              "mailkeeper-setup.task-unavailable": "Tarefa indisponível"
+              "mailkeeper-setup.task-unavailable": "Tarefa indisponível",
+              "mailkeeper-setup.choose-account": "Escolher conta de e-mail",
+              "mailkeeper-setup.update-sign-in": "Atualizar o login de {{account}}"
             },
             "ja": {
               "mailkeeper-setup.setup": "AIでメールを設定",
@@ -3136,7 +3156,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "スケジュール停止中 — 再開可能",
               "mailkeeper-setup.execution-stopped": "実行停止中",
               "mailkeeper-setup.task-state": "定期タスク",
-              "mailkeeper-setup.task-unavailable": "タスクを利用できません"
+              "mailkeeper-setup.task-unavailable": "タスクを利用できません",
+              "mailkeeper-setup.choose-account": "メールアカウントを選択",
+              "mailkeeper-setup.update-sign-in": "{{account}} のサインインを更新"
             },
             "lv": {
               "mailkeeper-setup.setup": "Iestatīt e-pastu ar AI",
@@ -3184,7 +3206,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Grafiks apturēts — gatavs atsākšanai",
               "mailkeeper-setup.execution-stopped": "Izpilde apturēta",
               "mailkeeper-setup.task-state": "Plānots uzdevums",
-              "mailkeeper-setup.task-unavailable": "Uzdevums nav pieejams"
+              "mailkeeper-setup.task-unavailable": "Uzdevums nav pieejams",
+              "mailkeeper-setup.choose-account": "Izvēlēties e-pasta kontu",
+              "mailkeeper-setup.update-sign-in": "Atjaunināt pierakstīšanos kontam {{account}}"
             },
             "it": {
               "mailkeeper-setup.setup": "Configura l'email con AI",
@@ -3232,7 +3256,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Pianificazione interrotta — pronta per riprendere",
               "mailkeeper-setup.execution-stopped": "Esecuzione interrotta",
               "mailkeeper-setup.task-state": "Attività pianificata",
-              "mailkeeper-setup.task-unavailable": "Attività non disponibile"
+              "mailkeeper-setup.task-unavailable": "Attività non disponibile",
+              "mailkeeper-setup.choose-account": "Scegli l'account email",
+              "mailkeeper-setup.update-sign-in": "Aggiorna l'accesso per {{account}}"
             },
             "zh_TW": {
               "mailkeeper-setup.setup": "使用 AI 設定電子郵件",
@@ -3280,7 +3306,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "排程已停止 — 可以恢復",
               "mailkeeper-setup.execution-stopped": "執行已停止",
               "mailkeeper-setup.task-state": "排程工作",
-              "mailkeeper-setup.task-unavailable": "工作無法使用"
+              "mailkeeper-setup.task-unavailable": "工作無法使用",
+              "mailkeeper-setup.choose-account": "選擇電子郵件帳戶",
+              "mailkeeper-setup.update-sign-in": "更新 {{account}} 的登入資訊"
             },
             "ru": {
               "mailkeeper-setup.setup": "Настроить почту с AI",
@@ -3328,7 +3356,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Расписание остановлено — готово к возобновлению",
               "mailkeeper-setup.execution-stopped": "Выполнение остановлено",
               "mailkeeper-setup.task-state": "Задача по расписанию",
-              "mailkeeper-setup.task-unavailable": "Задача недоступна"
+              "mailkeeper-setup.task-unavailable": "Задача недоступна",
+              "mailkeeper-setup.choose-account": "Выбрать почтовый аккаунт",
+              "mailkeeper-setup.update-sign-in": "Обновить данные входа для {{account}}"
             },
             "ro": {
               "mailkeeper-setup.setup": "Configurează e-mailul cu AI",
@@ -3376,7 +3406,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Program oprit — gata de reluare",
               "mailkeeper-setup.execution-stopped": "Execuție oprită",
               "mailkeeper-setup.task-state": "Sarcină programată",
-              "mailkeeper-setup.task-unavailable": "Sarcină indisponibilă"
+              "mailkeeper-setup.task-unavailable": "Sarcină indisponibilă",
+              "mailkeeper-setup.choose-account": "Alege contul de e-mail",
+              "mailkeeper-setup.update-sign-in": "Actualizează autentificarea pentru {{account}}"
             },
             "zh": {
               "mailkeeper-setup.setup": "使用 AI 设置电子邮件",
@@ -3424,7 +3456,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "计划已停止 — 可以恢复",
               "mailkeeper-setup.execution-stopped": "执行已停止",
               "mailkeeper-setup.task-state": "计划任务",
-              "mailkeeper-setup.task-unavailable": "任务不可用"
+              "mailkeeper-setup.task-unavailable": "任务不可用",
+              "mailkeeper-setup.choose-account": "选择邮箱账户",
+              "mailkeeper-setup.update-sign-in": "更新 {{account}} 的登录信息"
             },
             "ar": {
               "mailkeeper-setup.setup": "إعداد البريد الإلكتروني بالذكاء الاصطناعي",
@@ -3472,7 +3506,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "الجدول متوقف — جاهز للاستئناف",
               "mailkeeper-setup.execution-stopped": "التنفيذ متوقف",
               "mailkeeper-setup.task-state": "مهمة مجدولة",
-              "mailkeeper-setup.task-unavailable": "المهمة غير متاحة"
+              "mailkeeper-setup.task-unavailable": "المهمة غير متاحة",
+              "mailkeeper-setup.choose-account": "اختر حساب البريد الإلكتروني",
+              "mailkeeper-setup.update-sign-in": "تحديث تسجيل الدخول لـ {{account}}"
             },
             "nl": {
               "mailkeeper-setup.setup": "E-mail instellen met AI",
@@ -3520,7 +3556,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Schema gestopt — klaar om te hervatten",
               "mailkeeper-setup.execution-stopped": "Uitvoering gestopt",
               "mailkeeper-setup.task-state": "Geplande taak",
-              "mailkeeper-setup.task-unavailable": "Taak niet beschikbaar"
+              "mailkeeper-setup.task-unavailable": "Taak niet beschikbaar",
+              "mailkeeper-setup.choose-account": "E-mailaccount kiezen",
+              "mailkeeper-setup.update-sign-in": "Aanmelding voor {{account}} bijwerken"
             },
             "de": {
               "mailkeeper-setup.setup": "E-Mail mit KI einrichten",
@@ -3568,7 +3606,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Zeitplan gestoppt — bereit zum Fortsetzen",
               "mailkeeper-setup.execution-stopped": "Ausführung gestoppt",
               "mailkeeper-setup.task-state": "Geplante Aufgabe",
-              "mailkeeper-setup.task-unavailable": "Aufgabe nicht verfügbar"
+              "mailkeeper-setup.task-unavailable": "Aufgabe nicht verfügbar",
+              "mailkeeper-setup.choose-account": "E-Mail-Konto auswählen",
+              "mailkeeper-setup.update-sign-in": "Anmeldung für {{account}} aktualisieren"
             },
             "ko": {
               "mailkeeper-setup.setup": "AI로 이메일 설정",
@@ -3616,7 +3656,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "일정 중지됨 — 재개 가능",
               "mailkeeper-setup.execution-stopped": "실행 중지됨",
               "mailkeeper-setup.task-state": "예약 작업",
-              "mailkeeper-setup.task-unavailable": "작업을 사용할 수 없음"
+              "mailkeeper-setup.task-unavailable": "작업을 사용할 수 없음",
+              "mailkeeper-setup.choose-account": "이메일 계정 선택",
+              "mailkeeper-setup.update-sign-in": "{{account}} 로그인 정보 업데이트"
             },
             "fr": {
               "mailkeeper-setup.setup": "Configurer l'e-mail avec l'IA",
@@ -3664,7 +3706,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Programme arrêté — prêt à reprendre",
               "mailkeeper-setup.execution-stopped": "Exécution arrêtée",
               "mailkeeper-setup.task-state": "Tâche planifiée",
-              "mailkeeper-setup.task-unavailable": "Tâche indisponible"
+              "mailkeeper-setup.task-unavailable": "Tâche indisponible",
+              "mailkeeper-setup.choose-account": "Choisir un compte e-mail",
+              "mailkeeper-setup.update-sign-in": "Mettre à jour la connexion pour {{account}}"
             },
             "es": {
               "mailkeeper-setup.setup": "Configurar correo con IA",
@@ -3712,7 +3756,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Programación detenida — lista para reanudar",
               "mailkeeper-setup.execution-stopped": "Ejecución detenida",
               "mailkeeper-setup.task-state": "Tarea programada",
-              "mailkeeper-setup.task-unavailable": "Tarea no disponible"
+              "mailkeeper-setup.task-unavailable": "Tarea no disponible",
+              "mailkeeper-setup.choose-account": "Elegir cuenta de correo",
+              "mailkeeper-setup.update-sign-in": "Actualizar el inicio de sesión de {{account}}"
             },
             "et": {
               "mailkeeper-setup.setup": "Seadista e-post AI abil",
@@ -3760,7 +3806,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Ajakava peatatud — valmis jätkamiseks",
               "mailkeeper-setup.execution-stopped": "Käivitamine peatatud",
               "mailkeeper-setup.task-state": "Ajastatud ülesanne",
-              "mailkeeper-setup.task-unavailable": "Ülesanne pole saadaval"
+              "mailkeeper-setup.task-unavailable": "Ülesanne pole saadaval",
+              "mailkeeper-setup.choose-account": "Vali e-posti konto",
+              "mailkeeper-setup.update-sign-in": "Uuenda konto {{account}} sisselogimist"
             },
             "en": {
               "mailkeeper-setup.setup": "Set up email with AI",
@@ -3808,7 +3856,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Schedule stopped — ready to resume",
               "mailkeeper-setup.execution-stopped": "Execution stopped",
               "mailkeeper-setup.task-state": "Scheduled task",
-              "mailkeeper-setup.task-unavailable": "Task unavailable"
+              "mailkeeper-setup.task-unavailable": "Task unavailable",
+              "mailkeeper-setup.choose-account": "Choose email account",
+              "mailkeeper-setup.update-sign-in": "Update sign-in for {{account}}"
             },
             "fa": {
               "mailkeeper-setup.setup": "راه‌اندازی ایمیل با AI",
@@ -3856,7 +3906,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "برنامه متوقف است — آماده ازسرگیری",
               "mailkeeper-setup.execution-stopped": "اجرا متوقف است",
               "mailkeeper-setup.task-state": "وظیفه زمان‌بندی‌شده",
-              "mailkeeper-setup.task-unavailable": "وظیفه در دسترس نیست"
+              "mailkeeper-setup.task-unavailable": "وظیفه در دسترس نیست",
+              "mailkeeper-setup.choose-account": "انتخاب حساب ایمیل",
+              "mailkeeper-setup.update-sign-in": "به‌روزرسانی ورود برای {{account}}"
             },
             "tr": {
               "mailkeeper-setup.setup": "E-postayı AI ile ayarla",
@@ -3904,7 +3956,9 @@
               "mailkeeper-setup.schedule-stopped-ready": "Zamanlama durdu — sürdürmeye hazır",
               "mailkeeper-setup.execution-stopped": "Çalıştırma durdu",
               "mailkeeper-setup.task-state": "Zamanlanmış görev",
-              "mailkeeper-setup.task-unavailable": "Görev kullanılamıyor"
+              "mailkeeper-setup.task-unavailable": "Görev kullanılamıyor",
+              "mailkeeper-setup.choose-account": "E-posta hesabı seç",
+              "mailkeeper-setup.update-sign-in": "{{account}} için oturum açma bilgilerini güncelle"
             }
           },
           "readOnlyWhenInactive": true
@@ -6674,8 +6728,8 @@
         "fileName": "mailkeeper-setup.md",
         "chatTitle": "Set up MailKeeper",
         "taskPrompt": "Help me connect, add or update my email accounts with AI for this workspace. Reuse working accounts and preserve unrelated settings. The setup guide is optional reference; I can start with this task.",
-        "initialContent": "# Connect email with MailKeeper\n\nConnect your email accounts with AI, verify each connection and prepare MailKeeper. Sign-in details stay in the supported native private window. Working stored credentials are reused.\n\nContinue this same setup to reuse existing accounts, add an account or repair a selected connection. Use the contextual sign-in step here when authentication is needed, then Continue to check the real connection. After connection and resource checks succeed, choose Open MailKeeper. Preview inbox and scheduling are optional in MailKeeper usage.\n",
-        "prompt": "For a returning user, ask whether they want to add an account, edit a selected account, or repair a connection. Preserve all other accounts and saved choices. The guide file is optional reference; start from the task without requiring a file edit or Use file. Ask which email accounts the user wants to connect and offer existing account names for reuse first. Guide setup in this exact workspace, preserving the same non-secret draft/session and valid saved choices. Use node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js status to inspect cached observed facts and the shared target revision; never read raw TOML into chat. Show only observed setup checkpoints: Email tools, Account connection, MailKeeper settings, Prepare MailKeeper. Detect/check Himalaya with command -v himalaya, himalaya --version and himalaya --help. Explain the dependency plainly. If missing, propose the supported installation command through ordinary exact-command approval, then verify the actual binary. Never automatically run account doctor --fix. Ask only for non-secret provider/IMAP details. For macOS password accounts, use the helper account command with JSON fields name,email,displayName,host,port,encryption,login,revision; an environment target requires explicit confirmOverride. Preserve unrelated accounts, defaults, SMTP and BizOps sections. Guide required account/installed agent/model choices inside this journey using its configuration controls or validated helper configure; do not change the workspace default agent. Reuse working stored credentials without re-entry. For a selected account with CREDENTIAL_MISSING or AUTH_FAILED, use its contextual Sign in action in this bound setup to show the exact matching native Keychain Access reference locally. Passwords/app passwords remain only in that native field; never ask for them in AI chat, generate secret command arguments or copy the native reference mapping into chat/logs. After native save/update use Continue in the same step to perform a real connection check. Network failures require a connection retry, without assuming credentials are the cause. Unsupported references/platforms stay pending; never invent OAuth or another credential store. Use helper check to start reconciliation; status reads never probe. All selected accounts must verify against the current target, unless the user deliberately removes a failing account. Prepare and read back the owned conversation, MAILBOX.md, rules and managed task; a disabled verified task satisfies new manual or repaired readiness. Only observed connection/resource readiness means Email connected. Offer Open MailKeeper when ready; no preview receipt, successful agent execution or schedule choice is required to finish setup. Optional Preview inbox is available in that usage conversation before any receipt and requires explicit account/folder/agent/bounded-limit report-only confirmation. Never move, delete, send, add folders, promote rules or enable/resume scheduling during setup. Preserve existing mode, policy, rules, receipts, saved schedule cadence/intent and workspace pauses. Repair suspension remains in force after Check, Apply, native return and successful connection recovery; only a separate authenticated confirmed Resume saved schedule action in usage can resume execution. Do not direct the user back to removed card credential/check/preview/result/schedule actions. AI prose, native save and editor Apply never assert readiness or execution success.",
+        "initialContent": "# Connect email with MailKeeper\n\nConnect your email accounts with AI, verify each connection and prepare MailKeeper. Choose an email account from RealTimeX Secrets with **Choose email account**, or add one there; passwords stay in Secrets and are never shown to AI. Working existing accounts are reused.\n\nContinue this same setup to reuse existing accounts, add an account or repair a selected connection. After connection and resource checks succeed, choose Open MailKeeper. Preview inbox and scheduling are optional in MailKeeper usage.\n",
+        "prompt": "For a returning user, ask whether they want to add an account, edit a selected account, or repair a connection. Preserve all other accounts and saved choices. The guide file is optional reference; start from the task without requiring a file edit or Use file. Ask which email accounts the user wants to connect and offer existing account names for reuse first. Guide setup in this exact workspace, preserving the same non-secret draft/session and valid saved choices. Use node .agents/skills/mailbox-cleanup/scripts/mailkeeper-setup.js status to inspect cached observed facts and the shared target revision; never read raw TOML into chat. Show only observed setup checkpoints: Email tools, Account connection, MailKeeper settings, Prepare MailKeeper. Detect/check Himalaya with command -v himalaya, himalaya --version and himalaya --help. Explain the dependency plainly. If missing, propose the supported installation command through ordinary exact-command approval, then verify the actual binary. Never automatically run account doctor --fix. Ask only for non-secret provider/IMAP details. To add or switch an account, ask the user to press Choose email account in this setup and pick or add an email Login in RealTimeX Secrets; never ask for, read or echo a password. Then run mailkeeper-setup.js status: emailLogins.selected lists each chosen Login (login id, email, provider). Connect it with mailkeeper-setup.js connect '{\"login\":\"<login id>\",\"account\":{\"name\":\"<account name>\"}}'. Gmail, Outlook, iCloud and Yahoo use built-in IMAP settings; for other providers add host, port and encryption (tls or start-tls) to account. An environment-selected target requires explicit confirmOverride. Connecting stores the Secrets binding and starts the connection check; report only observed results. Guide required account/installed agent/model choices inside this journey using its configuration controls or validated helper configure; do not change the workspace default agent. Reuse working stored credentials without re-entry. For a Secrets-linked account with CREDENTIAL_MISSING or AUTH_FAILED, ask the user to use Update sign-in in this bound setup, which opens the same Secrets Login; for an older Keychain account use its contextual Sign in action to show the exact matching native Keychain Access reference locally. Passwords/app passwords remain only in that native field; never ask for them in AI chat, generate secret command arguments or copy the native reference mapping into chat/logs. After native save/update use Continue in the same step to perform a real connection check. Network failures require a connection retry, without assuming credentials are the cause. Unsupported references/platforms stay pending; never invent OAuth or another credential store. Use helper check to start reconciliation; status reads never probe. All selected accounts must verify against the current target, unless the user deliberately removes a failing account. Prepare and read back the owned conversation, MAILBOX.md, rules and managed task; a disabled verified task satisfies new manual or repaired readiness. Only observed connection/resource readiness means Email connected. Offer Open MailKeeper when ready; no preview receipt, successful agent execution or schedule choice is required to finish setup. Optional Preview inbox is available in that usage conversation before any receipt and requires explicit account/folder/agent/bounded-limit report-only confirmation. Never move, delete, send, add folders, promote rules or enable/resume scheduling during setup. Preserve existing mode, policy, rules, receipts, saved schedule cadence/intent and workspace pauses. Repair suspension remains in force after Check, Apply, native return and successful connection recovery; only a separate authenticated confirmed Resume saved schedule action in usage can resume execution. Do not direct the user back to removed card credential/check/preview/result/schedule actions. AI prose, native save and editor Apply never assert readiness or execution success.",
         "presentation": "workspace-setup",
         "allowInactiveDraft": true
       }

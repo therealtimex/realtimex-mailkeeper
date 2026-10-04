@@ -218,11 +218,25 @@ test("journey recovery is scoped to failed selected accounts and distinguishes n
     accountChecks: { good: { ok: true }, bad: { ok: false }, offline: { ok: false } } });
   const view = journeyPresentation(raw, service);
   assert.equal(view.checklist[0].labelKey, "mailkeeper-setup.step-connection");
-  assert.deepEqual(view.actions.map((entry) => [entry.actionId, entry.payload.accountRef]), [["credential", "bad"], ["check", "offline"]]);
-  assert.equal(view.actions[0].labelKey, "mailkeeper-setup.sign-in-account");
-  assert.equal(view.actions[1].labelKey, "mailkeeper-setup.retry-connection");
+  const repairs = view.actions.filter((entry) => entry.payload);
+  assert.deepEqual(repairs.map((entry) => [entry.actionId, entry.payload.accountRef]), [["credential", "bad"], ["check", "offline"]]);
+  assert.equal(repairs[0].labelKey, "mailkeeper-setup.sign-in-account");
+  assert.equal(repairs[1].labelKey, "mailkeeper-setup.retry-connection");
+  const choose = view.actions.find((entry) => entry.id === "choose-login");
+  assert.deepEqual([choose.kind, choose.actionId, choose.variant], ["email-login", "select-login", "outline"]);
   assert.ok(!view.actions.some((entry) => ["preview", "schedule"].includes(entry.id)));
   assert.equal(setupPresentation(raw, service).actions[0].labelKey, "mailkeeper-setup.reconnect-account");
+});
+
+test("a Secrets-linked account repairs its sign-in in the private Login picker, preselected", () => {
+  const raw = fixture({ state: "needs_repair", blockers: [{ accountRef: "work", code: "AUTH_FAILED" }, { accountRef: "net", code: "CONNECTION_FAILED" }],
+    emailLogins: { selected: [], linked: [{ account: "work", login: "login-1" }, { account: "net", login: "login-2" }] } });
+  const [repair, retry] = journeyPresentation(raw, service).actions;
+  assert.deepEqual([repair.kind, repair.actionId, repair.current, repair.payload, repair.labelKey],
+    ["email-login", "select-login", "login-1", { account: "work" }, "mailkeeper-setup.update-sign-in"]);
+  assert.equal(retry.actionId, "check", "a network failure retries the connection, not the sign-in");
+  const fresh = journeyPresentation(fixture({ state: "needs_setup" }), service).actions.find((entry) => entry.id === "choose-login");
+  assert.equal(fresh.variant, "primary");
 });
 
 test("repaired saved schedules stay stopped with explicit resume and truthful task/pause facts", () => {

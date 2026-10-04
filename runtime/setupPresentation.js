@@ -384,18 +384,32 @@ function journeyPresentation(setup, service) {
   const full = fullPresentation(setup, service);
   const pending = ["checking", "preparing"].includes(setup.state);
   const repairs = (setup.blockers || []).filter((entry) => entry.accountRef && ["CREDENTIAL_MISSING", "AUTH_FAILED", "CONNECTION_FAILED"].includes(entry.code));
-  const repairActions = repairs.map((entry, i) => action(`repair-${i}`,
-    entry.code === "CONNECTION_FAILED" ? "retry-connection" : "sign-in-account", {
-      values: { account: entry.accountRef },
-      actionId: entry.code === "CONNECTION_FAILED" ? "check" : "credential",
-      payload: { accountRef: entry.accountRef }, disabled: pending,
-    }));
+  // A Secrets-linked account repairs its sign-in in the host's private Login
+  // picker, preselected; older Keychain accounts keep the native dialog.
+  const linked = new Map((setup.emailLogins?.linked || []).map((entry) => [entry.account, entry.login]));
+  const repairActions = repairs.map((entry, i) => entry.code !== "CONNECTION_FAILED" && linked.has(entry.accountRef)
+    ? action(`repair-${i}`, "update-sign-in", {
+      values: { account: entry.accountRef }, kind: "email-login", actionId: "select-login",
+      current: linked.get(entry.accountRef), payload: { account: entry.accountRef }, disabled: pending,
+    })
+    : action(`repair-${i}`,
+      entry.code === "CONNECTION_FAILED" ? "retry-connection" : "sign-in-account", {
+        values: { account: entry.accountRef },
+        actionId: entry.code === "CONNECTION_FAILED" ? "check" : "credential",
+        payload: { accountRef: entry.accountRef }, disabled: pending,
+      }));
+  // Choosing or adding an email Login in Secrets is always available here.
+  const chooseLogin = action("choose-login", "choose-account", {
+    kind: "email-login", actionId: "select-login", disabled: pending,
+    variant: setup.state === "ready" || repairs.length ? "outline" : "primary",
+  });
   return { ...full, pending,
     notices: full.notices.map((notice) => notice.labelKey === "mailkeeper-setup.credential-recovery"
       ? { id: notice.id, ...label("credential-return") } : notice),
     sections: full.sections.filter((section) => section.id === "connection"),
     actions: [
       ...repairActions,
+      chooseLogin,
       ...full.actions.filter((entry) => (entry.id === "check" && !repairs.length && !setup.missingFields?.length)
         || (entry.id === "open" && setup.state === "ready")).map((entry) => entry.id === "check" ? { ...entry, disabled: pending } : entry),
     ],
