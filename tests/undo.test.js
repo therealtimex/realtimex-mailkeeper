@@ -120,7 +120,7 @@ test("a crash after dispatch leaves the chunk pending, and restart never replays
   const journal = f.journal("r");
   journal.pending.push({ attemptId: "dead", account: "a", from: "Auto/News", to: "INBOX", uids: ["3"], at: "2026-01-01T00:00:00Z" });
   fs.writeFileSync(path.join(f.state, "undo", "r.json"), JSON.stringify(journal));
-  fs.writeFileSync(path.join(f.state, "undo", "r.lock"), "999999999");
+  fs.writeFileSync(path.join(f.state, "undo", "r.lock"), JSON.stringify({ pid: 999999999, token: "dead-holder" }));
   await assert.rejects(undo(f, "r"), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
   assert.equal(f.requests.length, 0);
 });
@@ -157,4 +157,87 @@ test("the journal treats a dispatch failure without a proven outcome as uncertai
   await assert.rejects(undoJournal.reverse({ stateDir: state, runId: "j", actions, dispatch: async () => { dispatched = true; } }),
     { code: "MAILKEEPER_UNDO_UNRESOLVED" });
   assert.equal(dispatched, false);
+});
+
+// Synthetic legacy records, as in System Design's probe: none may be replayed.
+async function legacyRefusal(t, storedUndo, cliRecord) {
+  const f = fixture(t, confirmed);
+  f.store.set("ws-1-run-old", { ...threeActions(), runId: "old", ...(storedUndo ? { undo: storedUndo } : {}) });
+  fs.mkdirSync(path.join(f.state, "runs"), { recursive: true });
+  if (cliRecord !== undefined) fs.writeFileSync(path.join(f.state, "runs", "old.json"), typeof cliRecord === "string" ? cliRecord : JSON.stringify(cliRecord));
+  await assert.rejects(undo(f, "old"), { code: "MAILKEEPER_UNDO_LEGACY_AMBIGUOUS" });
+  assert.equal(f.requests.length, 0);
+  assert.equal(f.journal("old"), null, "a refused adoption writes no journal");
+}
+const legacyUnresolved = { account: "a", from: "Archive", to: "INBOX", uids: ["1"], operationId: "previous-op", outcome: "uncertain" };
+
+test("earlier undo history or an unreadable CLI copy refuses adoption with zero mutation", async (t) => {
+  await legacyRefusal(t, { unresolved: [legacyUnresolved] });
+  await legacyRefusal(t, null, { runId: "old", actions: [], undo: { unresolved: [legacyUnresolved] } });
+  await legacyRefusal(t, { reversed: [undoJournal.actionKey("a", "1", "INBOX", "Archive")] });
+  await legacyRefusal(t, null, "{broken");
+  await legacyRefusal(t, null, { runId: "another-run", actions: [] });
+});
+
+test("the undo lock never treats unknown ownership as dead and only removes its own lock", async (t) => {
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), "mailkeeper-lock-"));
+  t.after(() => fs.rmSync(state, { recursive: true, force: true }));
+  undoJournal.ensure(state, "l");
+  const lockFile = path.join(state, "undo", "l.lock");
+  const actions = [{ account: "a", uid: "1", from: "INBOX", to: "Archive" }];
+  let dispatched = 0;
+  const attempt = () => undoJournal.reverse({ stateDir: state, runId: "l", actions, dispatch: async () => { dispatched += 1; } });
+
+  for (const content of ["", "12345", "{not json", JSON.stringify({ pid: 1 })]) {
+    fs.writeFileSync(lockFile, content);
+    await assert.rejects(attempt(), { code: "MAILKEEPER_UNDO_BUSY" }, JSON.stringify(content));
+  }
+  assert.equal(dispatched, 0);
+
+  // A stale holder replaced by a live owner between the stale read and the
+  // takeover: the replacement keeps its lock and nothing is dispatched.
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, token: "stale" }));
+  const replacement = JSON.stringify({ pid: process.pid, token: "replacement" });
+  const originalRead = fs.readFileSync;
+  let injected = false;
+  fs.readFileSync = function (file, ...rest) {
+    const result = originalRead.call(fs, file, ...rest);
+    if (file === lockFile && !injected) { injected = true; fs.unlinkSync(lockFile); fs.writeFileSync(lockFile, replacement); }
+    return result;
+  };
+  try { await assert.rejects(attempt(), { code: "MAILKEEPER_UNDO_BUSY" }); } finally { fs.readFileSync = originalRead; }
+  assert.ok(injected);
+  assert.equal(fs.readFileSync(lockFile, "utf8"), replacement, "the live replacement's lock survives");
+  assert.equal(dispatched, 0);
+
+  // One release can never delete another owner's lock.
+  fs.rmSync(lockFile);
+  const release = undoJournal.lock(state, "l");
+  fs.writeFileSync(lockFile, replacement);
+  release();
+  assert.equal(fs.readFileSync(lockFile, "utf8"), replacement);
+
+  // A reclaim already in progress keeps a second contender out.
+  fs.writeFileSync(lockFile, JSON.stringify({ pid: 999999999, token: "stale" }));
+  fs.mkdirSync(`${lockFile}.reclaim`);
+  await assert.rejects(attempt(), { code: "MAILKEEPER_UNDO_BUSY" });
+  fs.rmdirSync(`${lockFile}.reclaim`);
+  // Uncontended, a dead holder is reclaimed and the undo proceeds.
+  assert.equal((await attempt()).reversed, 1);
+  assert.equal(fs.existsSync(lockFile), false, "the owner released its lock");
+});
+
+test("journal initialization runs under the guard and never erases pending state", async (t) => {
+  const state = fs.mkdtempSync(path.join(os.tmpdir(), "mailkeeper-ensure-"));
+  t.after(() => fs.rmSync(state, { recursive: true, force: true }));
+  undoJournal.ensure(state, "e");
+  const journal = undoJournal.read(state, "e");
+  journal.pending.push({ attemptId: "p", account: "a", from: "Archive", to: "INBOX", uids: ["1"], at: "x" });
+  fs.writeFileSync(path.join(state, "undo", "e.json"), JSON.stringify(journal));
+  undoJournal.ensure(state, "e");
+  assert.equal(undoJournal.read(state, "e").pending.length, 1);
+  const release = undoJournal.lock(state, "e");
+  assert.throws(() => undoJournal.ensure(state, "e"), { code: "MAILKEEPER_UNDO_BUSY" });
+  release();
+  assert.equal(undoJournal.read(state, "e").pending.length, 1);
 });

@@ -25,6 +25,23 @@ function text(value, max = 500) {
     .slice(0, max);
 }
 
+// A run that predates the undo journal is adopted only from the shipped
+// record format (undoneAt). Partial undo history, or an unreadable or
+// mismatched CLI copy, is ambiguous: refuse with zero mutation until it is
+// reconciled. Only a missing CLI file counts as absent.
+function legacyCompletion(stateDir, runId, receipt) {
+  const ambiguous = () => codedError("This run's earlier undo records are ambiguous. Reconcile them before undoing.", "MAILKEEPER_UNDO_LEGACY_AMBIGUOUS", 409);
+  let cliRun = null;
+  try {
+    cliRun = JSON.parse(fs.readFileSync(path.join(stateDir, "runs", `${runId}.json`), "utf8"));
+  } catch (error) {
+    if (error.code !== "ENOENT") throw ambiguous();
+  }
+  if (cliRun && (typeof cliRun !== "object" || Array.isArray(cliRun) || (cliRun.runId !== undefined && cliRun.runId !== runId))) throw ambiguous();
+  if (receipt.undo !== undefined || cliRun?.undo !== undefined) throw ambiguous();
+  return { undoneAt: receipt.undoneAt || cliRun?.undoneAt || null };
+}
+
 function taskIdentity(workspaceId) {
   return `mailkeeper-maintenance-${workspaceId}`;
 }
@@ -544,13 +561,11 @@ class MailKeeperService {
     });
     // The shared journal is the one undo authority for this run, also used by
     // the workspace CLI. This surface can see both earlier records, so it
-    // adopts a run that predates the journal, keeping any recorded completion.
+    // adopts a run that predates the journal (checked under the guard).
     const stateDir = path.join(workspace.workingDirectory, ".mailkeeper");
-    let cliRun = null;
-    try { cliRun = JSON.parse(fs.readFileSync(path.join(stateDir, "runs", `${runId}.json`), "utf8")); } catch { /* No CLI record. */ }
     const result = await undoJournal.reverse({
       stateDir, runId, actions, dryRun: body.dryRun === true, by: user.id,
-      legacy: { allow: true, undoneAt: cliRun?.undoneAt || null },
+      legacy: { allow: true, load: () => legacyCompletion(stateDir, runId, receipt) },
       dispatch: ({ account, from, to, uids }) => mailbox.move(account, uids, {
         from, to, email: this.host.email, bindingId: profile.emailBindings?.[account],
       }),

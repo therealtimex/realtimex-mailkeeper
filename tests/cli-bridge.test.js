@@ -188,7 +188,7 @@ test("a confirmed undo on either surface is never redispatched by the other", as
 test("a second undo of the same run is refused while one is running, from either surface", async (t) => {
   const f = fixture(t);
   f.seedRun("r2", threeActions);
-  fs.writeFileSync(path.join(f.state, "undo", "r2.lock"), String(process.pid)); // live holder
+  fs.writeFileSync(path.join(f.state, "undo", "r2.lock"), JSON.stringify({ pid: process.pid, token: "live-holder" }));
   const result = f.run("undo", "--run-id", "r2");
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /MAILKEEPER_UNDO_BUSY/);

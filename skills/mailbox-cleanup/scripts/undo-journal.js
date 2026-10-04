@@ -69,32 +69,85 @@ function write(stateDir, runId, journal) {
 }
 
 // Called when a run first records mailbox moves: a run without a journal
-// predates it, and its undo history is unknown to the journal.
+// predates it, and its undo history is unknown to the journal. Like every
+// writer, initialization runs under the guard.
 function ensure(stateDir, runId) {
-  if (!read(stateDir, runId)) write(stateDir, runId, blank(runId));
+  const release = lock(stateDir, runId);
+  try {
+    if (!read(stateDir, runId)) write(stateDir, runId, blank(runId));
+  } finally {
+    release();
+  }
+}
+
+const UNKNOWN = Symbol("unknown owner");
+const busy = () => fault("MAILKEEPER_UNDO_BUSY", "An undo for this run is already in progress");
+
+// null when absent; UNKNOWN when present but unreadable or incomplete.
+function readOwner(file) {
+  try {
+    const owner = JSON.parse(fs.readFileSync(file, "utf8"));
+    return Number.isInteger(owner?.pid) && owner.pid > 0 && typeof owner.token === "string" ? owner : UNKNOWN;
+  } catch (error) {
+    return error.code === "ENOENT" ? null : UNKNOWN;
+  }
+}
+
+// The complete owner record is written first and then linked into place
+// exclusively, so the lock is never observable empty or half-written.
+function publish(file, owner) {
+  const temporary = `${file}.${owner.token}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(owner), { flag: "wx", mode: 0o600 });
+  try {
+    fs.linkSync(temporary, file);
+    return true;
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function alive(pid) {
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code !== "ESRCH"; }
 }
 
 function lock(stateDir, runId) {
   const { dir, lock: file } = files(stateDir, runId);
   fs.mkdirSync(dir, { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      fs.writeFileSync(file, String(process.pid), { flag: "wx", mode: 0o600 });
-      return () => fs.rmSync(file, { force: true });
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      let holder = NaN;
-      try { holder = Number(fs.readFileSync(file, "utf8")); } catch { /* Treated as dead below. */ }
-      let alive = Number.isInteger(holder) && holder > 0;
-      if (alive) {
-        try { process.kill(holder, 0); } catch (probe) { alive = probe.code !== "ESRCH"; }
-      }
-      if (alive) throw fault("MAILKEEPER_UNDO_BUSY", "An undo for this run is already in progress");
-      // The dead holder's pending chunks stay in the journal and keep blocking.
-      fs.rmSync(file, { force: true });
-    }
+  const owner = { pid: process.pid, token: crypto.randomUUID(), at: new Date().toISOString() };
+  // Release removes only this caller's own current lock.
+  const release = () => {
+    const current = readOwner(file);
+    if (current && current !== UNKNOWN && current.token === owner.token) fs.rmSync(file, { force: true });
+  };
+  if (publish(file, owner)) return release;
+  const holder = readOwner(file);
+  if (holder === null) {
+    if (publish(file, owner)) return release;
+    throw busy();
   }
-  throw fault("MAILKEEPER_UNDO_BUSY", "An undo for this run is already in progress");
+  // Unknown ownership is never treated as dead.
+  if (holder === UNKNOWN || alive(holder.pid)) throw busy();
+  // A dead holder: reclaim exclusively, and only that exact stale record.
+  // Its pending chunks stay in the journal and keep blocking.
+  const reclaim = `${file}.reclaim`;
+  try {
+    fs.mkdirSync(reclaim);
+  } catch (error) {
+    if (error.code === "EEXIST") throw busy();
+    throw error;
+  }
+  try {
+    const again = readOwner(file);
+    if (!again || again === UNKNOWN || again.token !== holder.token) throw busy();
+    fs.unlinkSync(file);
+  } finally {
+    fs.rmdirSync(reclaim);
+  }
+  if (publish(file, owner)) return release;
+  throw busy();
 }
 
 /**
@@ -106,8 +159,9 @@ function lock(stateDir, runId) {
  * on confirmation. A failure is not_started only when it carries that proven
  * outcome; anything else is uncertain.
  * legacy: how to treat a run without a journal: { allow: false } refuses;
- * { allow: true, undoneAt } adopts it, and an earlier record of completion
- * (undoneAt) is kept rather than replayed.
+ * { allow: true, load } adopts it. load() runs under the guard and returns
+ * { undoneAt } from the shipped earlier records, or throws to refuse a run
+ * whose earlier records are ambiguous.
  */
 async function reverse({ stateDir, runId, actions, select = () => true, dispatch, dryRun = false, legacy = { allow: false }, by = null }) {
   const release = lock(stateDir, runId);
@@ -115,7 +169,8 @@ async function reverse({ stateDir, runId, actions, select = () => true, dispatch
     let journal = read(stateDir, runId); // Under the guard: never a stale copy.
     if (!journal) {
       if (!legacy.allow) throw fault("MAILKEEPER_UNDO_LEGACY", "This run predates the shared undo journal. Undo it from MailKeeper in RealTimeX.");
-      journal = { ...blank(runId), legacy: true, ...(legacy.undoneAt ? { undoneAt: legacy.undoneAt } : {}) };
+      const { undoneAt = null } = legacy.load ? legacy.load() : {};
+      journal = { ...blank(runId), legacy: true, ...(undoneAt ? { undoneAt } : {}) };
       if (!dryRun) write(stateDir, runId, journal);
     }
     if (journal.undoneAt) return { reused: true, undoneAt: journal.undoneAt, reversed: 0, skipped: [], dryRun };
@@ -186,4 +241,4 @@ async function reverse({ stateDir, runId, actions, select = () => true, dispatch
   }
 }
 
-module.exports = { actionKey, ensure, read, reverse, BATCH };
+module.exports = { actionKey, ensure, read, reverse, lock, BATCH };
