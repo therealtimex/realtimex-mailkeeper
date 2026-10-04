@@ -177,6 +177,26 @@ test("earlier undo history or an unreadable CLI copy refuses adoption with zero 
   await legacyRefusal(t, { reversed: [undoJournal.actionKey("a", "1", "INBOX", "Archive")] });
   await legacyRefusal(t, null, "{broken");
   await legacyRefusal(t, null, { runId: "another-run", actions: [] });
+  // Existing copies that are not the shipped run shape for this run.
+  await legacyRefusal(t, null, "null");
+  await legacyRefusal(t, null, "false");
+  await legacyRefusal(t, null, {});
+  await legacyRefusal(t, null, { runId: "old" });
+  await legacyRefusal(t, null, []);
+});
+
+test("valid pre-journal records are still adopted", async (t) => {
+  for (const [record, expectReused] of [[undefined, false], [{ runId: "old", actions: [] }, false],
+    [{ runId: "old", actions: [], undoneAt: "2026-01-01T00:00:00Z" }, true]]) {
+    const f = fixture(t, confirmed);
+    f.store.set("ws-1-run-old", { ...threeActions(), runId: "old" });
+    fs.mkdirSync(path.join(f.state, "runs"), { recursive: true });
+    if (record !== undefined) fs.writeFileSync(path.join(f.state, "runs", "old.json"), JSON.stringify(record));
+    const result = await undo(f, "old");
+    assert.equal(result.reused, expectReused, JSON.stringify(record));
+    assert.equal(f.requests.length, expectReused ? 0 : 2);
+    assert.ok(f.journal("old"));
+  }
 });
 
 test("the undo lock never treats unknown ownership as dead and only removes its own lock", async (t) => {

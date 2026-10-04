@@ -32,12 +32,16 @@ function text(value, max = 500) {
 function legacyCompletion(stateDir, runId, receipt) {
   const ambiguous = () => codedError("This run's earlier undo records are ambiguous. Reconcile them before undoing.", "MAILKEEPER_UNDO_LEGACY_AMBIGUOUS", 409);
   let cliRun = null;
+  let exists = true;
   try {
     cliRun = JSON.parse(fs.readFileSync(path.join(stateDir, "runs", `${runId}.json`), "utf8"));
   } catch (error) {
     if (error.code !== "ENOENT") throw ambiguous();
+    exists = false;
   }
-  if (cliRun && (typeof cliRun !== "object" || Array.isArray(cliRun) || (cliRun.runId !== undefined && cliRun.runId !== runId))) throw ambiguous();
+  // An existing copy must be the shipped run shape for exactly this run.
+  if (exists && (!cliRun || typeof cliRun !== "object" || Array.isArray(cliRun) ||
+      cliRun.runId !== runId || !Array.isArray(cliRun.actions))) throw ambiguous();
   if (receipt.undo !== undefined || cliRun?.undo !== undefined) throw ambiguous();
   return { undoneAt: receipt.undoneAt || cliRun?.undoneAt || null };
 }
