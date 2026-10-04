@@ -59,7 +59,7 @@ test("an interrupted apply keeps confirmed chunks and the uncertain attempt on i
   assert.equal(run.actions.length, 200, "the confirmed chunk stays undoable");
   assert.deepEqual(run.attempts, [{ account: "a", from: "INBOX", to: "Auto/Notifications", uids: ["201"],
     operationId: "op-2", outcome: "uncertain", code: "EMAIL_NETWORK_FAILED", pass: "no-reply", ruleId: null }]);
-  assert.deepEqual(f.read("snapshot-a.json").envelopes.map((e) => e.uid), ["201"]);
+  assert.deepEqual(f.read("snapshot-a.json").envelopes, [], "an uncertain move waits for a fresh snapshot readback");
   const moves = f.commands().filter((args) => option(args, "operation") === "move");
   assert.equal(moves.length, 2, "an uncertain move is never replayed automatically");
   assert.ok(moves.every((args) => option(args, "plugin") === "fixture-plugin" && option(args, "binding") === "binding-a"));
@@ -70,27 +70,50 @@ test("an interrupted apply keeps confirmed chunks and the uncertain attempt on i
   assert.equal(receipt.attempts[0].operationId, "op-2");
 });
 
-test("an interrupted undo records the attempt and a retry sends only unconfirmed reversals", (t) => {
+const threeActions = { runId: "r2", actions: [
+  { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
+  { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }] };
+
+test("an uncertain undo stays unresolved and a later CLI undo makes no mutation", (t) => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify({ runId: "r2", actions: [
-    { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
-    { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }] }));
+  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
   f.queueMoves(["confirmed", uncertain]);
   const first = f.run("undo", "--run-id", "r2");
   assert.equal(first.status, 0, first.stderr);
   assert.deepEqual(JSON.parse(first.stdout).skipped, [{ account: "a", from: "Auto/News", to: "INBOX", count: 1,
     code: "EMAIL_NETWORK_FAILED", attempt: { operationId: "op-2", outcome: "uncertain" } }]);
-  let run = f.read("runs/r2.json");
-  assert.equal(run.undoneAt, undefined, "an interrupted undo stays retryable");
-  assert.equal(run.undo.reversed.length, 2);
+  const run = f.read("runs/r2.json");
+  assert.equal(run.undoneAt, undefined);
+  assert.deepEqual(run.undo.unresolved.map(({ at, ...entry }) => entry),
+    [{ account: "a", from: "Auto/News", to: "INBOX", uids: ["3"], operationId: "op-2" }]);
 
+  const second = f.run("undo", "--run-id", "r2");
+  assert.notEqual(second.status, 0);
+  assert.match(second.stderr, /MAILKEEPER_UNDO_UNRESOLVED/);
+  assert.equal(f.commands().filter((args) => option(args, "operation") === "move").length, 2, "no further mutation");
+});
+
+test("a not_started undo chunk is retried and confirmed reversals are not", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
+  f.queueMoves(["confirmed", { ok: false, code: "EMAIL_OPERATION_CANCELLED", operationId: "op-2", outcome: "not_started" }]);
+  assert.equal(f.run("undo", "--run-id", "r2").status, 0);
+  assert.deepEqual(f.read("runs/r2.json").undo.unresolved, []);
   const second = f.run("undo", "--run-id", "r2");
   assert.equal(JSON.parse(second.stdout).reversed, 1);
   const moves = f.commands().filter((args) => option(args, "operation") === "move");
-  assert.equal(moves.length, 3);
-  assert.deepEqual([option(moves[2], "from"), option(moves[2], "to"), option(moves[2], "uids")], ["Auto/News", "INBOX", "3"]);
-  run = f.read("runs/r2.json");
-  assert.ok(run.undoneAt); assert.equal(run.undo.attempts.length, 2);
+  assert.deepEqual([option(moves[2], "from"), option(moves[2], "uids")], ["Auto/News", "3"]);
+  assert.ok(f.read("runs/r2.json").undoneAt);
+});
+
+test("a second CLI undo of the same run is refused while one is running", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
+  fs.writeFileSync(path.join(f.state, "runs/r2.undo.lock"), String(process.pid)); // live holder
+  const result = f.run("undo", "--run-id", "r2");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /MAILKEEPER_UNDO_BUSY/);
+  assert.deepEqual(f.commands(), []);
 });
 
 test("missing rtxexec or pre-bridge rules fail safely without launching Himalaya", (t) => {

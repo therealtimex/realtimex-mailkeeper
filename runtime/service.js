@@ -39,6 +39,7 @@ class MailKeeperService {
     this.store = api.getStore();
     this.setupJobs = new Map();
     this.locks = new Map();
+    this.undoing = new Set();
   }
 
   // -------------------------------------------------------------------------
@@ -117,13 +118,18 @@ class MailKeeperService {
     const authErrors = [];
     for (const account of config.emailAccounts) {
       const probe = await mailbox.checkAccount(account, { email: this.host.email, bindingId: profile.emailBindings?.[account] });
-      // Without an authenticated caller (for example plugin activation) a
-      // check says nothing about the account; leave readiness untouched.
-      if (probe.code === "CONTEXT_REQUIRED") throw codedError(probe.error, "CONTEXT_REQUIRED", 409);
+      // No caller before any check (for example plugin activation) is no
+      // evidence about an account: defer and keep the last result. Context
+      // lost after a check has run makes this check incomplete, and the
+      // results already observed must not be discarded.
+      if (probe.code === "CONTEXT_REQUIRED" && !Object.keys(readiness).length) {
+        throw codedError(probe.error, "CONTEXT_REQUIRED", 409);
+      }
       await current();
       probe.checkedAt = new Date().toISOString();
       readiness[account] = probe;
       if (!probe.ok) authErrors.push(probe.error);
+      if (probe.code === "CONTEXT_REQUIRED") break;
     }
     if (authErrors.length) {
       await this.suspendScheduleForRepair(workspace, operation);
@@ -518,10 +524,28 @@ class MailKeeperService {
     if (!user?.id)
       throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const runId = text(body.runId, 80);
+    // One undo per run at a time: overlapping requests could admit the same
+    // actions twice.
+    const guard = `${workspace.id}:${runId}`;
+    if (this.undoing.has(guard)) throw codedError("An undo for this run is already in progress", "MAILKEEPER_UNDO_BUSY", 409);
+    this.undoing.add(guard);
+    try {
+      return await this.reverseRun(workspace, runId, body, user);
+    } finally {
+      this.undoing.delete(guard);
+    }
+  }
+
+  async reverseRun(workspace, runId, body, user) {
     const receipt = await this.store.get(this.runKey(workspace, runId));
     if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILKEEPER_RUN_UNKNOWN", 404);
     if (receipt.undoneAt)
       return { runId, reused: true, undoneAt: receipt.undoneAt };
+    // An uncertain reversal may already have happened. Until an authenticated
+    // reconciliation of that attempt exists, nothing in the run moves again.
+    if (receipt.undo?.unresolved?.length) {
+      throw codedError("Review the interrupted undo before trying again", "MAILKEEPER_UNDO_UNRESOLVED", 409);
+    }
     const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
     if (!target?.configPath || !this.host.email.supported) throw codedError("Upgrade RealTimeX to undo against the shared email target", "HOST_UNSUPPORTED", 409);
     if (receipt.scope?.configPath && receipt.scope.configPath !== target.configPath) {
@@ -557,12 +581,17 @@ class MailKeeperService {
       reversedKeys.push(...partial.reversedActions.map((done) => actionKey(account, done.uid, done.to, done.from)));
     }
     if (!body.dryRun) {
-      // Record every attempt, including the operation identity and outcome of
-      // an interrupted move, so a retry only targets what was not confirmed.
+      // Record every attempt with its operation identity and outcome. Proven
+      // not_started work stays retryable; uncertain work becomes unresolved,
+      // kept apart from the trimmed history so it stays blocked.
+      const at = new Date().toISOString();
+      const unresolved = result.skipped.filter((entry) => entry.attempt?.outcome === "uncertain")
+        .map(({ account, attempt }) => ({ account, ...attempt, at }));
       receipt.undo = {
         reversed: [...confirmed, ...reversedKeys],
+        unresolved: [...(receipt.undo?.unresolved || []), ...unresolved],
         attempts: [...(receipt.undo?.attempts || []), {
-          at: new Date().toISOString(), by: user.id, reversed: result.reversed, skipped: result.skipped,
+          at, by: user.id, reversed: result.reversed, skipped: result.skipped,
         }].slice(-20),
       };
       if (!result.skipped.length) {

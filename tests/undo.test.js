@@ -42,31 +42,69 @@ test("runtime undo sends every receipt account through the authenticated bridge 
   assert.equal(f.requests.length, 2, "refused undo must not dispatch another move");
 });
 
-test("an interrupted undo keeps confirmed reversals and the uncertain attempt; a retry sends only the rest", async () => {
-  let fail = true;
-  const f = fixture((request, n) => fail && request.to === "INBOX" && request.from === "Auto/News"
-    ? { ok: false, code: "EMAIL_NETWORK_FAILED", operationId: `op-${n}`, outcome: "uncertain" } : confirmed(request, n));
-  f.store.set("ws-1-run-r", { runId: "r", scope: { accounts: ["a"], configPath: "/fixture/bizops.toml" }, actions: [
-    { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
-    { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }] });
+const threeActions = { runId: "r", scope: { accounts: ["a"], configPath: "/fixture/bizops.toml" }, actions: [
+  { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
+  { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }] };
 
+test("a reversal whose final validation was lost stays unresolved and blocks every later undo", async () => {
+  // The server moved UID 3 back, but final validation was lost: the host
+  // reports the admitted operation as uncertain.
+  const f = fixture((request, n) => request.from === "Auto/News"
+    ? { ok: false, code: "EMAIL_CONTEXT_UNAVAILABLE", operationId: `op-${n}`, outcome: "uncertain" } : confirmed(request, n));
+  f.store.set("ws-1-run-r", structuredClone(threeActions));
   const first = await f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 });
   assert.equal(first.reversed, 2);
-  assert.deepEqual(first.skipped, [{ account: "a", from: "Auto/News", to: "INBOX", uids: ["3"], code: "CONNECTION_FAILED",
-    error: "Check the connection and provider settings, then retry.",
-    attempt: { from: "Auto/News", to: "INBOX", uids: ["3"], operationId: "op-2", outcome: "uncertain" } }]);
-  const receipt = f.store.get("ws-1-run-r");
-  assert.equal(receipt.undoneAt, undefined, "an interrupted undo stays retryable");
-  assert.equal(receipt.undo.reversed.length, 2);
-  assert.equal(receipt.undo.attempts[0].skipped[0].attempt.operationId, "op-2");
+  assert.equal(first.skipped[0].attempt.outcome, "uncertain");
+  let receipt = f.store.get("ws-1-run-r");
+  assert.equal(receipt.undoneAt, undefined);
+  assert.deepEqual(receipt.undo.unresolved.map(({ at, ...entry }) => entry),
+    [{ account: "a", from: "Auto/News", to: "INBOX", uids: ["3"], operationId: "op-2", outcome: "uncertain" }]);
 
-  fail = false;
+  await assert.rejects(f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 }), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
+  assert.equal(f.requests.length, 2, "a human retry is not reconciliation: no further mutation");
+
+  // Trimming the display history never makes unresolved work eligible again.
+  receipt = f.store.get("ws-1-run-r");
+  receipt.undo.attempts = Array.from({ length: 25 }, (_, i) => ({ at: String(i), reversed: 0, skipped: [] })).slice(-20);
+  f.store.set("ws-1-run-r", receipt);
+  await assert.rejects(f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 }), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
+  assert.equal(f.requests.length, 2);
+});
+
+test("proven not_started work is retried, confirmed reversals never are", async () => {
+  let refuse = true;
+  const f = fixture((request, n) => refuse && request.from === "Auto/News"
+    ? { ok: false, code: "EMAIL_OPERATION_CANCELLED", operationId: `op-${n}`, outcome: "not_started" } : confirmed(request, n));
+  f.store.set("ws-1-run-r", structuredClone(threeActions));
+  const first = await f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 });
+  assert.equal(first.reversed, 2);
+  assert.deepEqual(f.store.get("ws-1-run-r").undo.unresolved, []);
+  refuse = false;
   const second = await f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 });
-  assert.equal(second.reversed, 1); assert.deepEqual(second.skipped, []);
-  assert.deepEqual(f.requests.slice(2), [{ account: "a", operation: "move", from: "Auto/News", to: "INBOX", uids: ["3"] }],
-    "confirmed reversals are never sent again");
+  assert.equal(second.reversed, 1);
+  assert.deepEqual(f.requests.slice(2), [{ account: "a", operation: "move", from: "Auto/News", to: "INBOX", uids: ["3"] }]);
   assert.ok(f.store.get("ws-1-run-r").undoneAt);
-  assert.equal(f.store.get("ws-1-run-r").undo.attempts.length, 2);
+});
+
+test("a malformed success reply is uncertain, not a reason to retry", async () => {
+  const f = fixture((request) => request.from === "Auto/News" ? { ok: true, data: null } : confirmed(request, 1));
+  f.store.set("ws-1-run-r", structuredClone(threeActions));
+  await f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 });
+  assert.equal(f.store.get("ws-1-run-r").undo.unresolved[0].outcome, "uncertain");
+  await assert.rejects(f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 }), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
+});
+
+test("overlapping undo requests for one run cannot both dispatch", async () => {
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const f = fixture(async (request, n) => { await gate; return confirmed(request, n); });
+  f.store.set("ws-1-run-r", structuredClone(threeActions));
+  const first = f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 });
+  await new Promise((resolve) => setImmediate(resolve));
+  await assert.rejects(f.service.undoRun(f.workspace, { runId: "r" }, { id: 7 }), { code: "MAILKEEPER_UNDO_BUSY" });
+  release();
+  assert.equal((await first).reversed, 3);
+  assert.equal(f.requests.length, 2);
 });
 
 test("undo fails fast when the host has no authenticated email runner", async () => {

@@ -507,10 +507,12 @@ const commands = {
 
     const results = [];
     // Persist on success and on failure: moved mail must always be on the
-    // receipt so it stays undoable.
+    // receipt so it stays undoable. Uncertain moves leave the snapshot too:
+    // only a fresh authenticated `snapshot` readback can offer them again.
     const persist = () => {
       if (!dryRun) {
-        const moved = new Set(run.actions.filter((a) => !a.dryRun).map((a) => a.uid));
+        const moved = new Set([...run.actions.filter((a) => !a.dryRun).map((a) => a.uid),
+          ...(run.attempts || []).filter((a) => a.outcome === "uncertain").flatMap((a) => a.uids)]);
         snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
         writeJson(snapshotFile(account), snapshot);
       }
@@ -605,6 +607,40 @@ const commands = {
     const only = args.account || null;
     const run = loadRun(runId);
     if (run.undoneAt) fail(`run ${runId} already undone at ${run.undoneAt}`);
+    // An uncertain reversal may already have happened. Until an authenticated
+    // reconciliation of that attempt exists, nothing in the run moves again.
+    if (run.undo?.unresolved?.length) fail("an earlier undo is unresolved (MAILKEEPER_UNDO_UNRESOLVED); review it before trying again");
+    const release = lockRun(runId);
+    try {
+      undoRun(run, runId, dryRun, only);
+    } finally {
+      release();
+    }
+  },
+};
+
+// One undo per run at a time; a stale lock from a dead process is replaced.
+function lockRun(runId) {
+  const file = path.join(STATE, "runs", `${runId}.undo.lock`);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: "wx", mode: 0o600 });
+      return () => fs.rmSync(file, { force: true });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error;
+      const holder = Number(fs.readFileSync(file, "utf8"));
+      let alive = Number.isInteger(holder) && holder > 0;
+      if (alive) { try { process.kill(holder, 0); } catch (probe) { alive = probe.code !== "ESRCH"; } }
+      if (alive) fail("an undo for this run is already in progress (MAILKEEPER_UNDO_BUSY)");
+      fs.rmSync(file, { force: true });
+    }
+  }
+  fail("could not lock the run for undo (MAILKEEPER_UNDO_BUSY)");
+}
+
+function undoRun(run, runId, dryRun, only) {
+  {
     // Reversals an earlier interrupted undo already confirmed are never sent again.
     const actionKey = (acct, uid, from, to) => JSON.stringify([acct, String(uid), from, to]);
     const confirmed = new Set(run.undo?.reversed || []);
@@ -628,7 +664,7 @@ const commands = {
       } catch (error) {
         done = error.completed || [];
         skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length - done.length, code: error.code,
-          ...(error.attempt ? { attempt: { operationId: error.attempt.operationId, outcome: error.attempt.outcome } } : {}) });
+          ...(error.attempt ? { attempt: { operationId: error.attempt.operationId, outcome: error.attempt.outcome }, attemptUids: error.attempt.uids } : {}) });
       }
       reversed += done.length;
       // A reversal moves `to` back to `from`; key it by the original action.
@@ -636,13 +672,19 @@ const commands = {
     }
     if (!dryRun) {
       const now = new Date().toISOString();
+      // Proven not_started work stays retryable; uncertain work becomes
+      // unresolved, kept apart from the trimmed history so it stays blocked.
+      const unresolved = skipped.filter((entry) => entry.attempt?.outcome === "uncertain")
+        .map((entry) => ({ account: entry.account, from: entry.from, to: entry.to, uids: entry.attemptUids,
+          operationId: entry.attempt.operationId, at: now }));
       writeJson(runFile(runId), { ...run,
-        undo: { reversed: [...confirmed, ...reversedKeys], attempts: [...(run.undo?.attempts || []), { at: now, reversed, skipped }].slice(-20) },
+        undo: { reversed: [...confirmed, ...reversedKeys], unresolved: [...(run.undo?.unresolved || []), ...unresolved],
+          attempts: [...(run.undo?.attempts || []), { at: now, reversed, skipped: skipped.map(({ attemptUids, ...entry }) => entry) }].slice(-20) },
         ...(skipped.length ? {} : { undoneAt: now }) });
     }
-    console.log(JSON.stringify({ ok: true, runId, dryRun, reversed, skipped }, null, 2));
-  },
-};
+    console.log(JSON.stringify({ ok: true, runId, dryRun, reversed, skipped: skipped.map(({ attemptUids, ...entry }) => entry) }, null, 2));
+  }
+}
 
 // ---------------------------------------------------------------------------
 

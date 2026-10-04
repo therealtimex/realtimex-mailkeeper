@@ -35,18 +35,23 @@ async function execute(account, request, { email, bindingId } = {}) {
     throw Object.assign(new Error("CONNECTION_FAILED"), { code: "CONNECTION_FAILED",
       ...(["move", "add-folder"].includes(request.operation) ? { receipt: { operationId: null, outcome: "uncertain" } } : {}) });
   }
+  const mutating = ["move", "add-folder"].includes(request.operation);
+  // A refusal before admission carries no operation fields and started nothing.
+  // Any other mutation reply without a valid receipt has an unknown outcome.
+  const uncertain = { operationId: typeof result?.operationId === "string" ? result.operationId : null, outcome: "uncertain" };
   if (result?.ok !== true) {
     const safe = classifyError(result);
-    throw Object.assign(new Error(safe.error), safe, { receipt: mutationReceipt(result) });
+    const admitted = result?.operationId !== undefined || result?.outcome !== undefined;
+    throw Object.assign(new Error(safe.error), safe, { receipt: !mutating ? null
+      : mutationReceipt(result, ["not_started", "uncertain"]) || (admitted ? uncertain : null) });
   }
-  if (["move", "add-folder"].includes(request.operation) && !mutationReceipt(result))
-    throw Object.assign(new Error("Mailbox result is uncertain. Review the original attempt."), { code: "EMAIL_RESULT_UNCERTAIN" });
+  if (mutating && !mutationReceipt(result, ["confirmed"]))
+    throw Object.assign(new Error("Mailbox result is uncertain. Review the original attempt."), { code: "EMAIL_RESULT_UNCERTAIN", receipt: uncertain });
   return result;
 }
 
-function mutationReceipt(result) {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(result?.operationId || "") ||
-      !["confirmed", "not_started", "uncertain"].includes(result?.outcome)) return null;
+function mutationReceipt(result, outcomes = ["confirmed", "not_started", "uncertain"]) {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(result?.operationId || "") || !outcomes.includes(result?.outcome)) return null;
   return { operationId: result.operationId, outcome: result.outcome };
 }
 
@@ -101,6 +106,7 @@ function classifyError(error) {
     CLI_UNSUPPORTED: "Use a supported Himalaya version, then check again.",
     HOST_UNSUPPORTED: "Upgrade RealTimeX to use authenticated email access.",
     CONTEXT_REQUIRED: "Open setup or run from this workspace's authenticated terminal, then check again.",
+    PLUGIN_DISABLED: "Enable MailKeeper for this workspace, then check again.",
     CREDENTIAL_SCOPE_DENIED: "Allow this Login for this workspace in Secrets, then check again.",
     EMAIL_PAGE_OUT_OF_RANGE: "No further page is available.",
     EMAIL_RESULT_UNCERTAIN: "Review the original mailbox attempt before retrying.",
@@ -121,7 +127,7 @@ function classifyError(error) {
     SECRET_UNDECRYPTABLE: "CREDENTIAL_MISSING", SECRET_FIELD_NOT_FOUND: "CREDENTIAL_MISSING",
     SECRET_LOGIN_REQUIRED: "CREDENTIAL_MISSING", EMAIL_AUTH_FAILED: "AUTH_FAILED",
     EMAIL_CREDENTIAL_COMMAND_FAILED: "CREDENTIAL_MISSING", EMAIL_PAGE_OUT_OF_RANGE: "EMAIL_PAGE_OUT_OF_RANGE",
-    EMAIL_PLUGIN_DISABLED: "CONTEXT_REQUIRED", EMAIL_RESULT_UNCERTAIN: "EMAIL_RESULT_UNCERTAIN",
+    EMAIL_PLUGIN_DISABLED: "PLUGIN_DISABLED", EMAIL_RESULT_UNCERTAIN: "EMAIL_RESULT_UNCERTAIN",
   };
   if (hostCodes[error?.code]) code = hostCodes[error.code];
   else if (messages[error?.code]) code = error.code; // Already classified by execute().

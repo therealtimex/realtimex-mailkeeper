@@ -129,6 +129,48 @@ test("a check without an authenticated caller keeps readiness and the saved sche
   assert.equal(status.schedule.suspendedForRepair, false); assert.equal(f.task().interval, "3d");
   assert.deepEqual(status.blockers, []);
 });
+test("an observed failure is kept when a later account loses its caller", async (t) => {
+  const f = fixture(t, { EMAIL_ACCOUNTS: ["a", "b"] }); await f.ready();
+  await f.service.setSchedule(f.workspace, { enabled: true, cadence: "3d" }, { id: 1 });
+  await f.service.setupJobs.get(1)?.promise;
+  mailbox.checkAccount = async (name) => name === "a"
+    ? { ok: false, code: "AUTH_FAILED", error: "Review authentication." }
+    : { ok: false, code: "CONTEXT_REQUIRED", error: "Open setup." };
+  await f.service.activateAll(); await f.service.setupJobs.get(1)?.promise;
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.state, "needs_repair");
+  assert.deepEqual(status.blockers.map((entry) => [entry.accountRef, entry.code]), [["a", "AUTH_FAILED"], ["b", "CONTEXT_REQUIRED"]]);
+  assert.equal(status.schedule.suspendedForRepair, true); assert.equal(f.task(), null);
+});
+test("a deferred check never restores over disablement, drift or an existing suspension", async (t) => {
+  const deferred = async () => ({ ok: false, code: "CONTEXT_REQUIRED", error: "Open setup." });
+  // Disabled while the deferred check is in flight.
+  const disabled = fixture(t); await disabled.ready(); let release;
+  mailbox.checkAccount = () => new Promise((resolve) => { release = resolve; });
+  await disabled.service.activateAll(); const job = disabled.service.setupJobs.get(1).promise;
+  await disabled.service.disable(disabled.workspace); release(await deferred()); await job;
+  assert.equal((await disabled.service.setupStatus(disabled.workspace)).state, "disabled"); assert.equal(disabled.task(), null);
+  // Known drift stays visible.
+  const drift = fixture(t); await drift.ready(); drift.setTarget({ revision: "changed", configPath: "new.toml" });
+  mailbox.checkAccount = deferred;
+  await drift.service.activateAll(); await drift.service.setupJobs.get(1)?.promise;
+  assert.equal((await drift.service.setupStatus(drift.workspace)).state, "needs_repair");
+  // An existing repair suspension is never cleared.
+  const suspended = fixture(t); await suspended.ready();
+  await suspended.service.setSchedule(suspended.workspace, { enabled: true, cadence: "3d" }, { id: 1 });
+  await suspended.service.setupJobs.get(1)?.promise;
+  await suspended.api.getStore().set("ws-1-profile", { ...(await suspended.api.getStore().get("ws-1-profile")), scheduleSuspendedForRepair: true });
+  mailbox.checkAccount = deferred;
+  await suspended.service.activateAll(); await suspended.service.setupJobs.get(1)?.promise;
+  assert.equal((await suspended.service.setupStatus(suspended.workspace)).schedule.suspendedForRepair, true);
+});
+test("plugin disablement is a real failure, not a deferred startup check", async (t) => {
+  const f = fixture(t); await f.ready();
+  mailbox.checkAccount = async () => ({ ok: false, code: "PLUGIN_DISABLED", error: "Enable MailKeeper." });
+  await f.service.activateAll(); await f.service.setupJobs.get(1)?.promise;
+  const status = await f.service.setupStatus(f.workspace);
+  assert.equal(status.state, "needs_repair"); assert.equal(status.blockers[0].code, "PLUGIN_DISABLED");
+});
 test("unreadable rules fail without overwriting them", async (t) => {
   const f = fixture(t); fs.mkdirSync(path.join(f.workspace.workingDirectory, ".mailkeeper"));
   const file = path.join(f.workspace.workingDirectory, ".mailkeeper", "rules.json"); fs.writeFileSync(file, "broken JSON");
