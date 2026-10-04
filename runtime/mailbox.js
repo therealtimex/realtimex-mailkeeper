@@ -41,9 +41,12 @@ async function execute(account, request, { email, bindingId } = {}) {
   const uncertain = { operationId: typeof result?.operationId === "string" ? result.operationId : null, outcome: "uncertain" };
   if (result?.ok !== true) {
     const safe = classifyError(result);
-    const admitted = result?.operationId !== undefined || result?.outcome !== undefined;
+    // Only a typed refusal with no operation fields proves nothing launched;
+    // an absent, empty or malformed reply leaves a mutation uncertain.
+    const refused = result?.ok === false && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code || "") &&
+      result.operationId === undefined && result.outcome === undefined;
     throw Object.assign(new Error(safe.error), safe, { receipt: !mutating ? null
-      : mutationReceipt(result, ["not_started", "uncertain"]) || (admitted ? uncertain : null) });
+      : mutationReceipt(result, ["not_started", "uncertain"]) || (refused ? null : uncertain) });
   }
   if (mutating && !mutationReceipt(result, ["confirmed"]))
     throw Object.assign(new Error("Mailbox result is uncertain. Review the original attempt."), { code: "EMAIL_RESULT_UNCERTAIN", receipt: uncertain });
@@ -204,41 +207,6 @@ async function move(account, uids, { from = "INBOX", to, dryRun = false, ...opti
 }
 
 /**
- * Reverse a receipt's actions. Only `move` is reversible today, and only by
- * moving back; UIDs may change across folders on some servers, in which case
- * we report the ones we could not find instead of guessing.
- */
-async function undoActions(account, actions, { dryRun = false, ...options } = {}) {
-  const byPair = new Map();
-  for (const action of actions) {
-    if (action.kind !== "move" || action.dryRun) continue;
-    const key = `${action.to}→${action.from}`;
-    if (!byPair.has(key)) byPair.set(key, { from: action.to, to: action.from, uids: [] });
-    byPair.get(key).uids.push(action.uid);
-  }
-  const reversed = [];
-  const skipped = [];
-  for (const group of byPair.values()) {
-    try {
-      const done = await move(account, group.uids, {
-        from: group.from,
-        to: group.to,
-        dryRun,
-        ...options,
-      });
-      reversed.push(...done);
-    } catch (error) {
-      const completed = error.completed || [];
-      reversed.push(...completed);
-      const { code, error: message } = classifyError(error);
-      skipped.push({ ...group, uids: group.uids.slice(completed.length), code, error: message,
-        ...(error.attempt ? { attempt: error.attempt } : {}) });
-    }
-  }
-  return { reversed: reversed.length, reversedActions: reversed, skipped, dryRun };
-}
-
-/**
  * Ensure an Auto/<category> folder exists. Idempotent.
  */
 async function ensureFolder(account, name, options = {}) {
@@ -253,7 +221,6 @@ module.exports = {
   checkAccount,
   listEnvelopes,
   move,
-  undoActions,
   ensureFolder,
   normalizeEnvelope,
   classifyError,

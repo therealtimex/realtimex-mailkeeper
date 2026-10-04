@@ -99,6 +99,13 @@ node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js undo --run-id <id> [-
 
 Moves every UID in the receipt back to where it came from, across every account the run touched (or just one with `--account`). Or use the plugin's `POST /undo` from the status page.
 
+Both routes share one undo journal per run (`.mailkeeper/undo/`). Confirmed reversals are never sent twice, and a chunk that never started can be retried. Stop and report the code to the human on any of these refusals; never work around them:
+- `MAILKEEPER_UNDO_UNRESOLVED`: an earlier undo of this run may have moved mail with an unknown result. This includes an undo interrupted mid-move. Nothing in the run moves again until it is reconciled.
+- `MAILKEEPER_UNDO_BUSY`: another undo of this run is running.
+- `MAILKEEPER_UNDO_LEGACY`: the run predates the journal; undo it from MailKeeper in RealTimeX.
+
+Do not edit files in `.mailkeeper/undo/`.
+
 ## Reporting
 
 Interactive: after each apply, report count moved, top senders, and how to undo. At the end, list proposals worth promoting.

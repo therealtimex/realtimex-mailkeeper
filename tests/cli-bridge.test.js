@@ -6,11 +6,14 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { MailKeeperService } = require("../runtime/service");
+const undoJournal = require("../skills/mailbox-cleanup/scripts/undo-journal");
 const cli = path.resolve(__dirname, "../skills/mailbox-cleanup/scripts/mailbox-ops.js");
 const option = (args, name) => args[args.indexOf(`--${name}`) + 1];
 
-// A workspace with one account whose snapshot holds `count` no-reply envelopes,
-// and a fake `rtxexec himalaya` that answers moves from a queue of outcomes.
+// One workspace shared by the CLI (a fake `rtxexec himalaya` answering moves
+// from a queue) and the desktop runtime (a fake host bridge), so both undo
+// surfaces act on the same run.
 function fixture(t, { count = 0, config = {} } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "mailkeeper-cli-bridge-"));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -27,6 +30,8 @@ function fixture(t, { count = 0, config = {} } = {}) {
   const queue = path.join(root, "moves.json");
   fs.writeFileSync(queue, "[]");
   const binary = path.join(root, "rtxexec");
+  // "crash" logs the move as dispatched, then kills the CLI before it can
+  // record the outcome.
   fs.writeFileSync(binary, `#!${process.execPath}
 const fs=require('fs'); const args=process.argv.slice(2); fs.appendFileSync(${JSON.stringify(log)},JSON.stringify(args)+'\\n');
 const option=(name)=>args[args.indexOf('--'+name)+1]; const operation=option('operation');
@@ -35,18 +40,51 @@ if(operation==='folders')out({ok:true,code:'EMAIL_OPERATION_OK',data:[{name:'INB
 if(operation==='add-folder')out({ok:true,code:'EMAIL_OPERATION_OK',data:null,operationId:'op-folder',outcome:'confirmed'});
 if(operation==='move'){const moves=JSON.parse(fs.readFileSync(${JSON.stringify(queue)}));const next=moves.shift()||'confirmed';
 fs.writeFileSync(${JSON.stringify(queue)},JSON.stringify(moves));
-if(next==='confirmed')out({ok:true,code:'EMAIL_OPERATION_OK',data:null,operationId:'op-ok',outcome:'confirmed'});out(next,1);}
-process.exit(90);`, { mode: 0o700 });
+if(next==='crash'){process.kill(process.ppid,'SIGKILL');setTimeout(()=>{},2000);}
+else{if(next==='confirmed')out({ok:true,code:'EMAIL_OPERATION_OK',data:null,operationId:'op-ok',outcome:'confirmed'});out(next,1);}}
+else process.exit(90);`, { mode: 0o700 });
+
+  const store = new Map();
+  const desktopRequests = [];
+  let desktopReplies = [];
+  const workspace = { id: 1, slug: "fixture", workingDirectory: root };
+  const desktop = new MailKeeperService({
+    getConfig: () => ({ EMAIL_ACCOUNTS: ["a"], AGENT: "cursor" }),
+    getStore: () => ({ get: async (key) => structuredClone(store.get(key)), set: async (key, value) => store.set(key, structuredClone(value)) }),
+    workspaces: { get: async () => workspace }, heartbeat: { upsertManagedTask: async () => {} },
+    email: {
+      getHimalayaTarget: async () => ({ source: "shared", configPath: "/fixture/shared.toml" }),
+      executeHimalaya: async (request) => {
+        desktopRequests.push(request);
+        const next = desktopReplies.shift() || "confirmed";
+        return next === "confirmed" ? { ok: true, data: null, operationId: "op-desktop", outcome: "confirmed" } : next;
+      },
+    },
+  });
   return {
     state,
     queueMoves: (moves) => fs.writeFileSync(queue, JSON.stringify(moves)),
     run: (...args) => spawnSync(process.execPath, [cli, ...args], { cwd: root, encoding: "utf8", env: { ...process.env, MAILKEEPER_RTXEXEC_BIN: binary } }),
     runWith: (env, ...args) => spawnSync(process.execPath, [cli, ...args], { cwd: root, encoding: "utf8", env: { ...process.env, ...env } }),
     commands: () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").map(JSON.parse) : [],
+    moves() { return this.commands().filter((args) => option(args, "operation") === "move"); },
     read: (file) => JSON.parse(fs.readFileSync(path.join(state, file), "utf8")),
+    journal: (runId) => undoJournal.read(state, runId),
+    // A submitted run as both surfaces hold it, with its journal.
+    seedRun(runId, actions) {
+      fs.writeFileSync(path.join(state, "runs", `${runId}.json`), JSON.stringify({ runId, actions }));
+      store.set(`ws-1-run-${runId}`, { runId, scope: { accounts: ["a"], configPath: "/fixture/shared.toml" }, actions });
+      undoJournal.ensure(state, runId);
+    },
+    desktopUndo: (runId) => desktop.undoRun(workspace, { runId }, { id: 7 }),
+    desktopReplies: (replies) => { desktopReplies = replies; },
+    desktopRequests,
   };
 }
 const uncertain = { ok: false, code: "EMAIL_NETWORK_FAILED", operationId: "op-2", outcome: "uncertain" };
+const threeActions = [
+  { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
+  { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }];
 
 test("an interrupted apply keeps confirmed chunks and the uncertain attempt on its receipt", (t) => {
   const f = fixture(t, { count: 201 });
@@ -60,9 +98,9 @@ test("an interrupted apply keeps confirmed chunks and the uncertain attempt on i
   assert.deepEqual(run.attempts, [{ account: "a", from: "INBOX", to: "Auto/Notifications", uids: ["201"],
     operationId: "op-2", outcome: "uncertain", code: "EMAIL_NETWORK_FAILED", pass: "no-reply", ruleId: null }]);
   assert.deepEqual(f.read("snapshot-a.json").envelopes, [], "an uncertain move waits for a fresh snapshot readback");
-  const moves = f.commands().filter((args) => option(args, "operation") === "move");
-  assert.equal(moves.length, 2, "an uncertain move is never replayed automatically");
-  assert.ok(moves.every((args) => option(args, "plugin") === "fixture-plugin" && option(args, "binding") === "binding-a"));
+  assert.equal(f.moves().length, 2, "an uncertain move is never replayed automatically");
+  assert.ok(f.moves().every((args) => option(args, "plugin") === "fixture-plugin" && option(args, "binding") === "binding-a"));
+  assert.ok(f.journal("r1"), "apply creates the run's shared undo journal before its first move");
 
   assert.equal(f.run("submit", "--run-id", "r1", "--outcome", "failed").status, 0);
   const receipt = f.read("outbox/r1.json");
@@ -70,49 +108,100 @@ test("an interrupted apply keeps confirmed chunks and the uncertain attempt on i
   assert.equal(receipt.attempts[0].operationId, "op-2");
 });
 
-const threeActions = { runId: "r2", actions: [
-  { kind: "move", account: "a", uid: "1", from: "INBOX", to: "Archive" }, { kind: "move", account: "a", uid: "2", from: "INBOX", to: "Archive" },
-  { kind: "move", account: "a", uid: "3", from: "INBOX", to: "Auto/News" }] };
-
-test("an uncertain undo stays unresolved and a later CLI undo makes no mutation", (t) => {
+test("an uncertain CLI undo stays unresolved and a later CLI undo makes no mutation", (t) => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
+  f.seedRun("r2", threeActions);
   f.queueMoves(["confirmed", uncertain]);
   const first = f.run("undo", "--run-id", "r2");
   assert.equal(first.status, 0, first.stderr);
   assert.deepEqual(JSON.parse(first.stdout).skipped, [{ account: "a", from: "Auto/News", to: "INBOX", count: 1,
     code: "EMAIL_NETWORK_FAILED", attempt: { operationId: "op-2", outcome: "uncertain" } }]);
-  const run = f.read("runs/r2.json");
-  assert.equal(run.undoneAt, undefined);
-  assert.deepEqual(run.undo.unresolved.map(({ at, ...entry }) => entry),
-    [{ account: "a", from: "Auto/News", to: "INBOX", uids: ["3"], operationId: "op-2" }]);
-
+  assert.equal(f.read("runs/r2.json").undoneAt, undefined);
+  assert.deepEqual(f.journal("r2").unresolved.map(({ uids, operationId }) => ({ uids, operationId })), [{ uids: ["3"], operationId: "op-2" }]);
   const second = f.run("undo", "--run-id", "r2");
   assert.notEqual(second.status, 0);
   assert.match(second.stderr, /MAILKEEPER_UNDO_UNRESOLVED/);
-  assert.equal(f.commands().filter((args) => option(args, "operation") === "move").length, 2, "no further mutation");
+  assert.equal(f.moves().length, 2, "no further mutation");
 });
 
-test("a not_started undo chunk is retried and confirmed reversals are not", (t) => {
+test("a not_started CLI undo chunk is retried and confirmed reversals are not", (t) => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
+  f.seedRun("r2", threeActions);
   f.queueMoves(["confirmed", { ok: false, code: "EMAIL_OPERATION_CANCELLED", operationId: "op-2", outcome: "not_started" }]);
   assert.equal(f.run("undo", "--run-id", "r2").status, 0);
-  assert.deepEqual(f.read("runs/r2.json").undo.unresolved, []);
+  assert.deepEqual(f.journal("r2").unresolved, []);
   const second = f.run("undo", "--run-id", "r2");
   assert.equal(JSON.parse(second.stdout).reversed, 1);
-  const moves = f.commands().filter((args) => option(args, "operation") === "move");
-  assert.deepEqual([option(moves[2], "from"), option(moves[2], "uids")], ["Auto/News", "3"]);
+  assert.deepEqual([option(f.moves()[2], "from"), option(f.moves()[2], "uids")], ["Auto/News", "3"]);
   assert.ok(f.read("runs/r2.json").undoneAt);
 });
 
-test("a second CLI undo of the same run is refused while one is running", (t) => {
+test("a CLI killed after dispatching a move leaves it pending, and neither surface replays it", async (t) => {
   const f = fixture(t);
-  fs.writeFileSync(path.join(f.state, "runs/r2.json"), JSON.stringify(threeActions));
-  fs.writeFileSync(path.join(f.state, "runs/r2.undo.lock"), String(process.pid)); // live holder
+  f.seedRun("r2", threeActions);
+  f.queueMoves(["crash"]);
+  const crashed = f.run("undo", "--run-id", "r2");
+  assert.equal(crashed.signal, "SIGKILL");
+  assert.equal(f.journal("r2").pending.length, 1, "the dispatched chunk was recorded before launch");
+  const retry = f.run("undo", "--run-id", "r2");
+  assert.match(retry.stderr, /MAILKEEPER_UNDO_UNRESOLVED/, "a dead lock holder is no evidence the move did not happen");
+  await assert.rejects(f.desktopUndo("r2"), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
+  assert.equal(f.moves().length, 1); assert.equal(f.desktopRequests.length, 0);
+});
+
+test("an uncertain undo on either surface blocks the other", async (t) => {
+  const cliFirst = fixture(t);
+  cliFirst.seedRun("r2", threeActions);
+  cliFirst.queueMoves(["confirmed", uncertain]);
+  cliFirst.run("undo", "--run-id", "r2");
+  await assert.rejects(cliFirst.desktopUndo("r2"), { code: "MAILKEEPER_UNDO_UNRESOLVED" });
+  assert.equal(cliFirst.desktopRequests.length, 0);
+
+  const desktopFirst = fixture(t);
+  desktopFirst.seedRun("r2", threeActions);
+  desktopFirst.desktopReplies(["confirmed", uncertain]);
+  await desktopFirst.desktopUndo("r2");
+  const cli = desktopFirst.run("undo", "--run-id", "r2");
+  assert.match(cli.stderr, /MAILKEEPER_UNDO_UNRESOLVED/);
+  assert.equal(desktopFirst.moves().length, 0);
+});
+
+test("a confirmed undo on either surface is never redispatched by the other", async (t) => {
+  const cliFirst = fixture(t);
+  cliFirst.seedRun("r2", threeActions);
+  assert.equal(JSON.parse(cliFirst.run("undo", "--run-id", "r2").stdout).reversed, 3);
+  assert.equal((await cliFirst.desktopUndo("r2")).reused, true);
+  assert.equal(cliFirst.desktopRequests.length, 0);
+
+  const desktopFirst = fixture(t);
+  desktopFirst.seedRun("r2", threeActions);
+  assert.equal((await desktopFirst.desktopUndo("r2")).reversed, 3);
+  // The CLI's own run file still lacks undoneAt: it must reread the journal
+  // under the lock rather than trust its earlier copy.
+  assert.equal(desktopFirst.read("runs/r2.json").undoneAt, undefined);
+  const cli = desktopFirst.run("undo", "--run-id", "r2");
+  assert.equal(cli.status, 0, cli.stderr);
+  assert.equal(JSON.parse(cli.stdout).reused, true);
+  assert.equal(desktopFirst.moves().length, 0);
+});
+
+test("a second undo of the same run is refused while one is running, from either surface", async (t) => {
+  const f = fixture(t);
+  f.seedRun("r2", threeActions);
+  fs.writeFileSync(path.join(f.state, "undo", "r2.lock"), String(process.pid)); // live holder
   const result = f.run("undo", "--run-id", "r2");
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /MAILKEEPER_UNDO_BUSY/);
+  await assert.rejects(f.desktopUndo("r2"), { code: "MAILKEEPER_UNDO_BUSY" });
+  assert.deepEqual(f.commands(), []); assert.equal(f.desktopRequests.length, 0);
+});
+
+test("the CLI refuses a run that predates the journal and points to the app", (t) => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.state, "runs", "old.json"), JSON.stringify({ runId: "old", actions: threeActions }));
+  const result = f.run("undo", "--run-id", "old");
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /MAILKEEPER_UNDO_LEGACY/);
   assert.deepEqual(f.commands(), []);
 });
 

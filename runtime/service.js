@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const { hostFor } = require("./host");
 const { resolveProfileConfig } = require("./config");
 const mailbox = require("./mailbox");
+const undoJournal = require("../skills/mailbox-cleanup/scripts/undo-journal");
 
 const PLUGIN_ID = "com.realtimex.mailkeeper";
 const TEMPLATE_DIR = path.join(__dirname, "..", "templates");
@@ -39,7 +40,6 @@ class MailKeeperService {
     this.store = api.getStore();
     this.setupJobs = new Map();
     this.locks = new Map();
-    this.undoing = new Set();
   }
 
   // -------------------------------------------------------------------------
@@ -524,83 +524,44 @@ class MailKeeperService {
     if (!user?.id)
       throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const runId = text(body.runId, 80);
-    // One undo per run at a time: overlapping requests could admit the same
-    // actions twice.
-    const guard = `${workspace.id}:${runId}`;
-    if (this.undoing.has(guard)) throw codedError("An undo for this run is already in progress", "MAILKEEPER_UNDO_BUSY", 409);
-    this.undoing.add(guard);
-    try {
-      return await this.reverseRun(workspace, runId, body, user);
-    } finally {
-      this.undoing.delete(guard);
-    }
-  }
-
-  async reverseRun(workspace, runId, body, user) {
     const receipt = await this.store.get(this.runKey(workspace, runId));
     if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILKEEPER_RUN_UNKNOWN", 404);
     if (receipt.undoneAt)
       return { runId, reused: true, undoneAt: receipt.undoneAt };
-    // An uncertain reversal may already have happened. Until an authenticated
-    // reconciliation of that attempt exists, nothing in the run moves again.
-    if (receipt.undo?.unresolved?.length) {
-      throw codedError("Review the interrupted undo before trying again", "MAILKEEPER_UNDO_UNRESOLVED", 409);
-    }
     const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
     if (!target?.configPath || !this.host.email.supported) throw codedError("Upgrade RealTimeX to undo against the shared email target", "HOST_UNSUPPORTED", 409);
     if (receipt.scope?.configPath && receipt.scope.configPath !== target.configPath) {
       throw codedError("Restore the run's email configuration before undoing it", "MAILKEEPER_TARGET_CHANGED", 409);
     }
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
-    // Moves an earlier interrupted undo already confirmed are never sent again.
-    const actionKey = (account, uid, from, to) => JSON.stringify([account, String(uid), from, to]);
-    const confirmed = new Set(receipt.undo?.reversed || []);
     // Account selection may have changed since the run. Reverse the accounts
     // actually recorded, and only infer an untagged legacy action when unique.
     const scopeAccounts = receipt.scope?.accounts || [];
-    const actionsByAccount = new Map();
-    for (const action of receipt.actions) {
-      if (action.kind !== "move" || action.dryRun) continue;
+    const actions = receipt.actions.filter((action) => action.kind === "move" && !action.dryRun).map((action) => {
       const account = action.account || (scopeAccounts.length === 1 && scopeAccounts[0]);
       if (!account) throw codedError("The receipt does not identify this action's account", "MAILKEEPER_UNDO_SCOPE_UNKNOWN", 409);
-      if (confirmed.has(actionKey(account, action.uid, action.from, action.to))) continue;
-      if (!actionsByAccount.has(account)) actionsByAccount.set(account, []);
-      actionsByAccount.get(account).push(action);
-    }
-    const result = { reversed: 0, skipped: [], dryRun: body.dryRun === true };
-    const reversedKeys = [];
-    for (const [account, actions] of actionsByAccount) {
-      const partial = await mailbox.undoActions(account, actions, {
-        dryRun: result.dryRun,
-        email: this.host.email,
-        bindingId: profile.emailBindings?.[account],
-      });
-      result.reversed += partial.reversed;
-      result.skipped.push(...partial.skipped.map((entry) => ({ account, ...entry })));
-      // A reversal moves `to` back to `from`; key it by the original action.
-      reversedKeys.push(...partial.reversedActions.map((done) => actionKey(account, done.uid, done.to, done.from)));
-    }
-    if (!body.dryRun) {
-      // Record every attempt with its operation identity and outcome. Proven
-      // not_started work stays retryable; uncertain work becomes unresolved,
-      // kept apart from the trimmed history so it stays blocked.
-      const at = new Date().toISOString();
-      const unresolved = result.skipped.filter((entry) => entry.attempt?.outcome === "uncertain")
-        .map(({ account, attempt }) => ({ account, ...attempt, at }));
-      receipt.undo = {
-        reversed: [...confirmed, ...reversedKeys],
-        unresolved: [...(receipt.undo?.unresolved || []), ...unresolved],
-        attempts: [...(receipt.undo?.attempts || []), {
-          at, by: user.id, reversed: result.reversed, skipped: result.skipped,
-        }].slice(-20),
-      };
-      if (!result.skipped.length) {
-        receipt.undoneAt = new Date().toISOString();
-        receipt.undoneBy = user.id;
-      }
+      return { account, uid: action.uid, from: action.from, to: action.to };
+    });
+    // The shared journal is the one undo authority for this run, also used by
+    // the workspace CLI. This surface can see both earlier records, so it
+    // adopts a run that predates the journal, keeping any recorded completion.
+    const stateDir = path.join(workspace.workingDirectory, ".mailkeeper");
+    let cliRun = null;
+    try { cliRun = JSON.parse(fs.readFileSync(path.join(stateDir, "runs", `${runId}.json`), "utf8")); } catch { /* No CLI record. */ }
+    const result = await undoJournal.reverse({
+      stateDir, runId, actions, dryRun: body.dryRun === true, by: user.id,
+      legacy: { allow: true, undoneAt: cliRun?.undoneAt || null },
+      dispatch: ({ account, from, to, uids }) => mailbox.move(account, uids, {
+        from, to, email: this.host.email, bindingId: profile.emailBindings?.[account],
+      }),
+    });
+    if (result.undoneAt && !receipt.undoneAt) {
+      receipt.undoneAt = result.undoneAt;
+      receipt.undoneBy = user.id;
       await this.store.set(this.runKey(workspace, runId), receipt);
     }
-    return { runId, reused: false, ...result };
+    return { runId, reused: result.reused, reversed: result.reversed, skipped: result.skipped, dryRun: result.dryRun,
+      ...(result.undoneAt ? { undoneAt: result.undoneAt } : {}) };
   }
 
   // -------------------------------------------------------------------------

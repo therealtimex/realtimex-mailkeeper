@@ -28,11 +28,11 @@ test("an interrupted chunked move reports confirmed chunks and the failed attemp
     return requests.length === 1 ? { ok: true, data: null, operationId: "op-1", outcome: "confirmed" }
       : { ok: false, code: "EMAIL_OPERATION_CANCELLED", operationId: "op-2", outcome: "not_started" };
   });
-  const result = await mailbox.undoActions("fixture", uids.map((uid) => ({ kind: "move", uid, from: "INBOX", to: "Archive" })), { email });
-  assert.equal(result.reversed, 200);
-  assert.deepEqual(result.skipped, [{ from: "Archive", to: "INBOX", uids: ["201"], code: "CONNECTION_FAILED",
-    error: "Check the connection and provider settings, then retry.",
-    attempt: { from: "Archive", to: "INBOX", uids: ["201"], operationId: "op-2", outcome: "not_started" } }]);
+  await assert.rejects(mailbox.move("fixture", uids, { from: "Archive", to: "INBOX", email }), (error) => {
+    assert.equal(error.completed.length, 200);
+    assert.deepEqual(error.attempt, { from: "Archive", to: "INBOX", uids: ["201"], operationId: "op-2", outcome: "not_started" });
+    return true;
+  });
 });
 
 test("a thrown host failure leaves a move's outcome uncertain", async () => {

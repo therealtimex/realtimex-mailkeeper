@@ -32,6 +32,7 @@
 const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const undoJournal = require("./undo-journal");
 
 const ROOT = process.cwd();
 const STATE = path.join(ROOT, ".mailkeeper");
@@ -186,9 +187,11 @@ function himalaya(account, request) {
   if (result?.ok === true && (!mutation || result.outcome === "confirmed")) return result.data;
   // A refusal before admission started nothing; without a readable reply an
   // admitted or unknown mutation's outcome is uncertain.
-  const outcome = result?.ok !== false ? "uncertain"
-    : ["not_started", "uncertain"].includes(result.outcome) ? result.outcome
-      : result.operationId ? "uncertain" : "not_started";
+  const refused = result?.ok === false && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code || "") &&
+    result.operationId === undefined && result.outcome === undefined;
+  const outcome = refused ? "not_started"
+    : result?.ok === false && ["not_started", "uncertain"].includes(result.outcome) && typeof result.operationId === "string" ? result.outcome
+      : "uncertain";
   throw emailError(result?.ok === false ? result.code : "RTXEXEC_UNSUPPORTED",
     mutation ? { operationId: typeof result?.operationId === "string" ? result.operationId : null, outcome } : {});
 }
@@ -522,6 +525,8 @@ const commands = {
       for (const step of plan) {
         const list = candidates(step.pass, ctx, snapshot, urgent);
         const to = targetFolder(step.pass, ctx, mode);
+        // Moves are undone through the run's shared journal; create it first.
+        if (!dryRun && list.length) undoJournal.ensure(STATE, runId);
         if (!dryRun && list.length) ensureFolder(account, to);
         let actions;
         try {
@@ -601,90 +606,31 @@ const commands = {
     console.log(JSON.stringify({ ok: true, runId, actions: receipt.actions.length, proposals: receipt.proposals.length, urgent: receipt.urgent.length, queued: `.mailkeeper/outbox/${runId}.json` }));
   },
 
-  undo(args) {
+  async undo(args) {
     const runId = args["run-id"] || fail("--run-id required");
     const dryRun = args["dry-run"] === true;
     const only = args.account || null;
     const run = loadRun(runId);
     if (run.undoneAt) fail(`run ${runId} already undone at ${run.undoneAt}`);
-    // An uncertain reversal may already have happened. Until an authenticated
-    // reconciliation of that attempt exists, nothing in the run moves again.
-    if (run.undo?.unresolved?.length) fail("an earlier undo is unresolved (MAILKEEPER_UNDO_UNRESOLVED); review it before trying again");
-    const release = lockRun(runId);
+    const actions = run.actions.filter((a) => a.kind === "move" && !a.dryRun).map((a) => ({
+      account: a.account || only || fail("receipt action has no account; pass --account"), uid: a.uid, from: a.from, to: a.to,
+    }));
+    let result;
     try {
-      undoRun(run, runId, dryRun, only);
-    } finally {
-      release();
+      // The shared journal is the one undo authority for this run, also used by
+      // the desktop. Its state is read under its lock, never from `run` above.
+      result = await undoJournal.reverse({
+        stateDir: STATE, runId, actions, dryRun, select: (a) => !only || a.account === only,
+        dispatch: ({ account, from, to, uids }) => move(account, uids, from, to, false),
+      });
+    } catch (error) {
+      if (/^MAILKEEPER_(UNDO|RUN)_/.test(error.code || "")) fail(`${error.message} (${error.code})`);
+      throw error;
     }
+    if (result.undoneAt && !dryRun) writeJson(runFile(runId), { ...loadRun(runId), undoneAt: result.undoneAt });
+    console.log(JSON.stringify({ ok: true, runId, dryRun, reused: result.reused, reversed: result.reversed, skipped: result.skipped }, null, 2));
   },
 };
-
-// One undo per run at a time; a stale lock from a dead process is replaced.
-function lockRun(runId) {
-  const file = path.join(STATE, "runs", `${runId}.undo.lock`);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      fs.writeFileSync(file, String(process.pid), { flag: "wx", mode: 0o600 });
-      return () => fs.rmSync(file, { force: true });
-    } catch (error) {
-      if (error.code !== "EEXIST") throw error;
-      const holder = Number(fs.readFileSync(file, "utf8"));
-      let alive = Number.isInteger(holder) && holder > 0;
-      if (alive) { try { process.kill(holder, 0); } catch (probe) { alive = probe.code !== "ESRCH"; } }
-      if (alive) fail("an undo for this run is already in progress (MAILKEEPER_UNDO_BUSY)");
-      fs.rmSync(file, { force: true });
-    }
-  }
-  fail("could not lock the run for undo (MAILKEEPER_UNDO_BUSY)");
-}
-
-function undoRun(run, runId, dryRun, only) {
-  {
-    // Reversals an earlier interrupted undo already confirmed are never sent again.
-    const actionKey = (acct, uid, from, to) => JSON.stringify([acct, String(uid), from, to]);
-    const confirmed = new Set(run.undo?.reversed || []);
-    const groups = new Map();
-    for (const a of run.actions) {
-      if (a.kind !== "move" || a.dryRun) continue;
-      const acct = a.account || only || fail("receipt action has no account; pass --account");
-      if (only && acct !== only) continue;
-      if (confirmed.has(actionKey(acct, a.uid, a.from, a.to))) continue;
-      const key = `${acct}|${a.to}→${a.from}`;
-      if (!groups.has(key)) groups.set(key, { account: acct, from: a.to, to: a.from, uids: [] });
-      groups.get(key).uids.push(a.uid);
-    }
-    let reversed = 0;
-    const reversedKeys = [];
-    const skipped = [];
-    for (const g of groups.values()) {
-      let done;
-      try {
-        done = move(g.account, g.uids, g.from, g.to, dryRun);
-      } catch (error) {
-        done = error.completed || [];
-        skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length - done.length, code: error.code,
-          ...(error.attempt ? { attempt: { operationId: error.attempt.operationId, outcome: error.attempt.outcome }, attemptUids: error.attempt.uids } : {}) });
-      }
-      reversed += done.length;
-      // A reversal moves `to` back to `from`; key it by the original action.
-      reversedKeys.push(...done.map((d) => actionKey(g.account, d.uid, d.to, d.from)));
-    }
-    if (!dryRun) {
-      const now = new Date().toISOString();
-      // Proven not_started work stays retryable; uncertain work becomes
-      // unresolved, kept apart from the trimmed history so it stays blocked.
-      const unresolved = skipped.filter((entry) => entry.attempt?.outcome === "uncertain")
-        .map((entry) => ({ account: entry.account, from: entry.from, to: entry.to, uids: entry.attemptUids,
-          operationId: entry.attempt.operationId, at: now }));
-      writeJson(runFile(runId), { ...run,
-        undo: { reversed: [...confirmed, ...reversedKeys], unresolved: [...(run.undo?.unresolved || []), ...unresolved],
-          attempts: [...(run.undo?.attempts || []), { at: now, reversed, skipped: skipped.map(({ attemptUids, ...entry }) => entry) }].slice(-20) },
-        ...(skipped.length ? {} : { undoneAt: now }) });
-    }
-    console.log(JSON.stringify({ ok: true, runId, dryRun, reversed, skipped: skipped.map(({ attemptUids, ...entry }) => entry) }, null, 2));
-  }
-}
 
 // ---------------------------------------------------------------------------
 
@@ -694,9 +640,7 @@ if (!command || !commands[command]) {
   console.error(`usage: mailbox-ops.js <${Object.keys(commands).join("|")}> [options]`);
   process.exit(2);
 }
-try {
-  commands[command](args);
-} catch (error) {
+Promise.resolve().then(() => commands[command](args)).catch((error) => {
   const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || "") ? ` (${error.code})` : "";
   fail(`Mailbox operation failed${code}. Check the account connection and try again.`);
-}
+});
