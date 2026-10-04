@@ -83,7 +83,6 @@ class MailKeeperService {
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
     const target = await this.api.email?.getHimalayaTarget({ workspaceId: workspace.id });
     if (!target) throw codedError("Upgrade RealTimeX to use guided setup", "HOST_UNSUPPORTED", 409);
-    config.himalayaConfigPath = target.configPath;
     const revision = this.setupRevision(config, target);
     const current = async () => {
       const latest = await this.store.get(this.profileKey(workspace));
@@ -155,7 +154,7 @@ class MailKeeperService {
     this.seedContract(workspace, config);
 
     const rules = await this.ensureRules(workspace, config);
-    this.syncRulesFile(workspace, config, rules, readiness);
+    this.syncRulesFile(workspace, config, rules, readiness, profile.emailBindings);
     await current();
 
     // Commit scheduler reconciliation and the ready profile under the same
@@ -281,7 +280,7 @@ class MailKeeperService {
    * workspace-side `mailbox-ops.js`: effective config + promoted rules.
    * Rewritten on every provision; the script never edits it.
    */
-  syncRulesFile(workspace, config, rules, readiness = {}) {
+  syncRulesFile(workspace, config, rules, readiness = {}, emailBindings = {}) {
     const accounts = {};
     for (const account of config.emailAccounts) {
       const folders = readiness[account]?.folders || [];
@@ -304,7 +303,10 @@ class MailKeeperService {
           revision: rules.revision,
           writtenAt: new Date().toISOString(),
           config: {
-            himalayaConfigPath: config.himalayaConfigPath || null,
+            // The CLI names this plugin and each account's non-secret Secrets
+            // binding; the host chooses the target and resolves credentials.
+            pluginId: this.api.pluginId,
+            emailBindings: emailBindings || {},
             emailAccounts: config.emailAccounts,
             accounts,
             mode: config.mode,
@@ -474,6 +476,8 @@ class MailKeeperService {
       failureCode: ["AGENT_UNAVAILABLE", "AGENT_SIGN_IN_REQUIRED", "AGENT_ACCESS_DENIED", "THREAD_UNAVAILABLE", "AGENT_LAUNCH_UNKNOWN"].includes(body.failureCode) ? body.failureCode : isPreview && outcome === "blocked" ? "AGENT_LAUNCH_UNKNOWN" : null,
       // Every mutation, by UID, so /undo can reverse it exactly.
       actions: Array.isArray(body.actions) ? body.actions.slice(0, 5000) : [],
+      // Interrupted moves with their operation identity and outcome.
+      attempts: Array.isArray(body.attempts) ? body.attempts.slice(0, 200) : [],
       // Things the agent found but was not allowed to act on.
       proposals: Array.isArray(body.proposals) ? body.proposals.slice(0, 200) : [],
       // Urgency triage hits: never touched, always surfaced.

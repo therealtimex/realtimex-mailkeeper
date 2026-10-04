@@ -96,7 +96,7 @@ The account picker depends on `optionsRoutePath` support in the host config moda
 
 ## Requirements for the maintenance agent
 
-The heartbeat agent runs `himalaya` from inside its own terminal session, so that session needs outbound network access to your IMAP hosts and access to the credential source the Himalaya config points at (macOS Keychain, a command, or a file).
+The heartbeat agent reaches the mailbox through `rtxexec himalaya` (rtxexec 0.4.0 or later) from inside its own RealTimeX terminal session. The host verifies that session, selects the shared Himalaya config and resolves any Secrets-managed credential for each operation, so the agent never handles a password or config path. The session still needs outbound network access to your IMAP hosts, because Himalaya connects from that terminal.
 
 - **Codex CLI** — RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, and that sandbox denies outbound network by default. Add to `~/.codex/config.toml`:
 

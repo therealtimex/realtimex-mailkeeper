@@ -44,6 +44,15 @@ test("new setup verifies resources and creates a disabled task", async (t) => {
   assert.equal(status.preview, null);
   assert.ok(!status.checklist.some((step) => ["preview", "schedule"].includes(step.id)));
 });
+test("rules.json gives the CLI this plugin's id and the stored bindings, never a config path", async (t) => {
+  const f = fixture(t);
+  await f.api.getStore().set("ws-1-profile", { emailBindings: { fixture: "binding-1" } });
+  await f.ready();
+  const { config } = JSON.parse(fs.readFileSync(path.join(f.workspace.workingDirectory, ".mailkeeper", "rules.json"), "utf8"));
+  assert.equal(config.pluginId, "test-install-id");
+  assert.deepEqual(config.emailBindings, { fixture: "binding-1" });
+  assert.equal("himalayaConfigPath" in config, false);
+});
 test("status is cached and does not probe a mailbox", async (t) => {
   const f = fixture(t); mailbox.checkAccount = async () => { throw Error("must not probe"); };
   assert.equal((await f.service.setupStatus(f.workspace)).state, "needs_setup");

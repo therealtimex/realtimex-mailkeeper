@@ -22,6 +22,11 @@
  * State: <workspace>/.mailkeeper/{rules.json, snapshot-<account>.json, runs/, outbox/}
  * rules.json is written by the plugin on every provision and carries the
  * effective config plus the promoted rule set. Never edit it by hand.
+ *
+ * Mailbox access goes through `rtxexec himalaya`, the host's authenticated
+ * email runner, using this terminal's verified RealTimeX session. The host
+ * chooses the Himalaya binary and config and resolves any Secrets-managed
+ * credential; this CLI never sees a path or password.
  */
 
 const fs = require("fs");
@@ -31,9 +36,9 @@ const { execFileSync } = require("child_process");
 const ROOT = process.cwd();
 const STATE = path.join(ROOT, ".mailkeeper");
 // realtimex-plugin-validator: allow-process-env -- this CLI runs in the agent's
-// terminal, not the plugin host; the Himalaya binary and TOML path are runtime
-// discovery injected by the environment, never plugin configuration.
-const HIMALAYA = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
+// terminal, not the plugin host; which rtxexec to launch is runtime discovery
+// injected by the environment, never plugin configuration.
+const RTXEXEC = process.env.MAILKEEPER_RTXEXEC_BIN || "rtxexec";
 let previewRules = null;
 const BATCH = 200;
 
@@ -151,16 +156,41 @@ function writeJson(file, value) {
   fs.renameSync(temporary, file);
 }
 
-function himalaya(account, args, { json = true } = {}) {
-  // `-a` / `-c` / `-o` are per-subcommand options in Himalaya, so they go last.
-  const configPath = loadRules().config.himalayaConfigPath || process.env.HIMALAYA_CONFIG;
-  const tail = ["-a", account, ...(json ? ["-o", "json"] : []), ...(configPath ? ["-c", configPath] : [])];
-  const out = execFileSync(HIMALAYA, [...args, ...tail], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  return json && out.trim() ? JSON.parse(out) : out;
+function emailError(code, extra = {}) {
+  // Only allowlist-shaped codes leave this process; never raw stderr.
+  const safe = /^[A-Z][A-Z0-9_]{0,63}$/.test(code || "") ? code : "EMAIL_CONTEXT_UNAVAILABLE";
+  return Object.assign(new Error(safe), { code: safe, ...extra });
+}
+
+// One bounded operation: folders | envelopes | move | add-folder.
+function himalaya(account, request) {
+  const config = loadRules().config;
+  if (!config.pluginId) fail("rules.json predates authenticated email access. Open MailKeeper setup and check again.");
+  const options = {
+    plugin: config.pluginId, account, binding: config.emailBindings?.[account], operation: request.operation,
+    folder: request.folder, from: request.from, to: request.to, uids: request.uids?.join(","),
+    page: request.page, "page-size": request.pageSize, query: request.query || undefined,
+  };
+  const argv = ["himalaya"];
+  for (const [key, value] of Object.entries(options)) if (value !== undefined) argv.push(`--${key}`, String(value));
+  const mutation = ["move", "add-folder"].includes(request.operation);
+  let output;
+  try {
+    output = execFileSync(RTXEXEC, argv, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    if (error.code === "ENOENT") throw emailError("RTXEXEC_UNAVAILABLE");
+    output = error.stdout; // A failed operation is still reported as one JSON line.
+  }
+  let result = null;
+  try { result = JSON.parse(String(output || "").trim().split("\n").pop()); } catch { /* handled below */ }
+  if (result?.ok === true && (!mutation || result.outcome === "confirmed")) return result.data;
+  // A refusal before admission started nothing; without a readable reply an
+  // admitted or unknown mutation's outcome is uncertain.
+  const outcome = result?.ok !== false ? "uncertain"
+    : ["not_started", "uncertain"].includes(result.outcome) ? result.outcome
+      : result.operationId ? "uncertain" : "not_started";
+  throw emailError(result?.ok === false ? result.code : "RTXEXEC_UNSUPPORTED",
+    mutation ? { operationId: typeof result?.operationId === "string" ? result.operationId : null, outcome } : {});
 }
 
 function normalize(row, folder, now) {
@@ -185,9 +215,10 @@ function listAll(account, folder, query, { maxPages = 2000 } = {}) {
   for (let page = 1; page <= maxPages; page += 1) {
     let rows;
     try {
-      rows = himalaya(account, ["envelope", "list", "-f", folder, "-p", String(page), "-s", String(BATCH), ...(query ? [query] : [])]);
+      rows = himalaya(account, { operation: "envelopes", folder, page, pageSize: BATCH, query });
     } catch (error) {
-      if (/out of bound/i.test(String(error.stderr || error.message))) break;
+      // Himalaya errors on an out-of-range page instead of returning [].
+      if (error.code === "EMAIL_PAGE_OUT_OF_RANGE") break;
       throw error;
     }
     if (!Array.isArray(rows) || !rows.length) break;
@@ -274,16 +305,25 @@ function targetFolder(passName, ctx, mode) {
 }
 
 function ensureFolder(account, name) {
-  const folders = himalaya(account, ["folder", "list"]);
+  const folders = himalaya(account, { operation: "folders" });
   if (Array.isArray(folders) && folders.some((f) => f.name === name)) return;
-  himalaya(account, ["folder", "add", name], { json: false });
+  himalaya(account, { operation: "add-folder", folder: name });
 }
 
 function move(account, uids, from, to, dryRun) {
   const actions = [];
   for (let i = 0; i < uids.length; i += BATCH) {
     const chunk = uids.slice(i, i + BATCH);
-    if (!dryRun) himalaya(account, ["message", "move", "-f", from, to, ...chunk], { json: false });
+    if (!dryRun) {
+      try {
+        himalaya(account, { operation: "move", from, to, uids: chunk });
+      } catch (error) {
+        // Keep confirmed chunks and the failed attempt so a receipt never
+        // drops moved mail or invites a blind replay.
+        throw Object.assign(error, { completed: actions, attempt: { account, from, to, uids: chunk,
+          operationId: error.operationId ?? null, outcome: error.outcome || "not_started", code: error.code } });
+      }
+    }
     for (const uid of chunk) actions.push({ kind: "move", account, uid, from, to, dryRun });
   }
   return actions;
@@ -466,21 +506,38 @@ const commands = {
     }
 
     const results = [];
-    for (const step of plan) {
-      const list = candidates(step.pass, ctx, snapshot, urgent);
-      const to = targetFolder(step.pass, ctx, mode);
-      if (!dryRun && list.length) ensureFolder(account, to);
-      const actions = move(account, list.map((e) => e.uid), snapshot.folder, to, dryRun).map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId }));
-      run.actions.push(...actions);
-      run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
-      results.push({ account, pass: step.pass, to, dryRun, ...summarize(list) });
+    // Persist on success and on failure: moved mail must always be on the
+    // receipt so it stays undoable.
+    const persist = () => {
+      if (!dryRun) {
+        const moved = new Set(run.actions.filter((a) => !a.dryRun).map((a) => a.uid));
+        snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
+        writeJson(snapshotFile(account), snapshot);
+      }
+      writeJson(runFile(runId), run);
+    };
+    try {
+      for (const step of plan) {
+        const list = candidates(step.pass, ctx, snapshot, urgent);
+        const to = targetFolder(step.pass, ctx, mode);
+        if (!dryRun && list.length) ensureFolder(account, to);
+        let actions;
+        try {
+          actions = move(account, list.map((e) => e.uid), snapshot.folder, to, dryRun);
+        } catch (error) {
+          run.actions.push(...(error.completed || []).map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId })));
+          if (error.attempt) run.attempts = [...(run.attempts || []), { ...error.attempt, pass: step.pass, ruleId: step.ruleId }];
+          throw error;
+        }
+        run.actions.push(...actions.map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId })));
+        run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
+        results.push({ account, pass: step.pass, to, dryRun, ...summarize(list) });
+      }
+    } catch (error) {
+      persist();
+      throw error;
     }
-    if (!dryRun) {
-      const moved = new Set(run.actions.filter((a) => !a.dryRun).map((a) => a.uid));
-      snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
-      writeJson(snapshotFile(account), snapshot);
-    }
-    writeJson(runFile(runId), run);
+    persist();
     console.log(JSON.stringify({ ok: true, runId, account, mode, dryRun, results }, null, 2));
   },
 
@@ -530,6 +587,8 @@ const commands = {
       startedAt: run.startedAt,
       finishedAt: new Date().toISOString(),
       actions: run.actions.filter((a) => !a.dryRun),
+      // Interrupted moves: operation identity and outcome, never replayed.
+      attempts: run.attempts || [],
       proposals: run.proposals || [],
       urgent: run.urgent || [],
       passes: run.passes || [],
@@ -546,25 +605,41 @@ const commands = {
     const only = args.account || null;
     const run = loadRun(runId);
     if (run.undoneAt) fail(`run ${runId} already undone at ${run.undoneAt}`);
+    // Reversals an earlier interrupted undo already confirmed are never sent again.
+    const actionKey = (acct, uid, from, to) => JSON.stringify([acct, String(uid), from, to]);
+    const confirmed = new Set(run.undo?.reversed || []);
     const groups = new Map();
     for (const a of run.actions) {
       if (a.kind !== "move" || a.dryRun) continue;
       const acct = a.account || only || fail("receipt action has no account; pass --account");
       if (only && acct !== only) continue;
+      if (confirmed.has(actionKey(acct, a.uid, a.from, a.to))) continue;
       const key = `${acct}|${a.to}→${a.from}`;
       if (!groups.has(key)) groups.set(key, { account: acct, from: a.to, to: a.from, uids: [] });
       groups.get(key).uids.push(a.uid);
     }
     let reversed = 0;
+    const reversedKeys = [];
     const skipped = [];
     for (const g of groups.values()) {
+      let done;
       try {
-        reversed += move(g.account, g.uids, g.from, g.to, dryRun).length;
+        done = move(g.account, g.uids, g.from, g.to, dryRun);
       } catch (error) {
-        skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length, error: String(error.message).split("\n")[0] });
+        done = error.completed || [];
+        skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length - done.length, code: error.code,
+          ...(error.attempt ? { attempt: { operationId: error.attempt.operationId, outcome: error.attempt.outcome } } : {}) });
       }
+      reversed += done.length;
+      // A reversal moves `to` back to `from`; key it by the original action.
+      reversedKeys.push(...done.map((d) => actionKey(g.account, d.uid, d.to, d.from)));
     }
-    if (!dryRun) writeJson(runFile(runId), { ...run, undoneAt: new Date().toISOString() });
+    if (!dryRun) {
+      const now = new Date().toISOString();
+      writeJson(runFile(runId), { ...run,
+        undo: { reversed: [...confirmed, ...reversedKeys], attempts: [...(run.undo?.attempts || []), { at: now, reversed, skipped }].slice(-20) },
+        ...(skipped.length ? {} : { undoneAt: now }) });
+    }
     console.log(JSON.stringify({ ok: true, runId, dryRun, reversed, skipped }, null, 2));
   },
 };
@@ -580,5 +655,6 @@ if (!command || !commands[command]) {
 try {
   commands[command](args);
 } catch (error) {
-  fail("Mailbox operation failed. Check the account connection and try again.");
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || "") ? ` (${error.code})` : "";
+  fail(`Mailbox operation failed${code}. Check the account connection and try again.`);
 }

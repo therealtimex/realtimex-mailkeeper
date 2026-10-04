@@ -20,7 +20,7 @@ module.exports = {
 
   setupRevision(config, target) {
     // Schedule intent is independent of account verification.
-    const { maintenanceEnabled, cadence, himalayaConfigPath, ...verificationConfig } = config;
+    const { maintenanceEnabled, cadence, ...verificationConfig } = config;
     return crypto.createHash("sha256").update(JSON.stringify({ verificationConfig, target })).digest("hex");
   },
 
