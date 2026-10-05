@@ -463,6 +463,19 @@ test("connecting stores the binding before the check and adds the account", asyn
   assert.equal((await f.service.setupStatus(f.workspace)).state, "ready");
 });
 
+test("connecting in a new workspace before an agent is chosen still adds the account", async (t) => {
+  const f = fixture(t, { EMAIL_ACCOUNTS: [], AGENT: "" }); withLogins(f);
+  await f.service.selectLogin(f.workspace, { selection: pick });
+  const result = await f.service.connectAccount(f.workspace, { login: "login-1", account: { name: "work" } });
+  await f.service.setupJobs.get(1)?.promise;
+  assert.equal(result.configured, true);
+  assert.deepEqual(f.api.getConfig().EMAIL_ACCOUNTS, ["work"]);
+  const status = await f.service.setupStatus(f.workspace);
+  assert.deepEqual(status.blockers.map((entry) => entry.safeMessage), ["Maintenance agent is required."]);
+  await assert.rejects(f.service.configureSetup(f.workspace, { MODE: "bogus" }), { code: "SETUP_CONFIG_INVALID" });
+  assert.deepEqual(f.api.getConfig().EMAIL_ACCOUNTS, ["work"]);
+});
+
 test("connect refuses unknown Logins, missing server details and host failures without storing a binding", async (t) => {
   const f = fixture(t);
   withLogins(f, { configure: () => { throw Object.assign(new Error("raw"), { code: "SECRET_SCOPE_DENIED" }); } });

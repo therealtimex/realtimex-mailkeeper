@@ -232,9 +232,12 @@ module.exports = {
     if (!patch || Array.isArray(patch) || typeof patch !== "object" || Object.keys(patch).some((key) => !editable.has(key))) throw fault("SETUP_CONFIG_INVALID", 400);
     await this.exclusive(workspace, async () => {
       const raw = this.api.getConfig({ workspaceId: workspace.id });
-      const before = resolveProfileConfig(raw).config;
+      const current = resolveProfileConfig(raw);
+      const before = current.config;
       const candidate = resolveProfileConfig({ ...raw, ...patch });
-      if (candidate.errors.length) throw fault("SETUP_CONFIG_INVALID", 400);
+      // Refuse what the patch breaks. Settings first use has not reached yet
+      // (no agent chosen) stay setup blockers instead of refusing the patch.
+      if (candidate.errors.some((error) => !current.errors.includes(error))) throw fault("SETUP_CONFIG_INVALID", 400);
       const verificationChanged = this.setupRevision(before, null) !== this.setupRevision(candidate.config, null);
       await this.api.updateConfig(patch, { workspaceId: workspace.id, workspaceSlug: workspace.slug });
       const profile = await this.store.get(this.profileKey(workspace)) || {};
