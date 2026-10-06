@@ -15,7 +15,7 @@ Read `MAILBOX.md` in the workspace root before anything else. It is the human-ow
 ## Sources of truth
 
 - Account names and mode come from the plugin (workspace settings) — never guess a host, address, or folder. A workspace may keep several accounts: run every per-account step once per account, then submit one receipt.
-- Himalaya config: `HIMALAYA_CONFIG` if set, otherwise the BizOps-configured TOML (`realtimex-bizops` skill explains how to resolve it). All commands take `-a <account>`.
+- Mailbox access: `mailbox-ops.js` calls `rtxexec himalaya` (rtxexec 0.4.0 or later), the host's authenticated email runner, from this RealTimeX terminal session. The host picks the Himalaya config and resolves any Secrets-managed credential, so never pass a config path, password or `himalaya` command yourself. A failure prints a safe code: `RTXEXEC_UNAVAILABLE`/`RTXEXEC_UPGRADE_REQUIRED` (rtxexec is missing or older than 0.4.0: run `npm install -g @realtimex/rtxexec@0.4.0` once, then retry the same command once; if it fails again, report the code and stop), `RTXEXEC_UNSUPPORTED` (unexpected rtxexec reply), `EMAIL_CONTEXT_UNAVAILABLE` (run from this workspace's RealTimeX terminal), `SECRET_*`/`EMAIL_AUTH_FAILED` (the human repairs the account in MailKeeper setup). Report the code and stop. Do not retry a failed `move` that the receipt records as uncertain.
 - Local state lives in `.mailkeeper/` in the workspace root: `rules.json` (written by the plugin: effective config, per-account folders, promoted rules), `snapshot-<account>.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
 - `scripts/mailbox-ops.js` is the only way to touch the mailbox from this skill. Do not hand-assemble `himalaya message move` commands.
 
@@ -98,6 +98,13 @@ node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js undo --run-id <id> [-
 ```
 
 Moves every UID in the receipt back to where it came from, across every account the run touched (or just one with `--account`). Or use the plugin's `POST /undo` from the status page.
+
+Both routes share one undo journal per run (`.mailkeeper/undo/`). Confirmed reversals are never sent twice, and a chunk that never started can be retried. Stop and report the code to the human on any of these refusals; never work around them:
+- `MAILKEEPER_UNDO_UNRESOLVED`: an earlier undo of this run may have moved mail with an unknown result. This includes an undo interrupted mid-move. Nothing in the run moves again until it is reconciled.
+- `MAILKEEPER_UNDO_BUSY`: another undo of this run is running.
+- `MAILKEEPER_UNDO_LEGACY`: the run predates the journal; undo it from MailKeeper in RealTimeX.
+
+Do not edit files in `.mailkeeper/undo/`.
 
 ## Reporting
 

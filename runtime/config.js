@@ -71,6 +71,7 @@ function resolveProfileConfig(raw = {}) {
     mode: effectiveMode,
     modeCappedByCeiling: effectiveMode !== requestedMode,
     cadence: text(raw.CADENCE, 20).toLowerCase() || "1d",
+    maintenanceEnabled: raw.MAINTENANCE_ENABLED === true,
     ageThresholdDays: Number(raw.AGE_THRESHOLD_DAYS) || 90,
     aggressiveness: text(raw.AGGRESSIVENESS, 20).toLowerCase() || "conservative",
     vipSenders: list(raw.VIP_SENDERS),
@@ -85,7 +86,7 @@ function resolveProfileConfig(raw = {}) {
   const errors = [];
   if (!config.emailAccounts.length) errors.push("At least one email account is required.");
   for (const account of config.emailAccounts) {
-    if (/[@\s]/.test(account)) {
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(account)) {
       errors.push(
         `Email account "${account}" must be a Himalaya account name, not an address.`
       );

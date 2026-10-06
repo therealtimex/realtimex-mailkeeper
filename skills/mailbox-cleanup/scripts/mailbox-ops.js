@@ -22,18 +22,28 @@
  * State: <workspace>/.mailkeeper/{rules.json, snapshot-<account>.json, runs/, outbox/}
  * rules.json is written by the plugin on every provision and carries the
  * effective config plus the promoted rule set. Never edit it by hand.
+ *
+ * Mailbox access goes through `rtxexec himalaya`, the host's authenticated
+ * email runner, using this terminal's verified RealTimeX session. The host
+ * chooses the Himalaya binary and config and resolves any Secrets-managed
+ * credential; this CLI never sees a path or password.
  */
 
 const fs = require("fs");
 const path = require("path");
 const { execFileSync } = require("child_process");
+const undoJournal = require("./undo-journal");
 
 const ROOT = process.cwd();
 const STATE = path.join(ROOT, ".mailkeeper");
 // realtimex-plugin-validator: allow-process-env -- this CLI runs in the agent's
-// terminal, not the plugin host; the Himalaya binary and TOML path are runtime
-// discovery injected by the environment, never plugin configuration.
-const HIMALAYA = process.env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
+// terminal, not the plugin host; which rtxexec to launch is runtime discovery
+// injected by the environment, never plugin configuration.
+const RTXEXEC = process.env.MAILKEEPER_RTXEXEC_BIN || "rtxexec";
+// `rtxexec himalaya` arrived in 0.4.0; an older rtxexec rejects it as a usage error.
+const RTXEXEC_INSTALL = "npm install -g @realtimex/rtxexec@0.4.0";
+let rtxexecReady = false;
+let previewRules = null;
 const BATCH = 200;
 
 // ---------------------------------------------------------------------------
@@ -145,18 +155,63 @@ function readJson(file, fallback = null) {
 
 function writeJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  const temporary = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+  fs.renameSync(temporary, file);
 }
 
-function himalaya(account, args, { json = true } = {}) {
-  // `-a` / `-c` / `-o` are per-subcommand options in Himalaya, so they go last.
-  const tail = ["-a", account, ...(json ? ["-o", "json"] : []), ...(process.env.HIMALAYA_CONFIG ? ["-c", process.env.HIMALAYA_CONFIG] : [])];
-  const out = execFileSync(HIMALAYA, [...args, ...tail], {
-    encoding: "utf8",
-    maxBuffer: 64 * 1024 * 1024,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  return json && out.trim() ? JSON.parse(out) : out;
+function emailError(code, extra = {}) {
+  // Only allowlist-shaped codes leave this process; never raw stderr.
+  const safe = /^[A-Z][A-Z0-9_]{0,63}$/.test(code || "") ? code : "EMAIL_CONTEXT_UNAVAILABLE";
+  return Object.assign(new Error(safe), { code: safe, ...extra });
+}
+
+// Checked once, before the first host call: missing or too old fails with a typed code.
+function ensureRtxexec() {
+  if (rtxexecReady) return;
+  let version = "";
+  try {
+    version = execFileSync(RTXEXEC, ["--version"], { encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch (error) {
+    if (error.code === "ENOENT") throw emailError("RTXEXEC_UNAVAILABLE");
+  }
+  const [major, minor] = (version.match(/^(\d+)\.(\d+)\.\d+/) || []).slice(1).map(Number);
+  if (!(major > 0 || minor >= 4)) throw emailError("RTXEXEC_UPGRADE_REQUIRED");
+  rtxexecReady = true;
+}
+
+// One bounded operation: folders | envelopes | move | add-folder.
+function himalaya(account, request) {
+  const config = loadRules().config;
+  if (!config.pluginId) fail("rules.json predates authenticated email access. Open MailKeeper setup and check again.");
+  ensureRtxexec();
+  const options = {
+    plugin: config.pluginId, account, binding: config.emailBindings?.[account], operation: request.operation,
+    folder: request.folder, from: request.from, to: request.to, uids: request.uids?.join(","),
+    page: request.page, "page-size": request.pageSize, query: request.query || undefined,
+  };
+  const argv = ["himalaya"];
+  for (const [key, value] of Object.entries(options)) if (value !== undefined) argv.push(`--${key}`, String(value));
+  const mutation = ["move", "add-folder"].includes(request.operation);
+  let output;
+  try {
+    output = execFileSync(RTXEXEC, argv, { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    if (error.code === "ENOENT") throw emailError("RTXEXEC_UNAVAILABLE");
+    output = error.stdout; // A failed operation is still reported as one JSON line.
+  }
+  let result = null;
+  try { result = JSON.parse(String(output || "").trim().split("\n").pop()); } catch { /* handled below */ }
+  if (result?.ok === true && (!mutation || result.outcome === "confirmed")) return result.data;
+  // A refusal before admission started nothing; without a readable reply an
+  // admitted or unknown mutation's outcome is uncertain.
+  const refused = result?.ok === false && /^[A-Z][A-Z0-9_]{0,63}$/.test(result.code || "") &&
+    result.operationId === undefined && result.outcome === undefined;
+  const outcome = refused ? "not_started"
+    : result?.ok === false && ["not_started", "uncertain"].includes(result.outcome) && typeof result.operationId === "string" ? result.outcome
+      : "uncertain";
+  throw emailError(result?.ok === false ? result.code : "RTXEXEC_UNSUPPORTED",
+    mutation ? { operationId: typeof result?.operationId === "string" ? result.operationId : null, outcome } : {});
 }
 
 function normalize(row, folder, now) {
@@ -175,15 +230,16 @@ function normalize(row, folder, now) {
   };
 }
 
-function listAll(account, folder, query) {
+function listAll(account, folder, query, { maxPages = 2000 } = {}) {
   const out = [];
   const now = Date.now();
-  for (let page = 1; page <= 2000; page += 1) {
+  for (let page = 1; page <= maxPages; page += 1) {
     let rows;
     try {
-      rows = himalaya(account, ["envelope", "list", "-f", folder, "-p", String(page), "-s", String(BATCH), ...(query ? [query] : [])]);
+      rows = himalaya(account, { operation: "envelopes", folder, page, pageSize: BATCH, query });
     } catch (error) {
-      if (/out of bound/i.test(String(error.stderr || error.message))) break;
+      // Himalaya errors on an out-of-range page instead of returning [].
+      if (error.code === "EMAIL_PAGE_OUT_OF_RANGE") break;
       throw error;
     }
     if (!Array.isArray(rows) || !rows.length) break;
@@ -196,6 +252,7 @@ function listAll(account, folder, query) {
 }
 
 function loadRules() {
+  if (previewRules) return previewRules;
   const rules = readJson(path.join(STATE, "rules.json"));
   if (!rules?.config) fail(".mailkeeper/rules.json missing — the MailKeeper plugin writes it on provision. Is the plugin enabled for this workspace?");
   return rules;
@@ -269,16 +326,25 @@ function targetFolder(passName, ctx, mode) {
 }
 
 function ensureFolder(account, name) {
-  const folders = himalaya(account, ["folder", "list"]);
+  const folders = himalaya(account, { operation: "folders" });
   if (Array.isArray(folders) && folders.some((f) => f.name === name)) return;
-  himalaya(account, ["folder", "add", name], { json: false });
+  himalaya(account, { operation: "add-folder", folder: name });
 }
 
 function move(account, uids, from, to, dryRun) {
   const actions = [];
   for (let i = 0; i < uids.length; i += BATCH) {
     const chunk = uids.slice(i, i + BATCH);
-    if (!dryRun) himalaya(account, ["message", "move", "-f", from, to, ...chunk], { json: false });
+    if (!dryRun) {
+      try {
+        himalaya(account, { operation: "move", from, to, uids: chunk });
+      } catch (error) {
+        // Keep confirmed chunks and the failed attempt so a receipt never
+        // drops moved mail or invites a blind replay.
+        throw Object.assign(error, { completed: actions, attempt: { account, from, to, uids: chunk,
+          operationId: error.operationId ?? null, outcome: error.outcome || "not_started", code: error.code } });
+      }
+    }
     for (const uid of chunk) actions.push({ kind: "move", account, uid, from, to, dryRun });
   }
   return actions;
@@ -300,6 +366,76 @@ function loadRun(runId, { create = false } = {}) {
 // ---------------------------------------------------------------------------
 
 const commands = {
+  "onboarding-preview"(args) {
+    const runId = args["run-id"] || fail("--run-id required");
+    if (!/^[a-zA-Z0-9-]{1,80}$/.test(runId)) fail("invalid run id");
+    const existing = readJson(runFile(runId));
+    if (existing) {
+      const queued = readJson(path.join(STATE, "outbox", `${runId}.json`));
+      if (existing.submittedAt || queued) {
+        if (queued && !existing.submittedAt) writeJson(runFile(runId), { ...existing, submittedAt: queued.finishedAt, outcome: queued.outcome });
+        console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: queued?.outcome || existing.outcome }));
+        return;
+      }
+      if (existing.kind !== "onboarding-preview" || existing.mode !== "report-only") fail("run is not an onboarding preview");
+      if (Number.isInteger(existing.runnerPid) && existing.runnerPid > 0) {
+        let running = true;
+        try { process.kill(existing.runnerPid, 0); } catch (error) { running = error.code !== "ESRCH"; }
+        if (running) {
+          console.log(JSON.stringify({ ok: true, runId, reused: true, outcome: "pending" }));
+          return;
+        }
+      }
+      // A restarted command cannot know how far an interrupted account got.
+      // Settle the original identity instead of rescanning past its ceiling.
+      const terminal = ["completed", "blocked", "failed"].includes(existing.outcome);
+      if (!terminal) {
+        const accounts = existing.scope?.accounts;
+        if (!Array.isArray(accounts) || !accounts.length) fail("preview scope is missing");
+        existing.accountOutcomes ||= [];
+        for (const account of accounts) {
+          if (!existing.accountOutcomes.some((entry) => entry.account === account)) {
+            existing.accountOutcomes.push({ account, outcome: "failed", code: "PREVIEW_INTERRUPTED" });
+          }
+        }
+        writeJson(runFile(runId), existing);
+      }
+      commands.submit({ "run-id": runId, outcome: terminal ? existing.outcome : "failed",
+        summary: "Preview interrupted. Recorded progress retained; actual mailbox changes: 0. Start a new preview deliberately after reviewing this result." });
+      return;
+    }
+    const reservation = readJson(path.join(STATE, "previews", `${runId}.json`));
+    if (reservation?.runId === runId && reservation.kind === "onboarding-preview") previewRules = reservation.rules;
+    const rules = loadRules();
+    const run = loadRun(runId, { create: true });
+    run.kind = "onboarding-preview";
+    run.runnerPid = process.pid;
+    run.mode = "report-only";
+    run.scope = { accounts: rules.config.emailAccounts, folders: ["INBOX"], maxPages: 5, pageSize: BATCH };
+    run.snapshot = { checked: 0 };
+    run.accountOutcomes = [];
+    writeJson(runFile(runId), run);
+    for (const account of rules.config.emailAccounts) {
+      try {
+        const envelopes = listAll(account, "INBOX", "", { maxPages: 5 });
+        const snapshot = { account, folder: "INBOX", takenAt: new Date().toISOString(), envelopes, repliedTo: [], sentDomains: [] };
+        const urgent = urgentHits(snapshot);
+        const ctx = buildContext(rules, snapshot);
+        run.urgent.push(...urgent.map((entry) => ({ account, uid: entry.uid })));
+        for (const pass of rules.config.promotablePasses || []) {
+          const matches = candidates(pass, ctx, snapshot, urgent);
+          if (matches.length) run.proposals.push({ account, pass, count: matches.length, query: PASSES[pass].describe(ctx), action: "report-only" });
+        }
+        run.snapshot.checked += envelopes.length;
+        run.accountOutcomes.push({ account, outcome: "completed", checked: envelopes.length, limitReached: envelopes.length === 5 * BATCH });
+      } catch {
+        run.accountOutcomes.push({ account, outcome: "failed", code: "PREVIEW_ACCOUNT_FAILED" });
+      }
+      writeJson(runFile(runId), run);
+    }
+    const failed = run.accountOutcomes.some((entry) => entry.outcome !== "completed");
+    commands.submit({ "run-id": runId, outcome: failed ? "failed" : "completed", summary: "First report-only preview. Actual mailbox changes: 0." });
+  },
   snapshot(args) {
     const account = args.account || fail("--account required");
     const folder = args.folder || "INBOX";
@@ -375,10 +511,10 @@ const commands = {
     const rules = loadRules();
     const snapshot = loadSnapshot(account);
     const ctx = buildContext(rules, snapshot);
-    const mode = args.mode || rules.config.mode;
+    const run = loadRun(runId, { create: true });
+    const mode = run.kind === "onboarding-preview" ? "report-only" : args.mode || rules.config.mode;
     const dryRun = args["dry-run"] === true || mode === "report-only";
     const urgent = urgentHits(snapshot);
-    const run = loadRun(runId, { create: true });
     run.mode = mode;
 
     let plan;
@@ -391,21 +527,42 @@ const commands = {
     }
 
     const results = [];
-    for (const step of plan) {
-      const list = candidates(step.pass, ctx, snapshot, urgent);
-      const to = targetFolder(step.pass, ctx, mode);
-      if (!dryRun && list.length) ensureFolder(account, to);
-      const actions = move(account, list.map((e) => e.uid), snapshot.folder, to, dryRun).map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId }));
-      run.actions.push(...actions);
-      run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
-      results.push({ account, pass: step.pass, to, dryRun, ...summarize(list) });
+    // Persist on success and on failure: moved mail must always be on the
+    // receipt so it stays undoable. Uncertain moves leave the snapshot too:
+    // only a fresh authenticated `snapshot` readback can offer them again.
+    const persist = () => {
+      if (!dryRun) {
+        const moved = new Set([...run.actions.filter((a) => !a.dryRun).map((a) => a.uid),
+          ...(run.attempts || []).filter((a) => a.outcome === "uncertain").flatMap((a) => a.uids)]);
+        snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
+        writeJson(snapshotFile(account), snapshot);
+      }
+      writeJson(runFile(runId), run);
+    };
+    try {
+      for (const step of plan) {
+        const list = candidates(step.pass, ctx, snapshot, urgent);
+        const to = targetFolder(step.pass, ctx, mode);
+        // Moves are undone through the run's shared journal; create it first.
+        if (!dryRun && list.length) undoJournal.ensure(STATE, runId);
+        if (!dryRun && list.length) ensureFolder(account, to);
+        let actions;
+        try {
+          actions = move(account, list.map((e) => e.uid), snapshot.folder, to, dryRun);
+        } catch (error) {
+          run.actions.push(...(error.completed || []).map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId })));
+          if (error.attempt) run.attempts = [...(run.attempts || []), { ...error.attempt, pass: step.pass, ruleId: step.ruleId }];
+          throw error;
+        }
+        run.actions.push(...actions.map((a) => ({ ...a, pass: step.pass, ruleId: step.ruleId })));
+        run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved: dryRun ? 0 : list.length, previewed: list.length, to, dryRun });
+        results.push({ account, pass: step.pass, to, dryRun, ...summarize(list) });
+      }
+    } catch (error) {
+      persist();
+      throw error;
     }
-    if (!dryRun) {
-      const moved = new Set(run.actions.filter((a) => !a.dryRun).map((a) => a.uid));
-      snapshot.envelopes = snapshot.envelopes.filter((e) => !moved.has(e.uid));
-      writeJson(snapshotFile(account), snapshot);
-    }
-    writeJson(runFile(runId), run);
+    persist();
     console.log(JSON.stringify({ ok: true, runId, account, mode, dryRun, results }, null, 2));
   },
 
@@ -446,11 +603,17 @@ const commands = {
     const receipt = {
       schemaVersion: 1,
       runId,
+      kind: run.kind || null,
       outcome,
       mode: run.mode || null,
+      scope: run.scope || null,
+      snapshot: run.snapshot || null,
+      accountOutcomes: run.accountOutcomes || [],
       startedAt: run.startedAt,
       finishedAt: new Date().toISOString(),
       actions: run.actions.filter((a) => !a.dryRun),
+      // Interrupted moves: operation identity and outcome, never replayed.
+      attempts: run.attempts || [],
       proposals: run.proposals || [],
       urgent: run.urgent || [],
       passes: run.passes || [],
@@ -461,32 +624,29 @@ const commands = {
     console.log(JSON.stringify({ ok: true, runId, actions: receipt.actions.length, proposals: receipt.proposals.length, urgent: receipt.urgent.length, queued: `.mailkeeper/outbox/${runId}.json` }));
   },
 
-  undo(args) {
+  async undo(args) {
     const runId = args["run-id"] || fail("--run-id required");
     const dryRun = args["dry-run"] === true;
     const only = args.account || null;
     const run = loadRun(runId);
     if (run.undoneAt) fail(`run ${runId} already undone at ${run.undoneAt}`);
-    const groups = new Map();
-    for (const a of run.actions) {
-      if (a.kind !== "move" || a.dryRun) continue;
-      const acct = a.account || only || fail("receipt action has no account; pass --account");
-      if (only && acct !== only) continue;
-      const key = `${acct}|${a.to}→${a.from}`;
-      if (!groups.has(key)) groups.set(key, { account: acct, from: a.to, to: a.from, uids: [] });
-      groups.get(key).uids.push(a.uid);
+    const actions = run.actions.filter((a) => a.kind === "move" && !a.dryRun).map((a) => ({
+      account: a.account || only || fail("receipt action has no account; pass --account"), uid: a.uid, from: a.from, to: a.to,
+    }));
+    let result;
+    try {
+      // The shared journal is the one undo authority for this run, also used by
+      // the desktop. Its state is read under its lock, never from `run` above.
+      result = await undoJournal.reverse({
+        stateDir: STATE, runId, actions, dryRun, select: (a) => !only || a.account === only,
+        dispatch: ({ account, from, to, uids }) => move(account, uids, from, to, false),
+      });
+    } catch (error) {
+      if (/^MAILKEEPER_(UNDO|RUN)_/.test(error.code || "")) fail(`${error.message} (${error.code})`);
+      throw error;
     }
-    let reversed = 0;
-    const skipped = [];
-    for (const g of groups.values()) {
-      try {
-        reversed += move(g.account, g.uids, g.from, g.to, dryRun).length;
-      } catch (error) {
-        skipped.push({ account: g.account, from: g.from, to: g.to, count: g.uids.length, error: String(error.message).split("\n")[0] });
-      }
-    }
-    if (!dryRun) writeJson(runFile(runId), { ...run, undoneAt: new Date().toISOString() });
-    console.log(JSON.stringify({ ok: true, runId, dryRun, reversed, skipped }, null, 2));
+    if (result.undoneAt && !dryRun) writeJson(runFile(runId), { ...loadRun(runId), undoneAt: result.undoneAt });
+    console.log(JSON.stringify({ ok: true, runId, dryRun, reused: result.reused, reversed: result.reversed, skipped: result.skipped }, null, 2));
   },
 };
 
@@ -498,8 +658,10 @@ if (!command || !commands[command]) {
   console.error(`usage: mailbox-ops.js <${Object.keys(commands).join("|")}> [options]`);
   process.exit(2);
 }
-try {
-  commands[command](args);
-} catch (error) {
-  fail(String(error.stderr || error.message).split("\n").slice(0, 3).join(" "));
-}
+Promise.resolve().then(() => commands[command](args)).catch((error) => {
+  const code = /^[A-Z][A-Z0-9_]{0,63}$/.test(error?.code || "") ? ` (${error.code})` : "";
+  const next = ["RTXEXEC_UNAVAILABLE", "RTXEXEC_UPGRADE_REQUIRED"].includes(error?.code)
+    ? `Install rtxexec 0.4.0 or later with \`${RTXEXEC_INSTALL}\`, then run the command again.`
+    : "Check the account connection and try again.";
+  fail(`Mailbox operation failed${code}. ${next}`);
+});

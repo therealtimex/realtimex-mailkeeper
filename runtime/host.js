@@ -220,15 +220,36 @@ function publicBackend(api) {
     backend: "public",
     workspaces: api.workspaces,
     heartbeat: api.heartbeat,
+    dispatchPreview: (options) => api.onboarding.dispatchPreview(options),
   };
 }
 
 const cache = new WeakMap();
 
+function emailBackend(api) {
+  const methods = ["getHimalayaTarget", "executeHimalaya",
+    "getLoginChoices", "configureSecretsAccount", "getCredentialReference"];
+  const email = {};
+  Object.defineProperty(email, "supported", { get: () =>
+    typeof api.email?.getHimalayaTarget === "function" &&
+    typeof api.email?.executeHimalaya === "function" });
+  for (const method of methods) email[method] = (...args) => {
+    if (typeof api.email?.[method] !== "function") {
+      const error = new Error("Upgrade RealTimeX to use authenticated email access.");
+      error.code = "HOST_UNSUPPORTED";
+      error.statusCode = 409;
+      throw error;
+    }
+    return api.email[method](...args);
+  };
+  return Object.freeze(email);
+}
+
 function hostFor(api) {
   let host = cache.get(api);
   if (!host) {
     host = hasPublicApi(api) ? publicBackend(api) : shimBackend(api);
+    host.email = emailBackend(api);
     cache.set(api, host);
   }
   return host;
