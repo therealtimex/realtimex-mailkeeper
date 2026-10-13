@@ -1,106 +1,184 @@
 ---
 name: mailbox-cleanup
-description: Multi-pass mailbox cleanup playbook over Himalaya (any IMAP provider). Use for large-backlog inbox cleanup, proposing and promoting cleanup rules, unattended maintenance runs driven by the RealTimeX MailKeeper plugin heartbeat, and reversing a previous run. Pattern-based subject/sender/body passes catch far more archivable mail than sender-only scans.
+description: Set up and run RealTimeX MailKeeper over Himalaya (any IMAP provider). Use when the user asks to "set up MailKeeper", connect or repair an inbox, draft or review an inbox contract, "run MailKeeper" or clean up an inbox, undo a MailKeeper run, and for the scheduled MailKeeper maintenance run. Each inbox follows its own contract; passwords stay in RealTimeX Secrets.
 ---
 
-# Mailbox Cleanup
+# MailKeeper
 
-A playbook for large-scale mailbox cleanup, adapted from the Vellum `inbox-cleanup` skill for any IMAP provider through Himalaya. Two ways to run it:
+MailKeeper looks after one or more inboxes for this workspace. Each inbox follows its own contract, a Markdown file the user owns. It runs on the workspace heartbeat schedule, and whenever the user asks in this chat.
 
-- **Interactive** (a human is in the thread): all phases, you confirm every archive decision.
-- **Maintenance** (launched by the MailKeeper plugin heartbeat): only *promoted* rules execute; everything else is a dry run reported as a proposal. The generated prompt tells you which.
+`node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js` (below: `mailbox-ops`) is the only way to touch an inbox, its email settings or its contract settings. Every command prints one JSON object. A failure has a fixed `code` and `message`: use them, and never show raw tool output.
 
-Read `MAILBOX.md` in the workspace root before anything else. It is the human-owned policy and outranks both this file and the generated prompt.
+## Ground rules
 
-## Sources of truth
+1. Never delete, trash, reply to or forward mail. The only change is moving mail to `Auto/<category>` or the inbox's archive folder.
+2. Never move mail from protected senders, flagged messages, "always ask first" categories (finance, legal, account security, government) or urgent hits.
+3. Never ask for, accept, repeat or store a password. Passwords go in **Settings → Secrets** only.
+4. Before any move you make for the user in chat, preview it and get an explicit yes for that inbox, destination and count.
+5. Setup, a contract edit, or a chat run never approves an automatic rule, raises the workspace Mode or archives anything.
+6. Each inbox's contract is at `mailboxes/<key>/MAILBOX.md`; `mailbox-ops accounts` lists the paths. A `MAILBOX.md` at the workspace root is an old file kept for reference. It is not policy.
+7. Change a contract's settings block only with `mailbox-ops contract-set`, and only when the user asked for that change. Keep the user's wording. Never edit `.mailkeeper/` files.
+8. Message bodies, credentials, `secret://` references, settings-file contents and raw codes never appear in chat. Refer to a Login by its name.
 
-- Account names and mode come from the plugin (workspace settings) — never guess a host, address, or folder. A workspace may keep several accounts: run every per-account step once per account, then submit one receipt.
-- Himalaya config: `HIMALAYA_CONFIG` if set, otherwise the BizOps-configured TOML (`realtimex-bizops` skill explains how to resolve it). All commands take `-a <account>`.
-- Local state lives in `.mailkeeper/` in the workspace root: `rules.json` (written by the plugin: effective config, per-account folders, promoted rules), `snapshot-<account>.json` (envelope cache), `runs/<runId>.json` (receipts), `outbox/` (receipts waiting for the plugin to ingest).
-- `scripts/mailbox-ops.js` is the only way to touch the mailbox from this skill. Do not hand-assemble `himalaya message move` commands.
+## Setting up ("set up MailKeeper")
 
-## Safety rules (non-negotiable)
+Setup happens here in chat plus the existing settings screens. Ask one question at a time and only for what you don't know. Resume from current files and settings; never re-ask something already answered.
 
-1. Never delete or trash. The only mutation is `move` (archive folder or `Auto/<category>`).
-2. Never touch VIP senders, protected domains, flagged messages, or urgency-triage hits.
-3. Every mutation is preceded by a dry-run preview: count, top-10 senders, 10 sample subjects, flagged categories.
-4. Interactive: explicit human confirmation at every apply. Maintenance: promoted rules only.
-5. Every run produces exactly one receipt with every moved UID, so `undo` can reverse it.
-6. Never invent rules. Propose them; a human promotes them from the plugin status page.
+An inbox is set up when all four hold: it is selected in MailKeeper settings, a maintenance agent is chosen, its contract has a valid settings block, and a read-only connection check succeeded. `mailbox-ops status` shows this per inbox. A preview, the first scheduled run, a model or reasoning effort are not setup steps.
 
-## Phases
+### 1. Choose inboxes
 
-### 1. Preferences (interactive only)
+Run `mailbox-ops accounts`. Tell the user which inboxes are **looked after here** and which are only **available**. Never add an inbox the user didn't name, and keep any selection they already made.
 
-Ask once, then write the answers into `MAILBOX.md`:
-- Aggressiveness: conservative / standard / aggressive
-- Age threshold (days) for the bulk pass
-- VIP senders to protect
-- Confirm-first categories (financial, legal, account security, government are always on)
+If it returns `MAILKEEPER_HIMALAYA_CONFIG_MISSING`, say: "I can't find your email settings yet, so I'll create them with you." Then continue with step 2: `account-config` creates the file in the right place.
 
-### 2. Snapshot
+### 2. Connect the inbox
 
-```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <name>            # full
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account <name> --since-last-run   # delta (maintenance)
-```
+Ask only for missing details: the address, then the provider (or the IMAP server if you can't infer it).
 
-Pulls envelopes (uid, date, from, subject, flags) into `.mailkeeper/snapshot.json`. All passes run against this cache, so previews are instant and the server is only hit again to move UIDs.
+Check the inbox's current sign-in with `mailbox-ops config-check --account <name>`. It shows key names only, never values.
 
-### 3. Urgency triage — always first
+- **`signIn: "command"` or `"keyring"`** (for example a Keychain command set up via BizOps): keep that method. Don't ask the user to move the password. Use `--native` below.
+- **`inlineSecret: true`**: the settings file holds a password in plain text. Say only that the file stores a password directly. Recommend changing it with the provider and saving the new one in Secrets. Then continue with the Secrets route, which replaces that entry.
+- **Otherwise**, give this one instruction:
 
-```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account <name> --run-id <id>
-```
+  > Open **Settings → Secrets**, add a **Login** named "MailKeeper – work@example.com", put the password in **Password**, and make it available to this workspace. Tell me when it's saved. Please don't paste the password here.
 
-Surfaces overdue / suspension / collections / legal / `.gov` hits. These go in the receipt under `urgent` and are excluded from every later pass.
+  If the provider needs an **app password** (Gmail, iCloud, Yahoo, or Outlook.com with 2-step verification), say so before they save, and link the provider's help page. If the provider doesn't allow IMAP password sign-in, stop: "work@example.com doesn't allow password sign-in for mail apps, so MailKeeper can't connect to it yet." Don't retry.
 
-### 4. Passes
-
-Run in this order. `preview` is always a dry run; `apply` mutates unless `--dry-run` is given or the mode is `report-only`.
-
-| Pass | What it matches | Default action |
-|---|---|---|
-| `age` | older than threshold, unflagged, not VIP | archive |
-| `personalized-outreach` | first name / company in subject from unknown domain | `Auto/Outreach` |
-| `generic-outreach` | "quick question", "checking in", "following up", "touching base", "circle back" | `Auto/Outreach` |
-| `no-reply` | `noreply`, `no-reply`, `donotreply`, `notifications@`, body `unsubscribe` | `Auto/Notifications` |
-| `calendar-response` | subject starts `Accepted:` / `Declined:` / `Tentative:` / `Invitation:` | `Auto/Calendar` |
-| `receipt` | receipt, order confirmation, shipped, delivered, invoice paid | `Auto/Receipts` |
-| `sketchy-tld` | sender domain `.shop .biz .xyz .info .club .online .top .icu` (exact TLD, not substring) | `Auto/Suspicious` |
-| `repeat-sender` | 20+ messages from one sender, none replied to | `Auto/Bulk` |
+When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. It must exist, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value. Then:
 
 ```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js preview --account <name> --pass no-reply
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply   --account <name> --pass no-reply --run-id <id>      # interactive, after confirmation
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply   --account <name> --promoted-only --mode <mode> --run-id <id>   # maintenance
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js propose --account <name> --run-id <id>                      # dry-run the rest, emit proposals
+mailbox-ops account-config --account <name> --email <address> --host <imap host> [--port 993] [--encryption tls|start-tls|none] [--login <user>]
+mailbox-ops check --account <name> --login <Login name>        # or --native for an existing sign-in
 ```
 
-In `report-only` mode, `apply` is always a dry run. In `label-only`, archive actions are downgraded to `Auto/<category>` moves. In `archive-promoted`, promoted `age` rules may archive.
+`account-config` writes only this inbox's entry, keeps every other inbox's settings, and stores no password. If it reports `removedInlineSecret: true`, ask the user to change that password with the provider. On success, `check` lists the folders and changes nothing. Say: "Connected to work@example.com. Nothing was changed."
 
-### 5. Cold-outreach classification
+**If the user pastes a password anyway:** don't repeat, store or use it. Say: "I won't use a password from chat. Because it's now in this conversation, please change it with your provider and save the new one in Settings → Secrets." Then continue with the Secrets step.
 
-Only when a pass is ambiguous: flag as cold outreach when **3+** of these hold — unknown sender domain, personalized subject, outreach phrase in body, known outreach-tool domain (`lemlist`, `apollo`, `outreach.io`, `salesloft`, `hubspot` tracking links). Use judgement, not the LLM slot; the snapshot has enough signal.
+If the check fails, answer as in **When something fails**. Steps already done stay done.
 
-### 6. Receipt
+### 3. Draft the contract
 
 ```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js submit --run-id <id> --outcome completed --summary "..."
+mailbox-ops contract-init --account <name> --login <Login name>     # or --native; never overwrites
+mailbox-ops contract-set  --account <name> [--vip a,b] [--age 90] [--archive-folder <folder>] [--sent-folder <folder>] ...
+mailbox-ops contract-check --account <name>
 ```
 
-Writes `.mailkeeper/outbox/<runId>.json` with `actions`, `proposals`, `urgent`, and the summary. The plugin ingests it on the next lifecycle event or status read. Exit only after it prints `ok:true`.
+Pick the archive and Sent folders from the folders `check` listed for **this** inbox. Ask if it's unclear; never assume another inbox's folders. Pre-fill from what you know: workspace VIP senders, the age setting, and any older contract text. Ask only about real gaps. A domain entry covers the domain and all its subdomains, so "*.bank.com" is stored as `bank.com`.
 
-### 7. Reversal
+Present the draft as plain language, never as JSON:
+
+> Here's what I'll follow for **work@example.com**:
+> - **On my own:** report only. I won't move anything.
+> - **Never touch:** boss@example.com, bank.com and its subdomains
+> - **Always ask first:** finance, legal, account security, government (always on)
+> - **Older-mail threshold:** 90 days
+>
+> Save this as the contract for work@example.com?
+
+Drafts always start report-only. After the user confirms, link the contract with a descriptive label, for example [Work inbox contract (work@example.com)](mailboxes/…/MAILBOX.md), never a bare path.
+
+If the user asks for a restriction the settings can't express, say once: you'll follow it when suggesting; the affected passes (name them) stay suggestions on scheduled runs; and offer an enforceable version where one exists, for example "Add school.edu to Never touch?" A restriction always wins over an approved rule.
+
+### 4. Settings and schedule
+
+You can't save plugin settings. Say:
+
+> In **Workspace Settings → Plugins → MailKeeper → Configure**, select work@example.com under **Inboxes**, choose a **Maintenance agent**, and save. Model and reasoning effort are optional.
+
+After the user says it's saved, run `mailbox-ops status` and close with the effective state:
+
+> **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
+
+If `schedule.paused` is true, add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
+
+Then say once: "When you ask me here, the agent selected for this chat does the work under the same contracts." Don't ask the user to change chat controls, and don't claim chat and schedule use the same agent unless you verified it. If the scheduled agent is Codex, add one line: Codex needs network access for scheduled checks (see the MailKeeper README).
+
+Offer one optional next step: "Want me to show what I'd suggest for this inbox now? It's read-only." Setup is complete whether or not the user says yes.
+
+Adding another inbox later repeats steps 2–4 for that inbox only.
+
+## Running
+
+Every run uses one run ID and one guard per workspace. Chat, the schedule and undo never run at the same time; `MAILKEEPER_RUN_BUSY` means wait. Always finish with `submit`, which writes the run's single receipt.
 
 ```sh
-node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js undo --run-id <id> [--account <name>] [--dry-run]
+mailbox-ops begin    --run-id <id> [--account <name> ...] [--trigger chat|heartbeat]
+mailbox-ops snapshot --account <name> --run-id <id> [--since-last-run]
+mailbox-ops triage   --account <name> --run-id <id>            # urgent first; never moved
+mailbox-ops preview  --account <name> --run-id <id> --pass <pass>
+mailbox-ops apply    --account <name> --run-id <id> --pass <pass>      # chat, after an explicit yes
+mailbox-ops apply    --account <name> --run-id <id> --promoted-only    # scheduled run
+mailbox-ops propose  --account <name> --run-id <id>
+mailbox-ops submit   --run-id <id> --summary "..."
 ```
 
-Moves every UID in the receipt back to where it came from, across every account the run touched (or just one with `--account`). Or use the plugin's `POST /undo` from the status page.
+A failure in one inbox is recorded for that inbox. Skip its remaining steps and carry on with the others. Never retry a move reported as uncertain.
 
-## Reporting
+**Scheduled runs** follow the generated prompt. They apply only rules the user has already approved, within each contract. Everything else is listed as a suggestion. They never ask questions, open wizards, change Secrets or retry sign-in. A blocked inbox becomes a blocked receipt and a clear report.
 
-Interactive: after each apply, report count moved, top senders, and how to undo. At the end, list proposals worth promoting.
+**In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved and how to undo it. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
 
-Maintenance: post a short summary in the maintenance thread — moved N (by category), proposed M rules, K urgent items — or exactly `HEARTBEAT_OK` if nothing moved and nothing was proposed.
+**Passes:** `age` (archive in `archive-promoted`, otherwise `Auto/Aged`), `personalized-outreach`, `generic-outreach`, `no-reply`, `calendar-response`, `receipt`, `sketchy-tld`, `repeat-sender` (moves go to `Auto/<category>`). Passes that need reply history stay off until the inbox's Sent folder is set.
+
+### Suggestions and automatic rules
+
+Describe these truthfully:
+
+- Scheduled runs apply rules the user has already approved.
+- Everything else is listed as a suggestion.
+- To act on a suggestion now, ask in chat. You preview and ask before moving anything.
+- Approving new automatic rules isn't available from chat or settings in this release.
+
+### Reports
+
+One report per run. Give each inbox its own section, inbox name first, and say what happened and what changed, based on the receipt (`submit` output), then one next action:
+
+> **work@example.com:** checked. Moved 14 by your approved rules (Newsletters 9, Calendar 5). 3 suggestions. 1 urgent: "Final notice …" from billing@… (left in the inbox).
+> **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the "MailKeeper – personal@example.com" Login in Settings → Secrets, then ask me to run MailKeeper.
+> To undo this run, ask me: "undo MailKeeper run 7f3a".
+
+When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed.
+
+If `begin` shows an effort warning, add one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it." For an unsupported agent, say instead: "Reasoning effort isn't supported for <agent> by MailKeeper yet."
+
+## Undo ("undo MailKeeper run <id>")
+
+```sh
+mailbox-ops undo --run-id <id> [--account <name>] --dry-run     # preview first
+mailbox-ops undo --run-id <id> [--account <name>]
+```
+
+Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date. Say plainly which ones it can't match (`unresolved`) before acting; they are left where they are. Undo checks every inbox before changing any.
+
+## When something fails
+
+Always answer in this order: the inbox name; what happened, without guessing the cause; what changed, from the receipt ("Nothing was changed", "N moved before the problem; you can undo them" (`movedBeforeProblem`), or "I can't confirm whether the last move finished"); one next action, in the place the user will act. You may add the code at the end as "(Details: MAILKEEPER_…)". Other inboxes continue when it is safe.
+
+| Code | Say (inbox-specific where it applies) |
+|---|---|
+| `HIMALAYA_UNAVAILABLE`, `HIMALAYA_VERSION_UNSUPPORTED` | MailKeeper needs a supported version of the Himalaya email tool on this computer (see the MailKeeper README). |
+| `HIMALAYA_CONFIG_MISSING` | I can't find your email settings yet. Ask me to set up MailKeeper and I'll create them with you. |
+| `HIMALAYA_CONFIG_INVALID` | Your email settings file has a problem I can fix with you. I won't show its contents. Ask me to repair MailKeeper's email settings. |
+| `ACCOUNT_NOT_FOUND`, `ACCOUNT_IDENTITY_MISMATCH` | work@example.com is selected in MailKeeper settings but isn't in your email settings any more. Ask me to reconnect it, or remove it from Inboxes. |
+| `CONTRACT_REVIEW_REQUIRED` | work@example.com's contract needs a quick review after the update. Until then I only report for it, and nothing will be moved. Your approved rules are kept. Ask me to "review the work inbox contract." |
+| `CONTRACT_INVALID` | I can't read the MailKeeper settings in work@example.com's contract, so I'm only reporting for it. Ask me to fix it; I'll keep your wording. |
+| `CONTRACT_CHANGED` | work@example.com's contract changed after this preview. I'll preview again before changing anything. |
+| `CREDENTIAL_UNAVAILABLE` | I can't use the saved password for work@example.com. In Settings → Secrets, check that the Login "…" exists, is enabled, has a password and is available to this workspace. |
+| `IMAP_CHECK_FAILED`, `NETWORK_DENIED`, `TIMEOUT` | I couldn't connect or sign in to work@example.com. Nothing was changed. Check the password in Secrets (some providers need an app password) and that the maintenance agent may use the network. Name only the category the code supports. |
+| `RTXEXEC_UNAVAILABLE`, `SESSION_UNAVAILABLE` | I can only reach your inboxes from a RealTimeX workspace chat or a scheduled run. Ask me here in the workspace chat. |
+| `RUN_BUSY` | MailKeeper is already running for this workspace. Ask again when it finishes. I won't start a second run. |
+| `MUTATION_UNCERTAIN` | The connection dropped while moving messages in work@example.com, so I can't confirm the last move. I've stopped changes for this inbox and won't repeat it. Ask me to check it. |
+| `TERMINAL_REQUIRED` | Undo for work@example.com runs in the workspace chat. Ask me: "undo MailKeeper run 7f3a". |
+| `OPERATION_FAILED` | Something went wrong while working on work@example.com. (Receipt-based change statement.) Ask me to try again. |
+
+**Checking an uncertain move:** snapshot the inbox and its destination folder, and show the user which recorded messages are where. Only after the user agrees the inbox is in a known state, run `mailbox-ops release --run-id <id> --reconciled`.
+
+## After an update from MailKeeper 0.1
+
+Each inbox now has its own contract; `begin` marks the inboxes awaiting review. The first time an inbox shows `migrationNotice: true`, use the `CONTRACT_REVIEW_REQUIRED` wording and add: "Your old MAILBOX.md is kept for reference but is no longer used; each inbox now has its own contract: [links]." Every later report keeps saying the inbox needs review until the user confirms.
+
+The review is one pre-filled confirmation, not a questionnaire. Read the old root `MAILBOX.md` and the inbox's contract, fill the settings with `contract-set`, and show the plain-language summary. Ask only about what is ambiguous or can't be expressed. Pre-filled wording is never consent: run `contract-set --account <name> --confirm-review` only after the user says yes. Approved rules from 0.1 that can't be tied to one inbox come back as suggestions.
