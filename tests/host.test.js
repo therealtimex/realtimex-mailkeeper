@@ -2,15 +2,21 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs");
+const path = require("path");
 
 const { hostFor, hasPublicApi } = require("../runtime/host");
 
-test("prefers the public SDK namespaces when the host provides them", () => {
-  const api = {
+function publicApi() {
+  return {
     pluginId: "com.realtimex.mailkeeper",
     workspaces: { get: async () => null, listEnabledForPlugin: async () => [], ensureThread: async () => ({}) },
     heartbeat: { readSettings: async () => ({}), upsertManagedTask: async () => ({}), removeManagedTask: async () => ({}) },
   };
+}
+
+test("uses the public SDK namespaces", () => {
+  const api = publicApi();
   assert.equal(hasPublicApi(api), true);
   const host = hostFor(api);
   assert.equal(host.backend, "public");
@@ -18,10 +24,21 @@ test("prefers the public SDK namespaces when the host provides them", () => {
   assert.equal(host.heartbeat, api.heartbeat);
 });
 
-test("falls back to the shim and reports a clear error outside the host", () => {
-  const api = { pluginId: "com.realtimex.mailkeeper" };
-  assert.equal(hasPublicApi(api), false);
-  // Outside a RealTimeX server process the @/ modules do not resolve; the
-  // adapter must surface that as one coded error rather than a raw stack.
-  assert.throws(() => hostFor(api), { code: "MAILKEEPER_HOST_CAPABILITY_MISSING" });
+test("a host without the public APIs reports one coded error", () => {
+  assert.throws(() => hostFor({ pluginId: "com.realtimex.mailkeeper" }), { code: "MAILKEEPER_HOST_CAPABILITY_MISSING" });
+  const partial = publicApi();
+  delete partial.workspaces.ensureThread;
+  assert.equal(hasPublicApi(partial), false);
+  assert.throws(() => hostFor(partial), { code: "MAILKEEPER_HOST_CAPABILITY_MISSING" });
+});
+
+test("no plugin file reaches into server internals", () => {
+  const root = path.join(__dirname, "..");
+  const files = ["index.js", ...fs.readdirSync(path.join(root, "runtime")).map((f) => `runtime/${f}`)];
+  const skill = path.join(root, "skills", "mailbox-cleanup", "scripts");
+  files.push(...fs.readdirSync(skill).map((f) => `skills/mailbox-cleanup/scripts/${f}`));
+  for (const file of files) {
+    const source = fs.readFileSync(path.join(root, file), "utf8");
+    assert.equal(/require\(\s*["']@\//.test(source), false, `${file} requires a server-internal module`);
+  }
 });
