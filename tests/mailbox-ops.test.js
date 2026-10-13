@@ -460,11 +460,12 @@ test("setup works before the inbox is selected and never overwrites a contract",
   fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
 
   assert.equal(ws.run("check", "--account", "c").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
-  const checked = ws.run("check", "--account", "c", "--login", "a-imap");
+  assert.equal(ws.run("check", "--account", "c", "--login", "a-imap").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE", "names are never turned into references");
+  const checked = ws.run("check", "--account", "c", "--password-ref", "secret://a-imap");
   assert.deepEqual(checked.json.folders, ["INBOX", "Archive", "Sent"]);
   assert.equal(checked.json.changed, false);
 
-  const created = ws.run("contract-init", "--account", "c", "--login", "a-imap");
+  const created = ws.run("contract-init", "--account", "c", "--password-ref", "secret://a-imap");
   assert.equal(created.json.created, true);
   const file = ws.contract("c");
   const draft = fs.readFileSync(file, "utf8");
@@ -473,6 +474,8 @@ test("setup works before the inbox is selected and never overwrites a contract",
   assert.equal(ws.run("contract-init", "--account", "c").json.created, false);
   assert.equal(fs.readFileSync(file, "utf8"), draft);
   assert.equal(ws.run("check", "--account", "not-in-settings").json.code, "MAILKEEPER_ACCOUNT_NOT_FOUND");
+  assert.equal(ws.run("check", "--account", "nobody@example.com").json.code, "MAILKEEPER_ACCOUNT_NOT_FOUND", "an address is valid only when discovered");
+  assert.equal(core.parseContract(draft, "c").policy.credential.passwordRef, "secret://a-imap#password");
   assertNoSecrets(ws);
 });
 
@@ -584,13 +587,35 @@ test("account-config writes only the chosen inbox's entry, with no password", { 
   assert.equal(described.stdout.includes(sentinel), false, "values are never echoed");
   assert.equal(cli(dir, ["config-check", "--account", "work@example.com"]).json.signIn, "mailkeeper-secrets");
 
-  const replaced = cli(dir, ["account-config", "--account", "other", "--email", "other@example.com", "--host", "imap.example.com"]);
+  // An existing entry is never overwritten without an explicit repair.
+  assert.equal(cli(dir, ["account-config", "--account", "other", "--email", "other@example.com", "--host", "imap.example.com"]).json.code, "MAILKEEPER_ACCOUNT_EXISTS");
+  const replaced = cli(dir, ["account-config", "--account", "other", "--email", "other@example.com", "--host", "imap.example.com", "--replace"]);
   assert.equal(replaced.json.removedInlineSecret, true);
   assert.equal(fs.readFileSync(configFile, "utf8").includes(sentinel), false);
   assert.equal(replaced.stdout.includes(sentinel), false);
 
   fs.appendFileSync(configFile, '\n[accounts.nested.backend]\ntype = "imap"\n');
   assert.equal(cli(dir, ["account-config", "--account", "nested", "--email", "n@example.com", "--host", "imap.example.com"]).json.code, "MAILKEEPER_HIMALAYA_CONFIG_INVALID");
+});
+
+test("account-config keeps existing names and aliases and never merges by address", { skip: !HAS_HIMALAYA && "himalaya not installed" }, () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "mk-cfg-"));
+  const configFile = path.join(home, "config.toml");
+  const alias = ['[accounts.work]', 'email = "Work@Example.com"', 'backend.type = "imap"', 'backend.host = "imap.example.com"', "backend.port = 993",
+    'backend.login = "work@example.com"', 'backend.auth.type = "password"', 'backend.auth.cmd = "security find-generic-password -w -s work"', ""].join("\n");
+  fs.writeFileSync(configFile, alias);
+  const dir = setupWorkspace(configFile);
+
+  const sameAddress = cli(dir, ["account-config", "--account", "work@example.com", "--email", "work@example.com", "--host", "imap.example.com"]);
+  assert.deepEqual([sameAddress.json.code, sameAddress.json.existingAccount], ["MAILKEEPER_ACCOUNT_EXISTS", "work"]);
+  const caseVariant = cli(dir, ["account-config", "--account", "WORK", "--email", "other@example.com", "--host", "imap.example.com"]);
+  assert.deepEqual([caseVariant.json.code, caseVariant.json.existingAccount], ["MAILKEEPER_ACCOUNT_EXISTS", "work"]);
+  assert.equal(fs.readFileSync(configFile, "utf8"), alias, "the alias is untouched");
+
+  const fresh = cli(dir, ["account-config", "--account", "home@example.com", "--email", "home@example.com", "--host", "imap.example.com"]);
+  assert.equal(fresh.json.ok, true);
+  const listed = cli(dir, ["accounts"]).json.inboxes.map((i) => i.name).sort();
+  assert.deepEqual(listed, ["home@example.com", "work"], "an email-shaped name survives discovery exactly");
 });
 
 test("account-config creates a missing settings file at the pinned location", { skip: !HAS_HIMALAYA && "himalaya not installed" }, () => {

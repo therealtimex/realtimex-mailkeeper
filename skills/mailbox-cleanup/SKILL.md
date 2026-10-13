@@ -34,7 +34,7 @@ If it returns `MAILKEEPER_HIMALAYA_CONFIG_MISSING`, say: "I can't find your emai
 
 ### 2. Connect the inbox
 
-Ask only for missing details: the address, then the provider (or the IMAP server if you can't infer it). Name a new inbox entry by its email address (`--account work@example.com`), so the **Inboxes** list in settings is readable.
+Ask only for missing details: the address, then the provider (or the IMAP server if you can't infer it). Name a new inbox entry by its email address (`--account work@example.com`), so the **Inboxes** list in settings is readable. Keep existing entries' names exactly as they are.
 
 Check the inbox's current sign-in with `mailbox-ops config-check --account <name>`. It shows key names only, never values.
 
@@ -48,16 +48,20 @@ Check the inbox's current sign-in with `mailbox-ops config-check --account <name
 
   If the provider needs an **app password** (Gmail, iCloud, Yahoo, or Outlook.com with 2-step verification), say so before they save, and link the provider's help page. If the provider doesn't allow IMAP password sign-in, stop: "work@example.com doesn't allow password sign-in for mail apps, so MailKeeper can't connect to it yet." Don't retry.
 
-When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. Find it by its `displayName`. It must be enabled, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value.
+When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. Find it by its `displayName`. It must be enabled, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value. Never change a Login's workspace scope: if this workspace isn't included, ask the user to include it in Settings → Secrets.
 
-Secrets gives every Login a stable reference `name`, generated from the display name plus a short suffix (for example `mailkeeper-work-example-1a2b3c4d`). Pass that `name` to `--login`. Never ask the user for it, and in chat call the Login by its display name. Then:
+Pass the Login's exact `reference` from that metadata (for example `secret://mailkeeper-work-example-1a2b3c4d`) to `--password-ref`. Secrets generates it from the display name plus a short suffix, so never build it from the name the user typed. Never ask the user for it, and in chat call the Login by its display name. Then:
 
 ```sh
 mailbox-ops account-config --account <name> --email <address> --host <imap host> [--port 993] [--encryption tls|start-tls|none] [--login <user>]
-mailbox-ops check --account <name> --login <Login reference name>   # or --native for an existing sign-in
+mailbox-ops check --account <name> --password-ref <Login reference>   # or --native for an existing sign-in
 ```
 
-`account-config` writes only this inbox's entry, keeps every other inbox's settings, and stores no password. If it reports `removedInlineSecret: true`, ask the user to change that password with the provider. On success, `check` lists the folders and changes nothing. Say: "Connected to work@example.com. Nothing was changed."
+`account-config` writes only this inbox's entry, keeps every other inbox's settings, and stores no password.
+
+If it answers `MAILKEEPER_ACCOUNT_EXISTS`, the email settings already have an entry with that name, a name differing only in case, or the same address (`existingAccount`). Never rename or merge entries. Ask the user whether to use that existing entry as it is, or give the new one a different name. Repairing the existing entry to use Secrets (`--replace`, same `--account`) happens only when the user agrees to it. If a repair reports `removedInlineSecret: true`, ask the user to change that password with the provider.
+
+On success, `check` lists the folders and changes nothing. Say: "Connected to work@example.com. Nothing was changed."
 
 **If the user pastes a password anyway:** don't repeat, store or use it. Say: "I won't use a password from chat. Because it's now in this conversation, please change it with your provider and save the new one in Settings → Secrets." Then continue with the Secrets step.
 
@@ -66,7 +70,7 @@ If the check fails, answer as in **When something fails**. Steps already done st
 ### 3. Draft the contract
 
 ```sh
-mailbox-ops contract-init --account <name> --login <Login reference name>   # or --native; never overwrites
+mailbox-ops contract-init --account <name> --password-ref <Login reference>   # or --native; never overwrites
 mailbox-ops contract-set  --account <name> [--vip a,b] [--age 90] [--archive-folder <folder>] [--sent-folder <folder>] ...
 mailbox-ops contract-check --account <name>
 ```

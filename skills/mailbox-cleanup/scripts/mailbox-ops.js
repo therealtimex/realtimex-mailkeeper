@@ -12,15 +12,16 @@
  *   accounts                                  inboxes looked after here vs available
  *   config-check   --account <name>           describe the inbox's email settings (no values)
  *   account-config --account <name> --email <addr> --host <imap host> [--port 993]
- *                  [--encryption tls|start-tls|none] [--login <user>]
- *                                            write that inbox's Himalaya entry for a Secrets password
- *   check          --account <name> [--login <Secrets Login> | --native]
+ *                  [--encryption tls|start-tls|none] [--login <user>] [--replace]
+ *                                            write a new inbox entry for a Secrets password;
+ *                                            --replace repairs that exact existing entry
+ *   check          --account <name> [--password-ref <Login reference> | --native]
  *                                            read-only connection check (lists folders, changes nothing)
- *   contract-init  --account <name> [--login <Secrets Login> | --native]
+ *   contract-init  --account <name> [--password-ref <Login reference> | --native]
  *                                            create the inbox's draft contract if it has none
  *   contract-set   --account <name> [--mode m] [--age n] [--aggressiveness a] [--vip a,b]
  *                  [--exclude p,q] [--archive-folder f|none] [--sent-folder f|none]
- *                  [--login <Secrets Login> | --native] [--confirm-review]
+ *                  [--password-ref <Login reference> | --native] [--confirm-review]
  *                                            change only the contract's settings block
  *   contract-check --account <name>           validate and summarise the inbox contract
  *   status                                    setup state per inbox and the schedule
@@ -71,6 +72,7 @@ const MESSAGES = {
   MAILKEEPER_HIMALAYA_CONFIG_INVALID: "The email settings file has a problem that needs repair.",
   MAILKEEPER_ACCOUNT_NOT_FOUND: "This inbox isn't selected for the workspace or isn't in the email settings.",
   MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH: "This inbox's contract or settings belong to a different inbox.",
+  MAILKEEPER_ACCOUNT_EXISTS: "The email settings already have an inbox entry with this name or address.",
   MAILKEEPER_CONTRACT_REVIEW_REQUIRED: "This inbox's contract needs the user's review; only reporting until then.",
   MAILKEEPER_CONTRACT_INVALID: "This inbox's contract settings can't be read; only reporting until fixed.",
   MAILKEEPER_CONTRACT_CHANGED: "The contract or approved rules changed during this run; preview again before changing anything.",
@@ -744,6 +746,30 @@ function describeStanza(lines, stanza) {
   return { keys, auth, inlineSecret };
 }
 
+/** Inbox names and their `email` values (non-secret), by table header and key only. */
+function listStanzas(lines) {
+  const entries = [];
+  let current = null;
+  for (const line of lines) {
+    const header = TABLE_RE.exec(line);
+    if (header) {
+      const table = accountTableName(header[1]);
+      current = table && !table.subTable ? { name: table.name, email: null } : null;
+      if (current) entries.push(current);
+      continue;
+    }
+    const email = current && /^\s*email\s*=\s*("(?:[^"\\]|\\.)*")\s*(?:#.*)?$/.exec(line);
+    if (email) {
+      try {
+        current.email = JSON.parse(email[1]).toLowerCase();
+      } catch {
+        /* not a plain basic string: ignore */
+      }
+    }
+  }
+  return entries;
+}
+
 function renderStanza({ account, email, host, port, encryption, login }) {
   const helper = [process.execPath, AUTH_HELPER].map(core.shellQuote).join(" ") + ` --account ${core.shellQuote(account)}`;
   // JSON string escapes are valid TOML basic-string escapes.
@@ -847,14 +873,23 @@ function setupInbox(account) {
   };
 }
 
-/** `--login <Secrets Login name>` or `--native`, as a contract credential. */
+/**
+ * `--password-ref <reference>` or `--native`, as a contract credential. The
+ * reference is the Login's exact `reference` from Secrets metadata; only the
+ * documented `#password` field selector is added, never a name rebuilt from
+ * what the user typed.
+ */
 function credentialFromArgs(args) {
   if (args.native === true) return { kind: "himalaya-native" };
-  if (typeof args.login === "string") {
-    const passwordRef = `secret://${args.login}#password`;
+  if (args.login !== undefined) {
+    throw failure("MAILKEEPER_CREDENTIAL_UNAVAILABLE", { reason: "use --password-ref with the Login's exact reference from Secrets metadata" });
+  }
+  if (typeof args["password-ref"] === "string") {
+    const reference = args["password-ref"];
+    const passwordRef = reference.includes("#") ? reference : `${reference}#password`;
     const credential = { kind: "realtimex-secret", passwordRef };
     if (!core.parseContract(core.renderPolicyBlock({ ...core.draftPolicy("x", DEFAULT_CAPS), credential }), "x").policy) {
-      throw failure("MAILKEEPER_CREDENTIAL_UNAVAILABLE", { reason: "--login must be a Secrets Login name" });
+      throw failure("MAILKEEPER_CREDENTIAL_UNAVAILABLE", { reason: "--password-ref must be a Login's secret reference" });
     }
     return credential;
   }
@@ -999,6 +1034,18 @@ const commands = {
     const stanza = findStanza(lines, account);
     if (stanza.subTables) {
       throw failure("MAILKEEPER_HIMALAYA_CONFIG_INVALID", { reason: "this inbox's entry uses sub-tables; repair it by hand" });
+    }
+    // Existing names and aliases are the user's: never rename, merge or
+    // silently overwrite one. The user picks the existing entry, a distinct
+    // name, or (--replace) an explicit repair of this exact entry.
+    const others = listStanzas(lines).filter((entry) => entry.name !== account);
+    const sameName = others.find((entry) => entry.name.toLowerCase() === account.toLowerCase());
+    const sameAddress = others.find((entry) => entry.email && entry.email === email.toLowerCase());
+    if (sameName || sameAddress) {
+      throw failure("MAILKEEPER_ACCOUNT_EXISTS", { account, existingAccount: (sameName || sameAddress).name });
+    }
+    if (stanza.start !== -1 && args.replace !== true) {
+      throw failure("MAILKEEPER_ACCOUNT_EXISTS", { account, existingAccount: account });
     }
     const replaced = stanza.start === -1 ? null : describeStanza(lines, stanza);
     const stanzaLines = renderStanza({ account, email, host, port, encryption, login });
@@ -1628,4 +1675,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { PASSES, CONFIRM_FIRST_RE, findStanza, describeStanza, renderStanza, accountTableName };
+module.exports = { PASSES, CONFIRM_FIRST_RE, findStanza, describeStanza, renderStanza, accountTableName, listStanzas };
