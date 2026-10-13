@@ -34,7 +34,7 @@ If it returns `MAILKEEPER_HIMALAYA_CONFIG_MISSING`, say: "I can't find your emai
 
 ### 2. Connect the inbox
 
-Ask only for missing details: the address, then the provider (or the IMAP server if you can't infer it).
+Ask only for missing details: the address, then the provider (or the IMAP server if you can't infer it). Name a new inbox entry by its email address (`--account work@example.com`), so the **Inboxes** list in settings is readable.
 
 Check the inbox's current sign-in with `mailbox-ops config-check --account <name>`. It shows key names only, never values.
 
@@ -42,15 +42,19 @@ Check the inbox's current sign-in with `mailbox-ops config-check --account <name
 - **`inlineSecret: true`**: the settings file holds a password in plain text. Say only that the file stores a password directly. Recommend changing it with the provider and saving the new one in Secrets. Then continue with the Secrets route, which replaces that entry.
 - **Otherwise**, give this one instruction:
 
-  > Open **Settings → Secrets**, add a **Login** named "MailKeeper – work@example.com", put the password in **Password**, and make it available to this workspace. Tell me when it's saved. Please don't paste the password here.
+  > Open **Settings → Secrets** and add a **Login** named **mailkeeper-work-example**. Put the password in **Password**. If you limit which workspaces can use it, include this one. Tell me when it's saved. Please don't paste the password here.
+
+  Suggest a name built from the address, for example `mailkeeper-work-example` for work@example.com.
 
   If the provider needs an **app password** (Gmail, iCloud, Yahoo, or Outlook.com with 2-step verification), say so before they save, and link the provider's help page. If the provider doesn't allow IMAP password sign-in, stop: "work@example.com doesn't allow password sign-in for mail apps, so MailKeeper can't connect to it yet." Don't retry.
 
-When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. It must exist, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value. Then:
+When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. Find it by its `displayName`. It must be enabled, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value.
+
+Secrets gives every Login a stable reference `name`, generated from the display name plus a short suffix (for example `mailkeeper-work-example-1a2b3c4d`). Pass that `name` to `--login`. Never ask the user for it, and in chat call the Login by its display name. Then:
 
 ```sh
 mailbox-ops account-config --account <name> --email <address> --host <imap host> [--port 993] [--encryption tls|start-tls|none] [--login <user>]
-mailbox-ops check --account <name> --login <Login name>        # or --native for an existing sign-in
+mailbox-ops check --account <name> --login <Login reference name>   # or --native for an existing sign-in
 ```
 
 `account-config` writes only this inbox's entry, keeps every other inbox's settings, and stores no password. If it reports `removedInlineSecret: true`, ask the user to change that password with the provider. On success, `check` lists the folders and changes nothing. Say: "Connected to work@example.com. Nothing was changed."
@@ -62,7 +66,7 @@ If the check fails, answer as in **When something fails**. Steps already done st
 ### 3. Draft the contract
 
 ```sh
-mailbox-ops contract-init --account <name> --login <Login name>     # or --native; never overwrites
+mailbox-ops contract-init --account <name> --login <Login reference name>   # or --native; never overwrites
 mailbox-ops contract-set  --account <name> [--vip a,b] [--age 90] [--archive-folder <folder>] [--sent-folder <folder>] ...
 mailbox-ops contract-check --account <name>
 ```
@@ -89,11 +93,11 @@ You can't save plugin settings. Say:
 
 > In **Workspace Settings → Plugins → MailKeeper → Configure**, select work@example.com under **Inboxes**, choose a **Maintenance agent**, and save. Model and reasoning effort are optional.
 
-After the user says it's saved, run `mailbox-ops status` and close with the effective state:
+After the user says it's saved, run `mailbox-ops status` and close with the effective state. Use `schedule.cadenceLabel`, `agentLabel` and `schedule.threadName` from its output:
 
 > **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
 
-If `schedule.paused` is true, add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
+If `schedule.paused` is true (the heartbeat is off or paused), add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
 
 Then say once: "When you ask me here, the agent selected for this chat does the work under the same contracts." Don't ask the user to change chat controls, and don't claim chat and schedule use the same agent unless you verified it. If the scheduled agent is Codex, add one line: Codex needs network access for scheduled checks (see the MailKeeper README).
 
@@ -135,7 +139,7 @@ Describe these truthfully:
 
 ### Reports
 
-One report per run. Give each inbox its own section, inbox name first, and say what happened and what changed, based on the receipt (`submit` output), then one next action:
+One report per run. Give each inbox its own section, inbox name first, and say what happened and what changed, then one next action. Take every fact from the `submit` output: each inbox's `outcome` and `code`, `movedByDestination`, `suggestions`, `urgent`, and the run ID for undo:
 
 > **work@example.com:** checked. Moved 14 by your approved rules (Newsletters 9, Calendar 5). 3 suggestions. 1 urgent: "Final notice …" from billing@… (left in the inbox).
 > **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the "MailKeeper – personal@example.com" Login in Settings → Secrets, then ask me to run MailKeeper.
@@ -143,7 +147,7 @@ One report per run. Give each inbox its own section, inbox name first, and say w
 
 When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed.
 
-If `begin` shows an effort warning, add one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it." For an unsupported agent, say instead: "Reasoning effort isn't supported for <agent> by MailKeeper yet."
+If `submit` reports `effortNotApplied`, add one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it." For an unsupported agent, say instead: "Reasoning effort isn't supported for <agent> by MailKeeper yet."
 
 ## Undo ("undo MailKeeper run <id>")
 

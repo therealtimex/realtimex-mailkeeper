@@ -14,6 +14,14 @@ const CONTRACT_TEMPLATE = path.join(__dirname, "..", "skills", "mailbox-cleanup"
 const LEGACY_CONTRACT = "MAILBOX.md";
 const SKILL_CLI = ".agents/skills/mailbox-cleanup/scripts/mailbox-ops.js";
 const { shellQuote } = core;
+const MANIFEST = require("../realtimex.plugin.json");
+const THREAD_NAME = "MailKeeper maintenance";
+
+/** The settings label for a cadence ("Daily"), or the raw value for a custom one. */
+function cadenceLabel(cadence) {
+  const field = MANIFEST.configSchema.find((entry) => entry.key === "CADENCE");
+  return field?.options?.find((option) => option.value === cadence)?.label || `Every ${cadence}`;
+}
 
 function codedError(message, code, statusCode = 500) {
   const error = new Error(message);
@@ -162,7 +170,7 @@ class MailKeeperService {
     const discovery = await this.discover();
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
-      name: "MailKeeper maintenance",
+      name: THREAD_NAME,
     });
     const inboxes = await this.syncInboxes(workspace, config, discovery, profile);
     const rules = await this.ensureRules(workspace, config, profile);
@@ -190,10 +198,13 @@ class MailKeeperService {
     const settings = await this.host.heartbeat.readSettings(workspace);
     this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
       cadence: config.cadence,
+      cadenceLabel: cadenceLabel(config.cadence),
+      heartbeatEnabled: settings?.enabled !== false,
       paused: heartbeat.explicitlyPaused === true || settings?.enabled === false,
       activeHours: settings?.activeHours || null,
       timezone: settings?.timezone || null,
       threadSlug: thread.slug,
+      threadName: thread.name || THREAD_NAME,
     });
 
     const next = {

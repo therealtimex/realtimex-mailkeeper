@@ -216,6 +216,10 @@ test("each inbox follows its own contract and only its own approved rules", () =
 
   assert.equal(submit.json.outcome, "completed");
   assert.equal(submit.json.guardReleased, true);
+  assert.deepEqual(submit.json.accounts.b.movedByDestination, { "Auto/Notifications": 2 });
+  assert.equal(submit.json.accounts.b.urgentCount, 1);
+  assert.deepEqual(submit.json.accounts.b.urgent, [{ from: "noreply@billing.example", subject: "Final notice: payment overdue" }]);
+  assert.equal(submit.json.effortNotApplied, false);
   const receipt = ws.receipt("r1");
   assert.equal(receipt.accounts.a.outcome, "completed");
   assert.equal(receipt.accounts.a.moved, 0);
@@ -504,6 +508,7 @@ test("status reports the four setup criteria per inbox and the schedule", () => 
   assert.deepEqual(status.inboxes.map((i) => [i.name, i.setupComplete]), [["a", true], ["b", false]]);
   assert.equal(status.schedule.paused, true);
   assert.equal(status.agent, "codex");
+  assert.equal(status.agentLabel, "Codex CLI");
 });
 
 test("the migration notice is owed once; the review status stays until confirmed", () => {

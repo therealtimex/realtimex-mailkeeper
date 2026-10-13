@@ -784,6 +784,30 @@ function himalayaParses(file) {
 // ---------------------------------------------------------------------------
 
 const CONTRACT_TEMPLATE = path.join(__dirname, "..", "templates", "MAILBOX.md");
+/**
+ * Display names the RealTimeX settings picker shows for terminal agents, for
+ * the setup closing message only. An unknown agent shows its key.
+ */
+const AGENT_LABELS = {
+  antigravity: "Antigravity CLI",
+  grok: "Grok CLI",
+  devin: "Devin CLI",
+  gemini: "Gemini CLI",
+  claude: "Claude Code",
+  codex: "Codex CLI",
+  qwen: "Qwen Code",
+  rtx: "RealtimeX Agent",
+  opencode: "OpenCode",
+  cursor: "Cursor Agent",
+  copilot: "GitHub Copilot",
+  kiro: "Kiro CLI",
+  kimi: "Kimi CLI",
+  kilocode: "Kilocode",
+  droid: "Factory Droid",
+  goose: "Goose",
+  iflow: "iFlow CLI",
+  pi: "Pi Coding Agent",
+};
 const DEFAULT_CAPS = {
   mode: "report-only",
   ageThresholdDays: 90,
@@ -1161,6 +1185,7 @@ const commands = {
       ok: true,
       configured,
       agent: configured ? rules.config.agent || null : null,
+      agentLabel: configured && rules.config.agent ? core.own(AGENT_LABELS, rules.config.agent) || rules.config.agent : null,
       model: configured ? rules.config.model || null : null,
       effort: configured ? rules.config.effort || null : null,
       schedule: configured ? rules.schedule || null : null,
@@ -1432,6 +1457,13 @@ const commands = {
         contractDigest: entry.contractDigest || null,
         mode: entry.mode || null,
         moved: run.actions.filter((a) => a.account === account).length,
+        // Report material: what moved where, what was suggested, what is urgent.
+        movedByDestination: run.actions
+          .filter((a) => a.account === account)
+          .reduce((counts, a) => ({ ...counts, [a.to]: (counts[a.to] || 0) + 1 }), {}),
+        suggestions: run.proposals.filter((p) => p.account === account).length,
+        urgent: run.urgent.filter((u) => u.account === account).slice(0, 5).map((u) => ({ from: u.from, subject: u.subject })),
+        urgentCount: run.urgent.filter((u) => u.account === account).length,
       });
     }
     const outcomes = Object.values(accounts).map((a) => a.outcome);
@@ -1473,6 +1505,9 @@ const commands = {
       proposals: receipt.proposals.length,
       urgent: receipt.urgent.length,
       guardReleased: released,
+      // The report owes one line when the requested effort was not applied.
+      effortNotApplied: Boolean(run.effort?.warning),
+      effortWarning: run.effort?.warning || null,
       queued: `.mailkeeper/outbox/${runId}.json`,
     });
   },

@@ -3,7 +3,7 @@
   "name": "realtimex-mailkeeper",
   "displayName": "RealTimeX MailKeeper",
   "version": "0.1.1",
-  "description": "Keeps each of your inboxes tidy under its own written contract, on a schedule or whenever you ask. To start, ask the agent in this workspace's chat to “set up MailKeeper.” Works with any IMAP provider through Himalaya.",
+  "description": "To start, ask this workspace's chat to “set up MailKeeper.” Then each inbox is kept tidy by its own contract, on a schedule or when you ask.",
   "author": {
     "name": "RealTimeX Team"
   },
@@ -126,27 +126,29 @@
       "required": true
     },
     {
-      "key": "MODE",
+      "key": "AGENT",
       "scope": "workspace",
-      "label": "Mode",
-      "type": "select",
+      "label": "Maintenance agent",
+      "type": "terminal-agent",
       "required": true,
-      "default": "report-only",
-      "description": "The most any inbox in this workspace may do on its own. Each inbox's contract can be stricter.",
-      "options": [
-        {
-          "value": "report-only",
-          "label": "Report only"
-        },
-        {
-          "value": "label-only",
-          "label": "Label only"
-        },
-        {
-          "value": "archive-promoted",
-          "label": "Archive promoted rules"
-        }
-      ]
+      "description": "Runs MailKeeper's scheduled checks. When you chat, the agent selected in that chat does the work under the same contracts."
+    },
+    {
+      "key": "MODEL",
+      "scope": "workspace",
+      "label": "Model",
+      "type": "terminal-agent-model",
+      "description": "Optional. Empty means the agent's default model.",
+      "agentKey": "AGENT"
+    },
+    {
+      "key": "EFFORT",
+      "scope": "workspace",
+      "label": "Reasoning effort",
+      "type": "terminal-agent-effort",
+      "agentKey": "AGENT",
+      "modelKey": "MODEL",
+      "description": "Optional. Applies when a model is selected; otherwise the agent's default is used."
     },
     {
       "key": "CADENCE",
@@ -180,13 +182,27 @@
       ]
     },
     {
-      "key": "AGE_THRESHOLD_DAYS",
+      "key": "MODE",
       "scope": "workspace",
-      "label": "Age threshold (days)",
-      "type": "number",
+      "label": "Mode",
+      "type": "select",
       "required": true,
-      "default": 90,
-      "description": "Starting value for new inbox contracts. Each contract can set its own."
+      "default": "report-only",
+      "description": "The most any inbox in this workspace may do on its own. Each inbox's contract can be stricter.",
+      "options": [
+        {
+          "value": "report-only",
+          "label": "Report only"
+        },
+        {
+          "value": "label-only",
+          "label": "Label only"
+        },
+        {
+          "value": "archive-promoted",
+          "label": "Archive promoted rules"
+        }
+      ]
     },
     {
       "key": "AGGRESSIVENESS",
@@ -212,37 +228,21 @@
       ]
     },
     {
+      "key": "AGE_THRESHOLD_DAYS",
+      "scope": "workspace",
+      "label": "Age threshold (days)",
+      "type": "number",
+      "required": true,
+      "default": 90,
+      "description": "Starting value for new inbox contracts. Each contract can set its own."
+    },
+    {
       "key": "VIP_SENDERS",
       "scope": "workspace",
       "label": "VIP senders",
       "type": "tag-list",
       "default": [],
       "description": "Never touched in any inbox. Add inbox-specific senders in that inbox's contract."
-    },
-    {
-      "key": "AGENT",
-      "scope": "workspace",
-      "label": "Maintenance agent",
-      "type": "terminal-agent",
-      "required": true,
-      "description": "Terminal agent that runs scheduled checks."
-    },
-    {
-      "key": "MODEL",
-      "scope": "workspace",
-      "label": "Model",
-      "type": "terminal-agent-model",
-      "description": "Optional. Empty means the agent's default model.",
-      "agentKey": "AGENT"
-    },
-    {
-      "key": "EFFORT",
-      "scope": "workspace",
-      "label": "Reasoning effort",
-      "type": "terminal-agent-effort",
-      "agentKey": "AGENT",
-      "modelKey": "MODEL",
-      "description": "Optional. Applies when a model is selected; otherwise the agent's default is used."
     }
   ],
   "permissions": []

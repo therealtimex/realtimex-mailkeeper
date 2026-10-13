@@ -109,6 +109,10 @@ test("provision seeds one report-only contract per selected inbox and one task",
   assert.deepEqual(rules.himalayaConfig.paths, [himalayaConfig]);
   assert.equal(rules.accounts.work.key, core.accountKey("work"));
   assert.equal((fs.statSync(path.join(dir, ".mailkeeper", "rules.json")).mode & 0o777).toString(8), "600");
+  assert.deepEqual(
+    [rules.schedule.cadenceLabel, rules.schedule.heartbeatEnabled, rules.schedule.paused, rules.schedule.threadName],
+    ["Daily", true, false, "MailKeeper maintenance"]
+  );
 });
 
 test("contracts are never overwritten and survive deselection", async () => {
@@ -214,6 +218,9 @@ test("a paused workspace stays paused after repair", async () => {
   const { service, workspace, calls } = harness({ paused: true, config: { EMAIL_ACCOUNTS: ["work"] } });
   const result = await service.provision(workspace);
   assert.equal(result.state, "paused_by_heartbeat");
+  const rules = JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", "rules.json"), "utf8"));
+  assert.equal(rules.schedule.paused, true);
+  assert.equal(rules.schedule.heartbeatEnabled, false);
   // MailKeeper never asks the host to enable heartbeat; the host keeps the pause.
   assert.equal(calls.upsert.length, 1);
   assert.equal(Object.keys(calls.upsert[0]).some((key) => /enable/i.test(key)), false);
