@@ -40,17 +40,20 @@ Check the inbox's current sign-in with `mailbox-ops config-check --account <name
 
 - **`signIn: "command"` or `"keyring"`** (for example a Keychain command set up via BizOps): keep that method. Don't ask the user to move the password. Use `--native` below.
 - **`inlineSecret: true`**: the settings file holds a password in plain text. Say only that the file stores a password directly. Recommend changing it with the provider and saving the new one in Secrets. Then continue with the Secrets route, which replaces that entry.
+- **A saved Login may already exist for the address.** Look in `realtimex-pp-cli list-secrets --agent` for a Login whose display name contains the address. If you find one, offer it before asking for a new one, because it may hold the normal account password rather than a mail-app password:
+
+  > You already have a Login named “work@example.com”. Does its password work for mail apps (for Gmail, that's an app password)? If yes, I'll use it. If not, add a new Login named “MailKeeper – work@example.com”.
+
+  Use it only after the user says yes. Never reuse a Login silently.
 - **Otherwise**, give this one instruction:
 
-  > Open **Settings → Secrets** and add a **Login** named **mailkeeper-work-example**. Put the password in **Password**. If you limit which workspaces can use it, include this one. Tell me when it's saved. Please don't paste the password here.
-
-  Suggest a name built from the address, for example `mailkeeper-work-example` for work@example.com.
+  > Open **Settings → Secrets** and add a **Login** named **MailKeeper – work@example.com**. Put the password in **Password**. If you limit which workspaces can use it, include this one. Tell me when it's saved. Please don't paste the password here.
 
   If the provider needs an **app password** (Gmail, iCloud, Yahoo, or Outlook.com with 2-step verification), say so before they save, and link the provider's help page. If the provider doesn't allow IMAP password sign-in, stop: "work@example.com doesn't allow password sign-in for mail apps, so MailKeeper can't connect to it yet." Don't retry.
 
 When the user says it's saved, check only the Login's metadata with `realtimex-pp-cli list-secrets --agent`. Find it by its `displayName`. It must be enabled, include `password` in `fieldNames`, and be available to this workspace (`workspaceSlugs` empty or listing it). Never read its value. Never change a Login's workspace scope: if this workspace isn't included, ask the user to include it in Settings → Secrets.
 
-Pass the Login's exact `reference` from that metadata (for example `secret://mailkeeper-work-example-1a2b3c4d`) to `--password-ref`. Secrets generates it from the display name plus a short suffix, so never build it from the name the user typed. Never ask the user for it, and in chat call the Login by its display name. Then:
+Pass the Login's exact `reference` from that metadata (for example `secret://mailkeeper-work-example-com-1a2b3c4d`) to `--password-ref`. Secrets generates it from the display name plus a short suffix, so never build it from the name the user typed. Never ask the user for it, and in chat call the Login by its display name. Then:
 
 ```sh
 mailbox-ops account-config --account <name> --email <address> --host <imap host> [--port 993] [--encryption tls|start-tls|none] [--login <user>]
