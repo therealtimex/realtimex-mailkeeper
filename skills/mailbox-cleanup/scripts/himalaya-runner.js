@@ -33,9 +33,15 @@ const MAX_STDOUT = 64 * 1024 * 1024;
 const MAX_STDERR = 64 * 1024;
 const MUTATING = new Set(["message-move", "folder-add"]);
 
+/** Ends main() with one result; written once, after main returns. */
+class Result {
+  constructor(value) {
+    this.value = value;
+  }
+}
+
 function emit(result) {
-  process.stdout.write(`${JSON.stringify(result)}\n`);
-  process.exit(result.ok ? 0 : 1);
+  throw new Result(result);
 }
 
 function parseArgs(argv) {
@@ -180,13 +186,27 @@ function main() {
   }
   const stdout = String(result.stdout || "").trim();
   if (!stdout) emit({ ok: true, op, data: null });
+  let data;
   try {
-    emit({ ok: true, op, data: JSON.parse(stdout) });
+    data = JSON.parse(stdout);
   } catch {
     emit({ ok: false, op, code: MUTATING.has(op) ? "MAILKEEPER_MUTATION_UNCERTAIN" : "MAILKEEPER_OPERATION_FAILED" });
   }
+  emit({ ok: true, op, data });
 }
 
-if (require.main === module) main();
+if (require.main === module) {
+  let result;
+  try {
+    main();
+    result = { ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" };
+  } catch (error) {
+    result = error instanceof Result ? error.value : { ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" };
+  }
+  // Exit naturally: on macOS a pipe write is asynchronous, and process.exit()
+  // right after it would cut a large envelope page short.
+  process.exitCode = result.ok ? 0 : 1;
+  process.stdout.write(`${JSON.stringify(result)}\n`);
+}
 
 module.exports = { himalayaArgs, classify, cleanName };
