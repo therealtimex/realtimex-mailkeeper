@@ -7,9 +7,13 @@ const crypto = require("crypto");
 const { hostFor } = require("./host");
 const { resolveProfileConfig } = require("./config");
 const mailbox = require("./mailbox");
+const core = require("../skills/mailbox-cleanup/scripts/mailkeeper-core");
 
 const PLUGIN_ID = "com.realtimex.mailkeeper";
-const TEMPLATE_DIR = path.join(__dirname, "..", "templates");
+const CONTRACT_TEMPLATE = path.join(__dirname, "..", "skills", "mailbox-cleanup", "templates", "MAILBOX.md");
+const LEGACY_CONTRACT = "MAILBOX.md";
+const SKILL_CLI = ".agents/skills/mailbox-cleanup/scripts/mailbox-ops.js";
+const { shellQuote } = core;
 
 function codedError(message, code, statusCode = 500) {
   const error = new Error(message);
@@ -30,6 +34,40 @@ function taskIdentity(workspaceId) {
 
 function threadKey(workspaceId) {
   return `mailkeeper-maintenance-${workspaceId}`;
+}
+
+/**
+ * Resolve `relative` under `root`, refusing a path that escapes it or passes
+ * through an existing symlink, so a planted link cannot redirect a write.
+ */
+function safeWorkspacePath(root, relative) {
+  const target = path.resolve(root, relative);
+  const rel = path.relative(root, target);
+  if (!rel || rel.startsWith("..") || path.isAbsolute(rel)) {
+    throw codedError("Path escapes the workspace", "MAILKEEPER_CONTRACT_INVALID", 409);
+  }
+  let current = root;
+  for (const part of rel.split(path.sep)) {
+    current = path.join(current, part);
+    let stat;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      break;
+    }
+    if (stat.isSymbolicLink()) {
+      throw codedError("Path passes through a symlink", "MAILKEEPER_CONTRACT_INVALID", 409);
+    }
+  }
+  return target;
+}
+
+/** Write JSON atomically and owner-only: temp file in the same directory, then rename. */
+function writeJsonAtomic(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const temp = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+  fs.writeFileSync(temp, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
+  fs.renameSync(temp, file);
 }
 
 class MailKeeperService {
@@ -58,6 +96,12 @@ class MailKeeperService {
   activeRunKey(workspace) {
     return `ws-${workspace.id}-active`;
   }
+  inboxKeysKey(workspace) {
+    return `ws-${workspace.id}-inbox-keys`;
+  }
+  migrationKey(workspace) {
+    return `ws-${workspace.id}-migration`;
+  }
 
   // -------------------------------------------------------------------------
   // Config
@@ -70,6 +114,21 @@ class MailKeeperService {
     const raw =
       this.api.getConfig({ workspaceId: workspace.id, workspaceSlug: workspace.slug }) || {};
     return resolveProfileConfig(raw);
+  }
+
+  // -------------------------------------------------------------------------
+  // Discovery
+  // -------------------------------------------------------------------------
+
+  /** Account names from the resolved Himalaya config; never authenticates. */
+  async discover() {
+    const himalayaConfig = mailbox.resolveConfig();
+    try {
+      const accounts = await mailbox.listAccounts(himalayaConfig);
+      return { himalayaConfig, accounts, code: null };
+    } catch (error) {
+      return { himalayaConfig, accounts: null, code: error.code || "MAILKEEPER_OPERATION_FAILED" };
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -98,44 +157,28 @@ class MailKeeperService {
       return { state: "config_invalid", errors };
     }
 
-    const readiness = {};
-    const authErrors = [];
-    for (const account of config.emailAccounts) {
-      const probe = await mailbox.checkAccount(account);
-      readiness[account] = probe;
-      if (!probe.ok) authErrors.push(probe.error);
-    }
-    if (authErrors.length) {
-      await this.host.heartbeat.removeManagedTask(workspace, {
-        id: taskIdentity(workspace.id),
-      });
-      await this.store.set(this.profileKey(workspace), {
-        ...profile,
-        state: "auth_missing",
-        errors: authErrors,
-        updatedAt: new Date().toISOString(),
-      });
-      return { state: "auth_missing", errors: authErrors };
-    }
-
+    // Provisioned means scheduled and configured, not "IMAP verified": the
+    // terminal checks each inbox when a run starts.
+    const discovery = await this.discover();
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
-      name: `MailKeeper: ${config.emailAccounts.join(", ")}`.slice(0, 180),
+      name: "MailKeeper maintenance",
     });
-
-    this.seedContract(workspace, config);
-
-    const rules = await this.ensureRules(workspace, config);
-    this.syncRulesFile(workspace, config, rules, readiness);
+    const inboxes = await this.syncInboxes(workspace, config, discovery, profile);
+    const rules = await this.ensureRules(workspace, config, profile);
 
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
-      name: `MailKeeper maintenance (${config.emailAccounts.join(", ")})`.slice(0, 120),
+      name: "MailKeeper maintenance",
       interval: config.cadence,
       executor: "agent",
       agent: config.agent,
       ...(config.model ? { model: config.model } : {}),
-      prompt: this.buildMaintenancePrompt(workspace, config, thread, rules),
+      // Rewriting the whole task drops any effort key a previous save wrote.
+      ...(Object.keys(config.effort.runtimeOptionValues).length
+        ? { runtimeOptionValues: config.effort.runtimeOptionValues }
+        : {}),
+      prompt: this.buildMaintenancePrompt(workspace, config, thread, rules, inboxes),
       threadSlug: thread.slug,
       useProvidedThreadSlug: true,
       directPrompt: true,
@@ -144,11 +187,25 @@ class MailKeeperService {
       promptArtifactCategory: "mailkeeper-maintenance",
       promptArtifactRetention: "durable",
     });
+    const settings = await this.host.heartbeat.readSettings(workspace);
+    this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
+      cadence: config.cadence,
+      paused: heartbeat.explicitlyPaused === true || settings?.enabled === false,
+      activeHours: settings?.activeHours || null,
+      timezone: settings?.timezone || null,
+      threadSlug: thread.slug,
+    });
 
     const next = {
       state: heartbeat.explicitlyPaused ? "paused_by_heartbeat" : "ready",
       errors: [],
+      warnings: config.effort.warning ? [config.effort.warning] : [],
       emailAccounts: config.emailAccounts,
+      inboxes: Object.fromEntries(
+        Object.entries(inboxes).map(([name, inbox]) => [name, { key: inbox.key, status: inbox.status, code: inbox.code }])
+      ),
+      discovery: { code: discovery.code, configSource: discovery.himalayaConfig.source },
+      effort: { requested: config.effort.requested, forwarded: config.effort.forwarded },
       mode: config.mode,
       threadId: thread.id,
       threadSlug: thread.slug,
@@ -170,7 +227,7 @@ class MailKeeperService {
       state: "disabled",
       updatedAt: new Date().toISOString(),
     });
-    // Thread, contract file, rules and run receipts are intentionally kept:
+    // Thread, contracts, rules and run receipts are intentionally kept:
     // they are the user's audit trail and survive re-enable.
   }
 
@@ -185,81 +242,183 @@ class MailKeeperService {
       try {
         await this.provision(workspace);
       } catch (error) {
-        // Message carries the detail: the host log line prints only the message.
-        this.api.log?.error?.(
-          `MailKeeper boot provision failed for ${workspace.slug}: ${error.message}`,
-          { workspace: workspace.slug, stack: error.stack }
-        );
+        this.api.log?.error?.(`MailKeeper boot provision failed for ${workspace.slug}`, {
+          workspace: workspace.slug,
+          code: error?.code || null,
+        });
       }
     }
   }
 
-  seedContract(workspace, config) {
-    const target = path.join(workspace.workingDirectory, config.contractPath);
-    if (fs.existsSync(target)) return false; // never overwrite user edits
-    const template = fs.readFileSync(
-      path.join(TEMPLATE_DIR, "MAILBOX.md"),
-      "utf8"
-    );
-    const vip = config.vipSenders.length
-      ? config.vipSenders.map((entry) => `- ${entry}`).join("\n")
-      : "- (none yet)";
-    const rendered = template
-      .replaceAll("{{EMAIL_ACCOUNT}}", config.emailAccounts.join(", "))
-      .replaceAll("{{MODE}}", config.mode)
-      .replaceAll("{{AGE_THRESHOLD_DAYS}}", String(config.ageThresholdDays))
-      .replaceAll("{{AGGRESSIVENESS}}", config.aggressiveness)
-      .replaceAll("{{VIP_SENDERS}}", vip)
-      .replaceAll("{{PROTECTED_DOMAINS}}", config.protectedDomains.join(", "));
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, rendered, "utf8");
-    return true;
+  // -------------------------------------------------------------------------
+  // Inbox contracts
+  // -------------------------------------------------------------------------
+
+  /**
+   * One contract per selected inbox at mailboxes/<key>/MAILBOX.md. A contract
+   * is created only when absent and never rewritten afterwards; removing an
+   * inbox from the selection leaves its contract in place for later reuse.
+   */
+  async syncInboxes(workspace, config, discovery, profile) {
+    const root = workspace.workingDirectory;
+    const keys = (await this.store.get(this.inboxKeysKey(workspace))) || {};
+    const migration = await this.ensureMigration(workspace, config, profile);
+    const discovered = discovery.accounts ? new Set(discovery.accounts.map((entry) => entry.name)) : null;
+    const inboxes = Object.create(null);
+
+    for (const name of config.emailAccounts) {
+      const key = core.accountKey(name);
+      const relative = core.contractRelativePath(key);
+      const inbox = { key, contract: relative, status: "missing", code: null, migrated: null };
+      core.setOwn(inboxes, name, inbox);
+
+      if (Object.prototype.hasOwnProperty.call(keys, key) && keys[key] !== name) {
+        inbox.status = "invalid";
+        inbox.code = "MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH";
+        continue;
+      }
+      let file;
+      try {
+        file = safeWorkspacePath(root, relative);
+      } catch (error) {
+        inbox.status = "invalid";
+        inbox.code = error.code;
+        continue;
+      }
+
+      if (!fs.existsSync(file)) {
+        if (!discovered) {
+          inbox.code = discovery.code;
+          continue;
+        }
+        if (!discovered.has(name)) {
+          inbox.code = "MAILKEEPER_ACCOUNT_NOT_FOUND";
+          continue;
+        }
+        inbox.migrated = this.seedContract(root, file, name, config, migration);
+      }
+      keys[key] = name;
+      const parsed = core.parseContract(fs.readFileSync(file, "utf8"), name);
+      inbox.status = parsed.status;
+      inbox.code = parsed.code;
+      if (!inbox.code && discovered && !discovered.has(name)) inbox.code = "MAILKEEPER_ACCOUNT_NOT_FOUND";
+    }
+
+    await this.store.set(this.inboxKeysKey(workspace), keys);
+    return inboxes;
+  }
+
+  /**
+   * Record, once, how a v0.1.1 root MAILBOX.md maps onto per-inbox contracts.
+   * The root file itself is never modified or moved.
+   */
+  async ensureMigration(workspace, config, profile) {
+    const existing = await this.store.get(this.migrationKey(workspace));
+    if (existing) return existing;
+    const legacy = path.join(workspace.workingDirectory, LEGACY_CONTRACT);
+    let stat = null;
+    try {
+      stat = fs.lstatSync(legacy);
+    } catch {
+      /* no legacy contract */
+    }
+    const record = stat?.isFile()
+      ? {
+          legacy: LEGACY_CONTRACT,
+          legacyDigest: core.digest(fs.readFileSync(legacy, "utf8")),
+          previouslySelected: Array.isArray(profile.emailAccounts) && profile.emailAccounts.length
+            ? profile.emailAccounts
+            : config.emailAccounts,
+          recordedAt: new Date().toISOString(),
+        }
+      : { legacy: null, previouslySelected: [], recordedAt: new Date().toISOString() };
+    await this.store.set(this.migrationKey(workspace), record);
+    return record;
+  }
+
+  seedContract(root, file, name, config, migration) {
+    const fromLegacy = Boolean(migration.legacy) && migration.previouslySelected.includes(name);
+    let content;
+    let migrated = null;
+    if (fromLegacy && migration.previouslySelected.length === 1) {
+      // The only inbox the old shared contract governed: carry its full text
+      // over. Without a settings block it stays report-only until reviewed.
+      const legacy = fs.readFileSync(path.join(root, migration.legacy), "utf8");
+      content = [
+        legacy.trimEnd(),
+        "",
+        "## About this copy",
+        "",
+        `This contract was copied from your old shared MAILBOX.md, which is kept for reference but no longer used. Until you review it with the agent, MailKeeper only reports for ${name} and moves nothing. Ask the agent to “review the ${name} contract.”`,
+        "",
+      ].join("\n");
+      migrated = "copied";
+    } else {
+      const policy = core.draftPolicy(name, config, { reviewRequired: fromLegacy });
+      const note = fromLegacy
+        ? `\nYour old MAILBOX.md, which applied to all inboxes, is kept at the workspace root for reference but is no longer used. Review with the agent how its preferences apply to ${name}; until then MailKeeper only reports for this inbox.\n`
+        : "";
+      content = core.renderContract(fs.readFileSync(CONTRACT_TEMPLATE, "utf8"), {
+        account: name,
+        protectedDomains: config.protectedDomains,
+        policy,
+        note,
+      });
+      migrated = fromLegacy ? "review" : null;
+    }
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    safeWorkspacePath(root, path.relative(root, file));
+    try {
+      fs.writeFileSync(file, content, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if (error.code !== "EEXIST") throw error; // created concurrently: keep theirs
+    }
+    return migrated;
   }
 
   /**
    * `.mailkeeper/rules.json` is the contract between the plugin and the
-   * workspace-side `mailbox-ops.js`: effective config + promoted rules.
-   * Rewritten on every provision; the script never edits it.
+   * workspace-side `mailbox-ops.js`: workspace caps, the pinned Himalaya
+   * config, inbox keys, and account-scoped approved rules. It is a generated
+   * view, rewritten on every provision; the contracts stay the user's policy.
    */
-  syncRulesFile(workspace, config, rules, readiness = {}) {
-    const accounts = {};
-    for (const account of config.emailAccounts) {
-      const folders = readiness[account]?.folders || [];
-      accounts[account] = {
-        archiveFolder: folders.includes("[Gmail]/All Mail")
-          ? "[Gmail]/All Mail"
-          : "Archive",
-        sentFolder:
-          folders.find((name) => /^(\[Gmail\]\/)?Sent( Mail)?$/i.test(name)) ||
-          "Sent",
-      };
-    }
-    const target = path.join(workspace.workingDirectory, ".mailkeeper", "rules.json");
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(
-      target,
-      `${JSON.stringify(
-        {
-          revision: rules.revision,
-          writtenAt: new Date().toISOString(),
-          config: {
-            emailAccounts: config.emailAccounts,
-            accounts,
-            mode: config.mode,
-            ageThresholdDays: config.ageThresholdDays,
-            aggressiveness: config.aggressiveness,
-            promotablePasses: config.promotablePasses,
-            autoFolderPrefix: config.autoFolderPrefix,
-            protectedDomains: config.protectedDomains,
-            vipSenders: [...new Set([...config.vipSenders, ...(rules.vipSenders || [])])],
-          },
-          promoted: rules.promoted,
+  syncRulesFile(workspace, config, rules, discovery, inboxes, schedule) {
+    const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "rules.json"));
+    writeJsonAtomic(target, {
+      schemaVersion: 2,
+      revision: rules.revision,
+      writtenAt: new Date().toISOString(),
+      himalayaConfig: {
+        paths: discovery.himalayaConfig.paths,
+        target: discovery.himalayaConfig.target,
+        source: discovery.himalayaConfig.source,
+      },
+      config: {
+        emailAccounts: config.emailAccounts,
+        mode: config.mode,
+        modeCeiling: config.modeCeiling,
+        ageThresholdDays: config.ageThresholdDays,
+        aggressiveness: config.aggressiveness,
+        promotablePasses: config.promotablePasses,
+        autoFolderPrefix: config.autoFolderPrefix,
+        protectedDomains: config.protectedDomains,
+        vipSenders: config.vipSenders,
+        agent: config.agent,
+        model: config.model || null,
+        effort: {
+          requested: config.effort.requested,
+          forwarded: config.effort.forwarded,
+          warning: config.effort.warning,
         },
-        null,
-        2
-      )}\n`,
-      "utf8"
-    );
+      },
+      // As of this provision; settings saves and repairs refresh it.
+      schedule,
+      accounts: Object.fromEntries(
+        Object.entries(inboxes).map(([name, inbox]) => [name, { key: inbox.key, contract: inbox.contract }])
+      ),
+      legacyContract: fs.existsSync(path.join(workspace.workingDirectory, LEGACY_CONTRACT)) ? LEGACY_CONTRACT : null,
+      promoted: rules.promoted.filter((rule) => typeof rule.account === "string"),
+    });
   }
 
   /**
@@ -275,8 +434,8 @@ class MailKeeperService {
       let body;
       try {
         body = JSON.parse(fs.readFileSync(full, "utf8"));
-      } catch (error) {
-        this.api.log?.warn?.("MailKeeper receipt unreadable", { file, error: error.message });
+      } catch {
+        this.api.log?.warn?.("MailKeeper receipt unreadable", { file });
         fs.renameSync(full, `${full}.invalid`);
         continue;
       }
@@ -285,7 +444,7 @@ class MailKeeperService {
         fs.unlinkSync(full);
         ingested += 1;
       } catch (error) {
-        this.api.log?.warn?.("MailKeeper receipt rejected", { file, error: error.message });
+        this.api.log?.warn?.("MailKeeper receipt rejected", { file, code: error?.code || null });
         fs.renameSync(full, `${full}.rejected`);
       }
     }
@@ -296,18 +455,47 @@ class MailKeeperService {
   // Rules
   // -------------------------------------------------------------------------
 
-  async ensureRules(workspace, config) {
+  /**
+   * Approved rules are scoped to one inbox. A v0.1.1 rule without an account
+   * is kept with that account only when the old profile had exactly one
+   * inbox; otherwise it goes back to the suggestions, flagged for review,
+   * rather than defaulting to whichever inbox happens to be first.
+   */
+  async ensureRules(workspace, config, profile = {}) {
     let rules = await this.store.get(this.rulesKey(workspace));
     if (!rules) {
       rules = {
+        schemaVersion: 2,
         revision: 0,
         promoted: [],
         proposed: [],
-        vipSenders: config.vipSenders,
         updatedAt: new Date().toISOString(),
       };
       await this.store.set(this.rulesKey(workspace), rules);
+      return rules;
     }
+    if (rules.schemaVersion === 2) return rules;
+
+    const previous = Array.isArray(profile.emailAccounts) ? profile.emailAccounts : [];
+    const soleAccount = previous.length === 1 ? previous[0] : null;
+    const promoted = [];
+    const proposed = [...(rules.proposed || [])].map((rule) =>
+      typeof rule.account === "string" ? rule : { ...rule, reviewRequired: true }
+    );
+    for (const rule of rules.promoted || []) {
+      if (typeof rule.account === "string") promoted.push(rule);
+      else if (soleAccount) promoted.push({ ...rule, account: soleAccount, scopedFrom: "v0.1.1-single-account" });
+      else proposed.push({ ...rule, reviewRequired: true, demotedReason: "legacy-unscoped" });
+    }
+    rules = {
+      ...rules,
+      schemaVersion: 2,
+      promoted,
+      proposed,
+      revision: (rules.revision || 0) + 1,
+      updatedAt: new Date().toISOString(),
+    };
+    await this.store.set(this.rulesKey(workspace), rules);
     return rules;
   }
 
@@ -322,6 +510,9 @@ class MailKeeperService {
     const proposal = rules.proposed.find((entry) => entry.id === ruleId);
     if (!proposal)
       throw codedError(`Unknown proposed rule ${ruleId}`, "MAILKEEPER_RULE_UNKNOWN", 404);
+    if (typeof proposal.account !== "string" || !config.emailAccounts.includes(proposal.account)) {
+      throw codedError("Rule is not scoped to a selected inbox", "MAILKEEPER_RULE_NOT_PROMOTABLE", 409);
+    }
     if (!config.promotablePasses.includes(proposal.pass)) {
       throw codedError(
         `Pass "${proposal.pass}" is not promotable at aggressiveness "${config.aggressiveness}"`,
@@ -330,15 +521,16 @@ class MailKeeperService {
       );
     }
     rules.proposed = rules.proposed.filter((entry) => entry.id !== ruleId);
+    const { reviewRequired, demotedReason, ...rule } = proposal;
     rules.promoted.push({
-      ...proposal,
+      ...rule,
       promotedAt: new Date().toISOString(),
       promotedBy: user.id,
     });
     rules.revision += 1;
     rules.updatedAt = new Date().toISOString();
     await this.store.set(this.rulesKey(workspace), rules);
-    await this.provision(workspace); // refresh the prompt with the new rule set
+    await this.provision(workspace); // refresh rules.json and the prompt
     return { ruleId, revision: rules.revision };
   }
 
@@ -364,8 +556,8 @@ class MailKeeperService {
   // -------------------------------------------------------------------------
 
   /**
-   * Record a run receipt submitted by the maintenance agent via the
-   * plugin-owned helper (templates/submit-run.cjs). Idempotent on runId.
+   * Record a run receipt the workspace helper queued in the outbox.
+   * Idempotent on runId.
    */
   async submitRun(workspace, body) {
     const runId = text(body.runId, 80);
@@ -381,20 +573,29 @@ class MailKeeperService {
         400
       );
     }
+    const accounts =
+      body.accounts && typeof body.accounts === "object" && !Array.isArray(body.accounts)
+        ? body.accounts
+        : {};
     const receipt = {
       runId,
       workspaceId: workspace.id,
       outcome,
-      mode: text(body.mode, 40),
+      trigger: text(body.trigger, 20) || null,
       startedAt: text(body.startedAt, 40),
       finishedAt: new Date().toISOString(),
-      snapshot: body.snapshot && typeof body.snapshot === "object" ? body.snapshot : null,
-      // Every mutation, by UID, so /undo can reverse it exactly.
+      rulesRevision: Number.isInteger(body.rulesRevision) ? body.rulesRevision : null,
+      // Per inbox: outcome, fixed code, contract digest and effective mode.
+      accounts,
+      // Every confirmed move with its account, source and destination.
       actions: Array.isArray(body.actions) ? body.actions.slice(0, 5000) : [],
-      // Things the agent found but was not allowed to act on.
+      // Moves whose result is unknown; never replayed automatically.
+      uncertain: Array.isArray(body.uncertain) ? body.uncertain.slice(0, 200) : [],
+      // Things found but not allowed to act on.
       proposals: Array.isArray(body.proposals) ? body.proposals.slice(0, 200) : [],
       // Urgency triage hits: never touched, always surfaced.
       urgent: Array.isArray(body.urgent) ? body.urgent.slice(0, 200) : [],
+      effort: body.effort && typeof body.effort === "object" ? body.effort : null,
       summary: text(body.summary, 4000),
       undoneAt: null,
     };
@@ -404,16 +605,18 @@ class MailKeeperService {
     index.unshift({ runId, outcome, finishedAt: receipt.finishedAt, actions: receipt.actions.length });
     await this.store.set(this.runIndexKey(workspace), index.slice(0, 500));
 
-    // Fold proposals into the rules ledger so a human can promote them.
-    if (receipt.proposals.length) {
+    // Fold account-scoped suggestions into the rules ledger so a human can
+    // approve them; a suggestion without an inbox is never recorded.
+    const scoped = receipt.proposals.filter((proposal) => typeof proposal?.account === "string");
+    if (scoped.length) {
       const { config } = this.profileConfig(workspace);
       const rules = await this.ensureRules(workspace, config);
       const known = new Set([
         ...rules.promoted.map((entry) => entry.id),
         ...rules.proposed.map((entry) => entry.id),
       ]);
-      for (const proposal of receipt.proposals) {
-        const id = text(proposal.id, 120) || ruleIdFor(proposal);
+      for (const proposal of scoped) {
+        const id = text(proposal.id, 120) || core.ruleId(proposal);
         if (known.has(id)) continue;
         rules.proposed.push({ ...proposal, id, firstSeenRunId: runId });
         known.add(id);
@@ -426,35 +629,21 @@ class MailKeeperService {
     return { runId, reused: false, actions: receipt.actions.length };
   }
 
+  /**
+   * Mailbox access needs the terminal credential path, which the plugin
+   * server cannot borrow. Undo therefore always happens in the workspace chat.
+   */
   async undoRun(workspace, body, user) {
     if (!user?.id)
       throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const runId = text(body.runId, 80);
     const receipt = await this.store.get(this.runKey(workspace, runId));
     if (!receipt) throw codedError(`Unknown run ${runId}`, "MAILKEEPER_RUN_UNKNOWN", 404);
-    if (receipt.undoneAt)
-      return { runId, reused: true, undoneAt: receipt.undoneAt };
-    const { config, errors } = this.profileConfig(workspace);
-    if (errors.length)
-      throw codedError(errors.join(" "), "MAILKEEPER_CONFIG_NOT_READY", 409);
-    const result = { reversed: 0, skipped: [], dryRun: body.dryRun === true };
-    for (const account of config.emailAccounts) {
-      const actions = receipt.actions.filter(
-        (action) => (action.account || config.emailAccounts[0]) === account
-      );
-      if (!actions.length) continue;
-      const partial = await mailbox.undoActions(account, actions, {
-        dryRun: result.dryRun,
-      });
-      result.reversed += partial.reversed;
-      result.skipped.push(...partial.skipped.map((entry) => ({ account, ...entry })));
-    }
-    if (!body.dryRun) {
-      receipt.undoneAt = new Date().toISOString();
-      receipt.undoneBy = user.id;
-      await this.store.set(this.runKey(workspace, runId), receipt);
-    }
-    return { runId, reused: false, ...result };
+    throw codedError(
+      `Undo runs in the workspace chat. Ask the agent: “undo MailKeeper run ${runId}”.`,
+      "MAILKEEPER_TERMINAL_REQUIRED",
+      409
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -499,6 +688,13 @@ class MailKeeperService {
         ageThresholdDays: config.ageThresholdDays,
         autoFolderPrefix: config.autoFolderPrefix,
         protectedDomains: config.protectedDomains,
+        agent: config.agent,
+        model: config.model || null,
+        effort: {
+          requested: config.effort.requested,
+          forwarded: config.effort.forwarded,
+          warning: config.effort.warning,
+        },
       },
       errors,
       heartbeat,
@@ -521,7 +717,8 @@ class MailKeeperService {
   /**
    * Scheduler admission. The host honours `{ skipLaunch, skipReason }`; every
    * other returned key is merged into the launch metadata the agent sees, which
-   * is how RUN_ID reaches the maintenance prompt.
+   * is how RUN_ID reaches the maintenance prompt. Effort compatibility never
+   * skips a run.
    */
   async admitHeartbeat(context) {
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
@@ -555,19 +752,44 @@ class MailKeeperService {
   /**
    * `dispatch.dispatchStatus` is the host's classification of the executor
    * event: anything other than `running` ends the occurrence. Ingest whatever
-   * the agent queued and release the single-flight lock.
+   * the agent queued, then release both the scheduler marker and the
+   * workspace run guard — the guard only when that run recorded no move whose
+   * outcome is unknown.
    */
   async recordHeartbeatLifecycle(context) {
     const status = String(context.dispatch?.dispatchStatus || "").toLowerCase();
     if (!status || status === "running") return;
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
     if (!workspace) return;
-    await this.ingestOutbox(workspace); // submitRun clears the lock on success
+    const active = await this.store.get(this.activeRunKey(workspace));
+    await this.ingestOutbox(workspace); // submitRun clears the marker on success
+    if (active?.runId) this.releaseRunGuard(workspace, active.runId);
     await this.store.set(this.activeRunKey(workspace), null);
   }
 
+  releaseRunGuard(workspace, runId) {
+    const state = path.join(workspace.workingDirectory, ".mailkeeper");
+    let guard;
+    try {
+      guard = JSON.parse(fs.readFileSync(path.join(state, "run.lock"), "utf8"));
+    } catch {
+      return false;
+    }
+    if (guard?.runId !== runId) return false;
+    let run = null;
+    try {
+      run = JSON.parse(fs.readFileSync(path.join(state, "runs", `${path.basename(runId)}.json`), "utf8"));
+    } catch {
+      /* no run record: nothing was attempted */
+    }
+    if (run?.pending || (Array.isArray(run?.uncertain) && run.uncertain.length)) return false;
+    fs.rmSync(path.join(state, "run.lock"), { force: true });
+    return true;
+  }
+
   async resolveHeartbeatLaunchPolicy() {
-    // Read-only mailbox work; no extra confinement beyond the host default.
+    // Mailbox work runs through the skill helper; no extra confinement beyond
+    // the host default.
     return {};
   }
 
@@ -575,49 +797,48 @@ class MailKeeperService {
   // Prompt
   // -------------------------------------------------------------------------
 
-  buildMaintenancePrompt(workspace, config, thread, rules) {
-    const promoted = rules.promoted.length
-      ? rules.promoted
-          .map((rule) => `- [${rule.pass}] ${rule.id}: ${rule.query} → ${rule.action}`)
-          .join("\n")
-      : "- (none promoted yet — this run is report-only regardless of MODE)";
+  buildMaintenancePrompt(workspace, config, thread, rules, inboxes) {
+    const accounts = config.emailAccounts;
+    const cli = `node ${SKILL_CLI}`;
+    const approved = (account) => {
+      const list = rules.promoted.filter((rule) => rule.account === account);
+      return list.length
+        ? list.map((rule) => `      - [${rule.pass}] ${rule.id}: ${rule.query} → ${rule.action}`).join("\n")
+        : "      - (none approved — this inbox is report-only on scheduled runs)";
+    };
+    const effortNote = config.effort.warning
+      ? config.effort.warning.reason === "unmapped-agent"
+        ? `EFFORT: the requested reasoning effort "${config.effort.requested}" isn't applied: MailKeeper doesn't support it for ${config.agent} yet. Say so in this run's report (one line), even if nothing else happened.`
+        : `EFFORT: the requested reasoning effort "${config.effort.requested}" isn't applied because no model is selected in MailKeeper settings. Say so in this run's report (one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it."), even if nothing else happened.`
+      : null;
     return [
-      `You are the MailKeeper maintenance agent for ${config.emailAccounts.length === 1 ? "account" : "accounts"} ${config.emailAccounts.map((a) => `"${a}"`).join(", ")} in workspace "${workspace.slug}".`,
-      `Use the workspace skill "mailbox-cleanup". Read ${config.contractPath} first; it is the human-owned policy and outranks this prompt.`,
+      `You are the MailKeeper maintenance agent for workspace "${workspace.slug}". It looks after ${accounts.length} ${accounts.length === 1 ? "inbox" : "inboxes"}.`,
+      'Use the workspace skill "mailbox-cleanup". Each inbox follows its own contract, listed below; read it before working on that inbox. The contract outranks this prompt. The root MAILBOX.md, if present, is an old file kept for reference and is not policy.',
       "",
-      `MODE: ${config.mode}${config.modeCappedByCeiling ? ` (capped from ${config.requestedMode} by the global ceiling)` : ""}`,
-      `AGE THRESHOLD: ${config.ageThresholdDays} days`,
-      `AGGRESSIVENESS: ${config.aggressiveness} (promotable passes: ${config.promotablePasses.join(", ")})`,
-      `AUTO FOLDER PREFIX: ${config.autoFolderPrefix}`,
-      `PROTECTED DOMAINS (never touch): ${config.protectedDomains.join(", ") || "(none)"}`,
+      `WORKSPACE CAPS: mode ${config.mode}${config.modeCappedByCeiling ? ` (capped from ${config.requestedMode} by the global ceiling)` : ""}; aggressiveness ${config.aggressiveness}; protected domains ${config.protectedDomains.join(", ") || "(none)"}. A contract can only be stricter; the helper enforces both.`,
+      ...(effortNote ? [effortNote] : []),
       "",
-      "PROMOTED RULES (the only rules you may execute unattended):",
-      promoted,
-      "",
-      "Procedure (run from the workspace root; RUN_ID is `mailkeeperRunId` from your launch metadata, or a fresh UUID if absent). Every account below is a separate checklist — do not submit until each one has all four checks:",
-      ...config.emailAccounts.flatMap((account, index) => [
-        `Account ${index + 1} of ${config.emailAccounts.length} — "${account}":`,
-        `  [ ] node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js snapshot --account ${account} --since-last-run`,
-        `  [ ] node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js triage --account ${account} --run-id RUN_ID   # urgency first; hits are never touched`,
-        `  [ ] node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js apply --account ${account} --promoted-only --mode ${config.mode} --run-id RUN_ID`,
-        `  [ ] node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js propose --account ${account} --run-id RUN_ID   # dry-run the rest, emit proposals`,
+      "Procedure (run from the workspace root; RUN_ID is `mailkeeperRunId` from your launch metadata, or a fresh UUID if absent):",
+      `  [ ] ${cli} begin --run-id RUN_ID --trigger heartbeat`,
+      ...accounts.flatMap((account, index) => [
+        `  Inbox ${index + 1} of ${accounts.length} — ${account} (contract: ${core.own(inboxes, account)?.contract || "not created yet"})`,
+        "    Approved rules for this inbox:",
+        approved(account),
+        `    [ ] ${cli} snapshot --account ${shellQuote(account)} --run-id RUN_ID --since-last-run`,
+        `    [ ] ${cli} triage   --account ${shellQuote(account)} --run-id RUN_ID   # urgency first; hits are never touched`,
+        `    [ ] ${cli} apply    --account ${shellQuote(account)} --promoted-only --run-id RUN_ID`,
+        `    [ ] ${cli} propose  --account ${shellQuote(account)} --run-id RUN_ID`,
       ]),
-      "Finally, exactly once:",
-      "  [ ] node .agents/skills/mailbox-cleanup/scripts/mailbox-ops.js submit --run-id RUN_ID --outcome completed --summary \"...\"   # exit only after ok:true",
-      "A large mailbox snapshot can take several minutes; run it in the foreground and wait for its JSON result rather than backgrounding it.",
+      `  [ ] ${cli} submit --run-id RUN_ID --summary "..."   # exactly once; exit only after ok:true`,
       "",
-      "Never delete or trash. Never act on VIP senders, protected domains, or urgent hits. Never invent rules; propose them.",
-      `Post a short human-readable summary in thread "${thread.slug}" when done, or exactly HEARTBEAT_OK if nothing changed and nothing was proposed.`,
+      "If a step fails for one inbox, the helper records that inbox as blocked or failed with a fixed code. Skip that inbox's remaining steps and continue with the next one. Never retry a move whose result the helper reports as uncertain.",
+      "A large mailbox snapshot can take several minutes; run it in the foreground and wait for its JSON result.",
+      "Never delete, trash or reply. Never act on protected senders, flagged messages, confirm-first categories or urgent hits. Never invent rules; suggest them.",
+      "",
+      `Report in thread "${thread.slug}": one section per inbox, the inbox name first, then what happened and what changed (from the helper's results), then one next action. Put any MAILKEEPER_ code last, as "(Details: …)". Never include message bodies, credentials or raw tool output.`,
+      `Reply exactly HEARTBEAT_OK only if every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed${effortNote ? " (one is owed this run: see EFFORT)" : ""}.`,
     ].join("\n");
   }
 }
 
-function ruleIdFor(proposal) {
-  return crypto
-    .createHash("sha256")
-    .update(`${proposal.pass}:${proposal.query}:${proposal.action}`)
-    .digest("hex")
-    .slice(0, 16);
-}
-
-module.exports = { MailKeeperService, PLUGIN_ID, taskIdentity };
+module.exports = { MailKeeperService, PLUGIN_ID, taskIdentity, shellQuote, safeWorkspacePath };

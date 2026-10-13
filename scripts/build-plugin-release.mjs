@@ -43,9 +43,10 @@ export function stagePluginRelease({ rootDir = repoRoot, outDir = path.join(root
             activationScope: manifest.activationScope,
           },
           hostRequirements: {
-            // Until realtimex-ai-app#1996 lands, runtime/host.js uses the @/ shim.
+            // runtime/host.js uses only these public SDK namespaces; a host
+            // without them reports MAILKEEPER_HOST_CAPABILITY_MISSING.
             publicSdkNamespaces: ["workspaces", "heartbeat"],
-            fallback: "server-internal-shim",
+            fallback: null,
           },
         },
       },
@@ -54,7 +55,7 @@ export function stagePluginRelease({ rootDir = repoRoot, outDir = path.join(root
     )}\n`
   );
 
-  for (const entry of ["index.js", "runtime", "templates", "skills"]) {
+  for (const entry of ["index.js", "runtime", "skills"]) {
     cpSync(path.join(rootDir, entry), path.join(stageDir, entry), { recursive: true });
   }
   cpSync(path.join(rootDir, "README.md"), path.join(stageDir, "README.md"));

@@ -3,7 +3,7 @@
   "name": "realtimex-mailkeeper",
   "displayName": "RealTimeX MailKeeper",
   "version": "0.1.1",
-  "description": "Keeps your inbox clean on a schedule: rules you promote, everything else proposed, every run reversible. Any IMAP provider via the Himalaya account configured in BizOps.",
+  "description": "Keeps each of your inboxes tidy under its own written contract, on a schedule or whenever you ask. To start, ask the agent in this workspace's chat to “set up MailKeeper.” Works with any IMAP provider through Himalaya.",
   "author": {
     "name": "RealTimeX Team"
   },
@@ -21,45 +21,45 @@
         "method": "GET",
         "path": "/status",
         "auth": "internalOrAppId",
-        "description": "Read a workspace MailKeeper profile, readiness state, promoted rules, and last run summary."
+        "description": "Read a workspace's MailKeeper profile: inboxes and their contract state, settings, approved rules and recent runs."
       },
       {
         "method": "GET",
         "path": "/accounts",
         "auth": "internalOrAppId",
         "availableWhenInactive": true,
-        "description": "List Himalaya accounts from the configured email config as select options for EMAIL_ACCOUNTS. Never returns hosts or secrets."
+        "description": "List inbox names from the user's Himalaya email settings as options for Inboxes. Never returns hosts, addresses or secrets."
       },
       {
         "method": "POST",
         "path": "/runs",
         "auth": "internalOrAppId",
         "availableWhenInactive": true,
-        "description": "Record a finite cleanup run receipt (actions taken, proposals, urgent items), including after workspace deactivation."
+        "description": "Record a finite run receipt (per-inbox outcome, confirmed moves, suggestions, urgent items), including after workspace deactivation."
       },
       {
         "method": "POST",
         "path": "/rules/promote",
         "auth": "internalOrAppId",
-        "description": "Promote a proposed rule so the heartbeat may execute it unattended. Human-only."
+        "description": "Approve a suggested rule for one inbox so scheduled runs may apply it. Human-only."
       },
       {
         "method": "POST",
         "path": "/rules/demote",
         "auth": "internalOrAppId",
-        "description": "Demote a promoted rule back to proposal. Human-only."
+        "description": "Return an approved rule to the suggestions. Human-only."
       },
       {
         "method": "POST",
         "path": "/undo",
         "auth": "internalOrAppId",
-        "description": "Reverse every action recorded in one run receipt by UID."
+        "description": "Undo runs in the workspace chat, where the inbox credentials are available; this route answers MAILKEEPER_TERMINAL_REQUIRED with the next step."
       },
       {
         "method": "POST",
         "path": "/repair",
         "auth": "internalOrAppId",
-        "description": "Explicitly re-provision the profile-owned thread, contract file, and managed heartbeat task."
+        "description": "Re-provision the maintenance thread, any missing inbox contract (existing contracts are never overwritten) and the managed heartbeat task."
       }
     ]
   },
@@ -118,10 +118,10 @@
     {
       "key": "EMAIL_ACCOUNTS",
       "scope": "workspace",
-      "label": "Email accounts",
+      "label": "Inboxes",
       "type": "multi-select",
       "default": [],
-      "description": "Accounts this workspace keeps clean. Sourced from the BizOps Himalaya config; each gets its own snapshot and Auto/* folders.",
+      "description": "Inboxes this workspace looks after. Each has its own contract in `mailboxes/`. None listed? Ask the agent in this workspace's chat to “set up MailKeeper.”",
       "optionsRoutePath": "/accounts",
       "required": true
     },
@@ -132,7 +132,7 @@
       "type": "select",
       "required": true,
       "default": "report-only",
-      "description": "What the heartbeat may do unattended. Cannot exceed the global mode ceiling.",
+      "description": "The most any inbox in this workspace may do on its own. Each inbox's contract can be stricter.",
       "options": [
         {
           "value": "report-only",
@@ -155,7 +155,7 @@
       "type": "select",
       "required": true,
       "default": "1d",
-      "description": "How often the maintenance run happens. Follows this workspace's heartbeat active hours and pause state.",
+      "description": "How often MailKeeper checks your inboxes on its own. Follows this workspace's heartbeat schedule and pause.",
       "options": [
         {
           "value": "4h",
@@ -186,7 +186,7 @@
       "type": "number",
       "required": true,
       "default": 90,
-      "description": "Messages older than this qualify for the age pass."
+      "description": "Starting value for new inbox contracts. Each contract can set its own."
     },
     {
       "key": "AGGRESSIVENESS",
@@ -195,7 +195,7 @@
       "type": "select",
       "required": true,
       "default": "conservative",
-      "description": "Which passes may be promoted. See MAILBOX.md for the pass list per level.",
+      "description": "The most any inbox may allow. Contracts can be stricter.",
       "options": [
         {
           "value": "conservative",
@@ -217,7 +217,7 @@
       "label": "VIP senders",
       "type": "tag-list",
       "default": [],
-      "description": "Addresses or domains that are never touched. Seeds MAILBOX.md."
+      "description": "Never touched in any inbox. Add inbox-specific senders in that inbox's contract."
     },
     {
       "key": "AGENT",
@@ -225,7 +225,7 @@
       "label": "Maintenance agent",
       "type": "terminal-agent",
       "required": true,
-      "description": "Terminal agent that runs the maintenance task."
+      "description": "Terminal agent that runs scheduled checks."
     },
     {
       "key": "MODEL",
@@ -234,6 +234,15 @@
       "type": "terminal-agent-model",
       "description": "Optional. Empty means the agent's default model.",
       "agentKey": "AGENT"
+    },
+    {
+      "key": "EFFORT",
+      "scope": "workspace",
+      "label": "Reasoning effort",
+      "type": "terminal-agent-effort",
+      "agentKey": "AGENT",
+      "modelKey": "MODEL",
+      "description": "Optional. Applies when a model is selected; otherwise the agent's default is used."
     }
   ],
   "permissions": []

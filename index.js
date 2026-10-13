@@ -64,10 +64,8 @@ async function withScope(service, request, response, handler, options = {}) {
   try {
     return await handler(resolved);
   } catch (error) {
-    service.api.log?.error?.(
-      `MailKeeper route failed: ${error.message}`,
-      { code: error?.code || null }
-    );
+    // Fixed code only: route errors may wrap tool or file-system text.
+    service.api.log?.error?.("MailKeeper route failed", { code: error?.code || null });
     return errorResponse(response, error);
   }
 }
@@ -97,7 +95,7 @@ module.exports = definePlugin({
         name: "mailbox-cleanup",
         displayName: "Mailbox Cleanup",
         description:
-          "Multi-pass mailbox cleanup playbook over Himalaya: snapshot, urgency triage, promoted-rule maintenance, proposals, receipts, undo.",
+          "Set up and run MailKeeper: connect inboxes, draft each inbox's contract, run scheduled or on-request cleanup over Himalaya, receipts and undo.",
         files: readSkillFiles(),
       },
     ]);
@@ -122,7 +120,7 @@ module.exports = definePlugin({
         try {
           return response.status(200).json({ ok: true, ...(await service.accountOptions()) });
         } catch (error) {
-          service.api.log?.error?.("MailKeeper account list failed", { error: error.message });
+          service.api.log?.error?.("MailKeeper account list failed", { code: error?.code || null });
           return errorResponse(response, error);
         }
       },
