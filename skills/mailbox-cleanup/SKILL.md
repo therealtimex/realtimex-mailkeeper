@@ -201,7 +201,16 @@ Always answer in this order: the inbox name; what happened, without guessing the
 | `TERMINAL_REQUIRED` | Undo for work@example.com runs in the workspace chat. Ask me: "undo MailKeeper run 7f3a". |
 | `OPERATION_FAILED` | Something went wrong while working on work@example.com. (Receipt-based change statement.) Ask me to try again. |
 
-**Going through an inbox's setup** (after a yes to the question above): check what you can verify, one item at a time, and say what you found without naming a cause. (1) The Login is saved, enabled and available to this workspace, from Secrets metadata, without reading the password. (2) The inbox's server details (`config-check`). (3) Provider facts, as setup guidance rather than a diagnosis of this failure, for example: "Gmail needs an app password, not your normal password." (4) Network access: if checks work here in chat but scheduled checks keep failing, say: "make sure the maintenance agent is allowed to use the network". Then run the read-only `check` again.
+**Going through an inbox's setup** (when the person asks "check <address>", go straight to it; after a failure they didn't ask about, offer it first). Review only what you can verify, one item at a time, and say what you found, or that it's unknown, without naming a cause:
+
+1. The Login linked in this inbox's contract: saved, enabled and available to this workspace, from Secrets metadata only. Never read the password, and never claim metadata shows whether it is a normal or an app password. Switching the inbox to a different Login still needs the person's explicit choice.
+2. The inbox's server details (`config-check`).
+3. What this setup method needs from the provider, as a requirement of the method, never as evidence about today's failure. For a saved-password Gmail inbox: "This setup uses a saved password. For Gmail, use an app password if your account allows one; creating one requires 2-Step Verification. See https://support.google.com/mail/answer/185833." If the account can't use app passwords, don't suggest weakening its protections or replacing the saved password again. Leave a working native sign-in as it is.
+4. Network access: if checks work here in chat but scheduled checks keep failing, say "make sure the maintenance agent is allowed to use the network", without calling it the cause.
+
+Then run the read-only `check` once. It is the bounded sign-in and folder check, never a full scan, a move or a retry loop. If a sign-in already succeeded in the run you're explaining, keep that result and look at the later failure instead of the setup.
+
+Say "Nothing was changed" only when the inbox's receipt shows no confirmed moves and nothing pending or uncertain; otherwise use the partial and undo wording above.
 
 **Checking an uncertain move:** snapshot the inbox and its destination folder, and show the user which recorded messages are where. Only after the user agrees the inbox is in a known state, run `mailbox-ops release --run-id <id> --reconciled`.
 
