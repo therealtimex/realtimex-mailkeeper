@@ -104,6 +104,17 @@ function heartbeatOccurrenceEnded(context) {
 }
 
 /**
+ * The host-issued executor identity on a lifecycle event (runtime session and
+ * PTY session), or null when the event carries neither.
+ */
+function executorOwner(event) {
+  const pick = (value) => (typeof value === "string" && /^[A-Za-z0-9:._-]{1,200}$/.test(value) ? value : null);
+  const runtimeSessionId = pick(event?.runtimeSessionId);
+  const ptySessionId = pick(event?.ptySessionId);
+  return runtimeSessionId || ptySessionId ? { runtimeSessionId, ptySessionId } : null;
+}
+
+/**
  * Whether a run journal proves that run `runId` left no move pending or in
  * doubt: it must be this run's journal, in the shape the helper writes.
  */
@@ -916,24 +927,61 @@ class MailKeeperService {
   }
 
   /**
-   * The end of one heartbeat occurrence: ingest its receipt, then release its
-   * run guard (unless a move is pending or uncertain, or its journal can't be
-   * read) and its active marker. Only the occurrence the marker was admitted
-   * for (`event.heartbeatRunId`) can end it; anything else does nothing.
+   * Lifecycle events of one heartbeat occurrence. Each event for the
+   * occurrence the marker was admitted for (`event.heartbeatRunId`) records
+   * the executor's host identity. Its end event then ingests its receipt and
+   * releases its run guard (unless a move is pending or uncertain, or its
+   * journal can't be read) and its active marker. Events for any other
+   * occurrence do nothing.
    */
   async recordHeartbeatLifecycle(context) {
-    if (!heartbeatOccurrenceEnded(context)) return;
-    const occurrence = String(context.event?.heartbeatRunId || "").trim();
+    const occurrence = String(context?.event?.heartbeatRunId || "").trim();
     if (!occurrence) return;
+    const ended = heartbeatOccurrenceEnded(context);
+    const owner = executorOwner(context.event);
+    if (!ended && !owner) return;
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
     if (!workspace) return;
     await this.withRunState(workspace, async () => {
       const active = await this.store.get(this.activeRunKey(workspace));
       if (!active?.runId || active.heartbeatRunId !== occurrence) return;
+      if (owner) await this.recordRunOwner(workspace, active, owner);
+      if (!ended) return;
       await this.ingestOutboxLocked(workspace);
       this.releaseRunGuard(workspace, active.runId);
       await this.clearActiveRun(workspace, active.runId);
     });
+  }
+
+  /**
+   * Add an executor identity to the active run's owners, on the marker and
+   * beside its journal (`runs/<runId>.owner.json`). A later event never
+   * erases a known field; a new session for the same occurrence (the host's
+   * fallback chain) is added, not substituted.
+   */
+  async recordRunOwner(workspace, active, owner) {
+    const owners = Array.isArray(active.owners) ? active.owners.map((entry) => ({ ...entry })) : [];
+    const same = owners.find(
+      (entry) =>
+        (owner.runtimeSessionId && entry.runtimeSessionId === owner.runtimeSessionId) ||
+        (owner.ptySessionId && entry.ptySessionId === owner.ptySessionId)
+    );
+    if (same) {
+      if (same.runtimeSessionId && owner.runtimeSessionId && same.runtimeSessionId !== owner.runtimeSessionId) return;
+      if (same.ptySessionId && owner.ptySessionId && same.ptySessionId !== owner.ptySessionId) return;
+      const before = JSON.stringify(same);
+      same.runtimeSessionId ||= owner.runtimeSessionId;
+      same.ptySessionId ||= owner.ptySessionId;
+      if (JSON.stringify(same) === before) return;
+    } else {
+      owners.push({ ...owner, firstSeenAt: new Date().toISOString() });
+    }
+    await this.store.set(this.activeRunKey(workspace), { ...active, owners });
+    const target = safeWorkspacePath(
+      workspace.workingDirectory,
+      path.join(".mailkeeper", "runs", `${path.basename(active.runId)}.owner.json`)
+    );
+    writeJsonAtomic(target, { schemaVersion: 1, runId: active.runId, heartbeatRunId: active.heartbeatRunId, owners });
   }
 
   releaseRunGuard(workspace, runId) {

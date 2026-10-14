@@ -82,7 +82,7 @@ const MESSAGES = {
   MAILKEEPER_IMAP_CHECK_FAILED: "Couldn't connect or sign in to this inbox.",
   MAILKEEPER_NETWORK_DENIED: "This terminal isn't allowed to use the network.",
   MAILKEEPER_TIMEOUT: "The mail server didn't answer in time.",
-  MAILKEEPER_RUN_BUSY: "Another MailKeeper run is in progress for this workspace.",
+  MAILKEEPER_RUN_BUSY: "I couldn't confirm whether MailKeeper's previous run has ended, so I won't start another.",
   MAILKEEPER_MUTATION_UNCERTAIN: "The last move's result is unknown; changes stopped for this inbox and it won't be repeated.",
   MAILKEEPER_TERMINAL_REQUIRED: "This must run from the workspace chat or terminal.",
   MAILKEEPER_OPERATION_FAILED: "Something went wrong.",
@@ -833,14 +833,35 @@ function readLock() {
 }
 
 /**
- * One run at a time per workspace, across chat, heartbeat and undo. The
- * guard is a file created exclusively and owned by a run ID; it is never
- * taken over just because time passed.
+ * The terminal session this helper runs in, as the host injected it: the
+ * agent context's `terminalSessionId`, or the older variable. Null when
+ * neither is set or they disagree.
  */
-function acquireGuard(runId, trigger) {
+function terminalSessionId() {
+  let fromContext = null;
+  try {
+    const context = JSON.parse(env.RTX_AGENT_CONTEXT_JSON || "null");
+    if (typeof context?.terminalSessionId === "string") fromContext = context.terminalSessionId;
+  } catch {
+    fromContext = null;
+  }
+  const legacy = env.REALTIMEX_TERMINAL_SESSION_ID || null;
+  if (fromContext && legacy && fromContext !== legacy) return null;
+  const id = fromContext || legacy;
+  return id && /^[A-Za-z0-9:._-]{1,128}$/.test(id) ? id : null;
+}
+
+/**
+ * One run at a time per workspace, across chat, heartbeat and undo. The
+ * guard is a file created exclusively and owned by a run ID, recording the
+ * terminal session that took it; it is never taken over just because time
+ * passed. Another run's guard means its end isn't confirmed, not that it is
+ * still running: this helper can't tell.
+ */
+function acquireGuard(runId, trigger, owner) {
   fs.mkdirSync(STATE, { recursive: true, mode: 0o700 });
   try {
-    fs.writeFileSync(lockFile(), JSON.stringify({ runId, trigger, startedAt: new Date().toISOString() }), {
+    fs.writeFileSync(lockFile(), JSON.stringify({ runId, trigger, startedAt: new Date().toISOString(), owner }), {
       flag: "wx",
       mode: 0o600,
     });
@@ -849,7 +870,18 @@ function acquireGuard(runId, trigger) {
     if (error.code !== "EEXIST") throw error;
   }
   const lock = readLock();
-  if (lock?.runId !== runId) throw failure("MAILKEEPER_RUN_BUSY", { heldBy: lock?.runId || null });
+  if (lock?.runId !== runId) {
+    // Confirmed moves the earlier run recorded, so the person hears their undo is kept.
+    const held = typeof lock?.runId === "string" ? readJson(runFile(lock.runId)) : null;
+    throw failure("MAILKEEPER_RUN_BUSY", {
+      heldBy: lock?.runId || null,
+      heldRunMoved: held?.runId === lock?.runId && Array.isArray(held?.actions) ? held.actions.length : null,
+      heldSince: typeof lock?.startedAt === "string" ? lock.startedAt : null,
+      heldByTrigger: typeof lock?.trigger === "string" ? lock.trigger : null,
+      ownerRecorded: Boolean(lock?.owner?.terminalSessionId),
+      ownerState: "unknown",
+    });
+  }
 }
 
 function releaseGuard(runId, run) {
@@ -860,11 +892,13 @@ function releaseGuard(runId, run) {
   return true;
 }
 
-function newRun(runId, rules, requested, trigger) {
+function newRun(runId, rules, requested, trigger, owner) {
   return {
     schemaVersion: 2,
     runId,
     trigger,
+    // The terminal session that began the run (null when not injected).
+    owner,
     startedAt: new Date().toISOString(),
     rulesRevision: rules.revision,
     effort: rules.config.effort || null,
@@ -906,8 +940,9 @@ function runFor(args, rules) {
   const runId = runIdOf(args);
   let run = readJson(runFile(runId));
   if (run?.submittedAt) throw failure("MAILKEEPER_OPERATION_FAILED", { reason: `run ${runId} was already submitted` });
-  acquireGuard(runId, run?.trigger || "chat");
-  if (!run) run = newRun(runId, rules, [...rules.config.emailAccounts], "chat");
+  const owner = run?.owner || { terminalSessionId: terminalSessionId() };
+  acquireGuard(runId, run?.trigger || "chat", owner);
+  if (!run) run = newRun(runId, rules, [...rules.config.emailAccounts], "chat", owner);
   return run;
 }
 
@@ -1644,8 +1679,9 @@ const commands = {
     for (const account of requested) {
       if (!rules.config.emailAccounts.includes(account)) throw failure("MAILKEEPER_ACCOUNT_NOT_FOUND", { account });
     }
-    acquireGuard(runId, trigger);
-    const run = newRun(runId, rules, requested, trigger);
+    const owner = { terminalSessionId: terminalSessionId() };
+    acquireGuard(runId, trigger, owner);
+    const run = newRun(runId, rules, requested, trigger, owner);
     const inboxes = Object.create(null);
     const notices = readJson(statePath("notices.json")) || {};
     notices.migration = notices.migration || {};
@@ -1980,8 +2016,9 @@ const commands = {
       inboxes.set(account, inbox);
     }
     const undoRunId = `undo-${runId}`.slice(0, 80);
-    acquireGuard(undoRunId, "undo");
-    const undoRun = readJson(runFile(undoRunId)) || newRun(undoRunId, rules, accounts, "undo");
+    const undoOwner = { terminalSessionId: terminalSessionId() };
+    acquireGuard(undoRunId, "undo", undoOwner);
+    const undoRun = readJson(runFile(undoRunId)) || newRun(undoRunId, rules, accounts, "undo", undoOwner);
     if (undoRun.uncertain?.length) throw failure("MAILKEEPER_MUTATION_UNCERTAIN");
     const report = { reversed: 0, unresolved: [] };
     try {

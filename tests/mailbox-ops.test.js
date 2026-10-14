@@ -536,6 +536,29 @@ test("clearing a review marker cannot exceed the workspace caps or approve a rul
   assert.equal(ws.mailbox().accounts.legacy.folders.INBOX.length, 6);
 });
 
+test("begin records its terminal session; another run's guard is reported as unconfirmed, not running", () => {
+  const ws = twoInboxes();
+  const lock = () => JSON.parse(fs.readFileSync(path.join(ws.dir, ".mailkeeper", "run.lock"), "utf8"));
+  ws.env = { RTX_AGENT_CONTEXT_JSON: JSON.stringify({ schemaVersion: 1, terminalSessionId: "t-1" }), REALTIMEX_TERMINAL_SESSION_ID: "t-1" };
+  assert.equal(ws.run("begin", "--run-id", "r1", "--trigger", "heartbeat").json.ok, true);
+  assert.deepEqual(lock().owner, { terminalSessionId: "t-1" });
+  assert.deepEqual(ws.run_("r1").owner, { terminalSessionId: "t-1" });
+
+  ws.env = { RTX_AGENT_CONTEXT_JSON: JSON.stringify({ schemaVersion: 1, terminalSessionId: "t-2" }), REALTIMEX_TERMINAL_SESSION_ID: "t-2" };
+  const busy = ws.run("begin", "--run-id", "r2").json;
+  assert.equal(busy.code, "MAILKEEPER_RUN_BUSY");
+  assert.deepEqual(
+    [busy.heldBy, busy.heldByTrigger, busy.ownerRecorded, busy.ownerState, typeof busy.heldSince, busy.heldRunMoved],
+    ["r1", "heartbeat", true, "unknown", "string", 0]
+  );
+  assert.doesNotMatch(busy.message || "", /in progress|already running/i, "never claims the other run is running");
+
+  fs.rmSync(path.join(ws.dir, ".mailkeeper", "run.lock"));
+  ws.env = { RTX_AGENT_CONTEXT_JSON: JSON.stringify({ schemaVersion: 1, terminalSessionId: "t-3" }), REALTIMEX_TERMINAL_SESSION_ID: "t-other" };
+  ws.run("begin", "--run-id", "r3");
+  assert.deepEqual(lock().owner, { terminalSessionId: null }, "disagreeing sources record no owner");
+});
+
 test("status reports the four setup criteria per inbox and the schedule", () => {
   const ws = twoInboxes();
   ws.writeRules({ schedule: { cadence: "1d", paused: true, threadSlug: "mailkeeper-maintenance-7" } });

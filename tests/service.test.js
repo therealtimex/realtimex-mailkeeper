@@ -537,6 +537,32 @@ test("the guard stays for pending, uncertain or unreadable journals", async () =
   assert.equal(fs.existsSync(f.lock), false, "no journal at all: the run ended before begin");
 });
 
+test("each matching lifecycle event records the executor's host identity, never erasing it", async () => {
+  const f = runFixture();
+  f.start("r1", "hb-1");
+  const event = (heartbeatRunId, fields, state = "session_started") =>
+    f.service.recordHeartbeatLifecycle({ workspace: { id: 7 }, dispatch: { success: true, managed: false, reason: "dispatch_not_found" }, event: { state, heartbeatRunId, ...fields } });
+  const owners = () => (f.active()?.owners || []).map(({ runtimeSessionId, ptySessionId }) => ({ runtimeSessionId, ptySessionId }));
+  const sidecar = path.join(path.dirname(f.lock), "runs", "r1.owner.json");
+
+  await event("hb-1", { runtimeSessionId: "cli-agent:p1" });
+  assert.deepEqual(owners(), [{ runtimeSessionId: "cli-agent:p1", ptySessionId: null }], "a nonterminal event is enough");
+  await event("hb-1", { runtimeSessionId: "cli-agent:p1", ptySessionId: "p1" });
+  assert.deepEqual(owners(), [{ runtimeSessionId: "cli-agent:p1", ptySessionId: "p1" }], "a later event fills a missing field");
+  await event("hb-1", {});
+  await event("hb-1", { ptySessionId: "p1" });
+  assert.deepEqual(owners(), [{ runtimeSessionId: "cli-agent:p1", ptySessionId: "p1" }], "absent fields never erase known ones");
+  await event("hb-other", { runtimeSessionId: "cli-agent:x", ptySessionId: "x" });
+  assert.equal(owners().length, 1, "another occurrence's identity is ignored");
+  await event("hb-1", { runtimeSessionId: "cli-agent:p2", ptySessionId: "p2" });
+  assert.deepEqual(owners().map((owner) => owner.ptySessionId), ["p1", "p2"], "a fallback session is added, not substituted");
+  assert.deepEqual(JSON.parse(fs.readFileSync(sidecar, "utf8")).owners.map((owner) => owner.ptySessionId), ["p1", "p2"]);
+
+  await event("hb-1", { ptySessionId: "p2" }, "task_completed");
+  assert.equal(f.active(), null, "the end event still ends the run");
+  assert.equal(JSON.parse(fs.readFileSync(sidecar, "utf8")).runId, "r1", "the owner record stays with the run's journal");
+});
+
 test("concurrent admissions start at most one run", async () => {
   const f = runFixture();
   const results = await Promise.all(

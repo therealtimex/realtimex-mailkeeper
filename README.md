@@ -119,6 +119,10 @@ Each contract ends with a small typed `mailkeeper-policy` settings block, which 
 
 MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getStore`, `registerWorkspaceSkillProvider`, `workspaces.get/listEnabledForPlugin/ensureThread` and `heartbeat.upsertManagedTask/removeManagedTask/readSettings`. A host without them reports `MAILKEEPER_HOST_CAPABILITY_MISSING`. The Inboxes picker uses the host's `optionsRoutePath` support. The Reasoning effort picker uses the `terminal-agent-effort` field type.
 
+### Known limitations
+
+- If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. Support can clear it. A fix is tracked in realtimex-ai-app#2456.
+
 ### Upgrading from 0.1
 
 The first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
