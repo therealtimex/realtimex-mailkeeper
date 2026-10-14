@@ -78,13 +78,13 @@ function writeJsonAtomic(file, value) {
   fs.renameSync(temp, file);
 }
 
-// How the host reports the end of a heartbeat occurrence to the managed
+// The end of a heartbeat occurrence, as the host reports it to the managed
 // lifecycle hook (server/models/heartbeatSource.js recordExecutorLifecycle and
-// server/utils/heartbeat/executorLifecycle.js). A dispatched run carries the
-// dispatch `status`; a person's Run has no dispatch record, so the host sends
-// `reason: "dispatch_not_found"` and its executor state decides. Activity and
-// fallback states are not ends: the host may still launch or run afterwards.
-const DISPATCH_END_STATUSES = new Set(["completed", "failed", "abandoned", "delivery_unknown"]);
+// server/utils/heartbeat/executorLifecycle.js). Both a dispatched run
+// (`managed: true`) and a person's Run (`reason: "dispatch_not_found"`) need
+// an explicit executor end event: a final dispatch status alone isn't one
+// (delivery_unknown is unresolved, task_needs_input and session_stale map to
+// failed, and a duplicate final status comes back for any later event).
 const EXECUTOR_END_STATES = new Set([
   "task_completed",
   "task_blocked",
@@ -97,10 +97,22 @@ const EXECUTOR_END_STATES = new Set([
 function heartbeatOccurrenceEnded(context) {
   const dispatch = context?.dispatch || {};
   if (dispatch.success !== true) return false;
-  if (dispatch.managed === true) return DISPATCH_END_STATUSES.has(String(dispatch.status || "").toLowerCase());
-  if (dispatch.reason !== "dispatch_not_found") return false;
+  if (dispatch.managed !== true && dispatch.reason !== "dispatch_not_found") return false;
+  if (dispatch.managed === true && String(dispatch.status || "").toLowerCase() === "running") return false;
   const event = context?.event || {};
   return EXECUTOR_END_STATES.has(String(event.state || event.status || "").trim().toLowerCase());
+}
+
+/**
+ * Whether a run journal proves that run `runId` left no move pending or in
+ * doubt: it must be this run's journal, in the shape the helper writes.
+ */
+function journalAllowsRelease(run, runId) {
+  if (!run || typeof run !== "object" || Array.isArray(run)) return false;
+  if (run.schemaVersion !== 2 || run.runId !== runId) return false;
+  if (!Array.isArray(run.requested) || !Array.isArray(run.actions) || !Array.isArray(run.uncertain)) return false;
+  if (!run.accounts || typeof run.accounts !== "object" || Array.isArray(run.accounts)) return false;
+  return run.pending === null && run.uncertain.length === 0;
 }
 
 class MailKeeperService {
@@ -933,15 +945,23 @@ class MailKeeperService {
       return false;
     }
     if (guard?.runId !== runId) return false;
-    let run = null;
+    let text = null;
     try {
-      run = JSON.parse(fs.readFileSync(path.join(state, "runs", `${path.basename(runId)}.json`), "utf8"));
+      text = fs.readFileSync(path.join(state, "runs", `${path.basename(runId)}.json`), "utf8");
     } catch (error) {
       // No journal: the run ended before `begin` wrote one, so nothing was
       // attempted. An unreadable journal could hide a pending move: keep it.
       if (error?.code !== "ENOENT") return false;
     }
-    if (run?.pending || (Array.isArray(run?.uncertain) && run.uncertain.length)) return false;
+    if (text !== null) {
+      let run;
+      try {
+        run = JSON.parse(text);
+      } catch {
+        return false;
+      }
+      if (!journalAllowsRelease(run, runId)) return false;
+    }
     fs.rmSync(path.join(state, "run.lock"), { force: true });
     return true;
   }

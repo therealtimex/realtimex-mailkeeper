@@ -421,7 +421,8 @@ function runFixture() {
       h.store.set("ws-7-active", { runId, heartbeatRunId, startedAt: new Date().toISOString() });
       fs.writeFileSync(lock, JSON.stringify({ runId }));
       const file = path.join(state, "runs", `${runId}.json`);
-      fs.writeFileSync(file, typeof journal === "string" ? journal : JSON.stringify({ runId, pending: null, uncertain: [], ...journal }));
+      const valid = { schemaVersion: 2, runId, requested: ["work"], accounts: {}, actions: [], uncertain: [], pending: null };
+      fs.writeFileSync(file, typeof journal === "string" ? journal : JSON.stringify({ ...valid, ...journal }));
     },
     receipt(runId) {
       fs.writeFileSync(path.join(state, "outbox", `${runId}.json`), JSON.stringify({ runId, outcome: "blocked" }));
@@ -447,10 +448,14 @@ test("a person's Run that ends releases the next Run and chat; only its own occu
   assert.deepEqual([f.active(), fs.existsSync(f.lock)], [null, false]);
   assert.equal(f.store.get("ws-7-run-r3") ?? null, null, "no receipt is invented for a crashed run");
 
-  // A dispatched (scheduled) run reports the host's dispatch status.
+  // A dispatched (scheduled) run: the dispatch is recorded and the executor reports its end.
   f.start("r4", "hb-4");
   await f.end("hb-4", { dispatch: { success: true, managed: true, status: "completed" } });
   assert.equal(f.active(), null);
+  // An explicit exit without an exit code: the host leaves it delivery_unknown, but the session ended.
+  f.start("r5", "hb-5");
+  await f.end("hb-5", { state: "session_exited", dispatch: { success: true, managed: true, status: "delivery_unknown", resolutionRequired: true } });
+  assert.deepEqual([f.active(), fs.existsSync(f.lock)], [null, false]);
 });
 
 test("lifecycle events that don't end this occurrence change nothing", async () => {
@@ -467,9 +472,18 @@ test("lifecycle events that don't end this occurrence change nothing", async () 
   }
   await f.end("hb-1", { dispatch: { success: true, managed: false, reason: "non_state_event" } });
   untouched();
-  await f.end("hb-1", { dispatch: { success: true, managed: true, status: "running" } });
-  untouched();
+  await f.end("hb-1", { state: "task_completed", dispatch: { success: true, managed: true, status: "running" } });
+  untouched(); // contradictory: the host still has the dispatch running
   await f.end("hb-1", { dispatch: { success: false, managed: true, reason: "stale_fence" } });
+  untouched();
+  // A final dispatch status isn't an end event on its own.
+  await f.end("hb-1", { state: "delivery_unknown", dispatch: { success: true, managed: true, status: "delivery_unknown", resolutionRequired: true } });
+  untouched();
+  for (const state of ["session_stale", "task_needs_input"]) {
+    await f.end("hb-1", { state, dispatch: { success: true, managed: true, status: "failed" } });
+    untouched();
+  }
+  await f.end("hb-1", { state: "resume_failed", dispatch: { success: true, managed: true, status: "completed", duplicate: true } });
   untouched();
 });
 
@@ -503,6 +517,13 @@ test("the guard stays for pending, uncertain or unreadable journals", async () =
     ["pending", { pending: { account: "work" } }],
     ["uncertain", { uncertain: [{ account: "work" }] }],
     ["corrupt", "{"],
+    ["null", "null"],
+    ["empty object", "{}"],
+    ["array", "[]"],
+    ["another run's journal", { runId: "someone-else" }],
+    ["uncertain as an object", { uncertain: { account: "work" } }],
+    ["no schema version", { schemaVersion: undefined }],
+    ["pending missing", { pending: undefined }],
   ]) {
     const f = runFixture();
     f.start("r1", "hb-1", journal);
