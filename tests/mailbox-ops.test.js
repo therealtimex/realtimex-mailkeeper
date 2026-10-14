@@ -430,11 +430,13 @@ test("undo finds moved messages by sender, subject and date, and reports what it
   assert.deepEqual(dry.json.unresolved.map((u) => u.reason), ["ambiguous", "ambiguous"]);
   assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 3, "dry run moves nothing");
 
-  const undone = ws.run("undo", "--run-id", "r1");
-  assert.equal(undone.json.reversed, 1);
-  const box = ws.mailbox();
-  assert.deepEqual(box.accounts.b.folders.INBOX.map((m) => m.subject), ["Solo"]);
-  assert.equal(ws.run("undo", "--run-id", "r1").json.reused, true);
+  const undone = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([undone.reversed, undone.remaining, undone.undone], [1, 2, false]);
+  assert.deepEqual(ws.mailbox().accounts.b.folders.INBOX.map((m) => m.subject), ["Solo"]);
+  // The look-alikes stay recoverable, and a second attempt doesn't move Solo again.
+  const again = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([again.reused, again.reversed, again.alreadyReversed, again.remaining], [undefined, 0, 1, 2]);
+  assert.deepEqual(ws.mailbox().accounts.b.folders.INBOX.map((m) => m.subject), ["Solo"]);
   assertNoSecrets(ws);
 });
 
@@ -954,7 +956,7 @@ test("an approved rule this version skips or reduces is owed one notice per inbo
   assert.equal(second.inboxes.b.ruleNotices, undefined);
 });
 
-test("undo looks for moved messages only within the capped, unfiltered read", () => {
+test("undo never moves from a folder it couldn't list to its end, not even a single visible match", () => {
   const ws = twoInboxes();
   maintenance(ws, "r1");
   const folders = ws.mailbox().accounts.b.folders;
@@ -963,19 +965,164 @@ test("undo looks for moved messages only within the capped, unfiltered read", ()
   // A listing that reached its end can say a message wasn't found.
   ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [moved[0]] } });
   const ended = ws.run("undo", "--run-id", "r1", "--dry-run").json;
-  assert.deepEqual([ended.reversed, ended.unresolved.map((u) => u.reason)], [1, ["not-found"]]);
-  // The destination now holds 1000 newer messages ahead of the moved ones.
-  ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [...bulkInbox(1000, 5001), ...moved] } });
+  assert.deepEqual([ended.reversed, ended.remaining, ended.unresolved.map((u) => u.reason)], [1, 1, ["not-found"]]);
+
+  // A look-alike of a moved message at the top, the originals beyond the cap.
+  const twin = { ...moved[0], id: "9001" };
+  ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [twin, ...bulkInbox(1000, 5001), ...moved] } });
   const before = listCalls(ws, "b", "Auto/Notifications").length;
   const undone = ws.run("undo", "--run-id", "r1").json;
-  assert.equal(undone.reversed, 0);
-  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["not-found-in-checked-part", "not-found-in-checked-part"]);
+  assert.deepEqual([undone.reversed, undone.remaining, undone.undone], [0, 2, false]);
+  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["folder-not-fully-checked", "folder-not-fully-checked"]);
   assert.ok(undone.unresolved.every((u) => u.from === "Auto/Notifications" && u.to === "INBOX"));
   const calls = listCalls(ws, "b", "Auto/Notifications").slice(before);
   assert.equal(calls.length, 5);
   assert.ok(calls.every((call) => call.query === ""));
-  assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 1002, "nothing moved back");
+  assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 1003, "nothing moved back, not even the look-alike");
 
+  // The run stays undoable: once the folder can be listed to its end, it is.
+  ws.setFake("b", { folders });
+  const later = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([later.reversed, later.remaining, later.undone], [2, 0, true]);
+  assert.equal(ws.run("undo", "--run-id", "r1").json.reused, true);
+});
+
+test("a partial undo stays recoverable across destinations, inboxes and attempts, sharing one read budget per inbox", () => {
+  const CAL_QUERY = "calendar accept/decline/invitation subjects";
+  const calendar = {
+    id: core.ruleId({ account: "b", pass: "calendar-response", query: CAL_QUERY, action: "move → Auto/Calendar" }),
+    account: "b",
+    pass: "calendar-response",
+    query: CAL_QUERY,
+    action: "move → Auto/Calendar",
+  };
+  const ruleA = { ...ruleB, account: "a", id: core.ruleId({ ...ruleB, account: "a" }) };
+  const ws = twoInboxes({
+    promoted: [ruleA, ruleB, calendar],
+    a: { folders: { "Auto/Notifications": [] } },
+    b: {
+      messages: [...standardInbox(), msg(7, "alice@people.example", "Accepted: Planning sync"), msg(8, "bob@people.example", "Declined: Lunch")],
+      folders: { "Auto/Notifications": [], "Auto/Calendar": [] },
+    },
+  });
+  maintenance(ws, "r1");
+  const receipt = ws.receipt("r1");
+  assert.deepEqual(receipt.accounts.a.movedByDestination, { "Auto/Notifications": 1 });
+  assert.deepEqual(receipt.accounts.b.movedByDestination, { "Auto/Notifications": 2, "Auto/Calendar": 2 });
+
+  const moves = (account) => ws.mailbox().calls.filter((c) => c.account === account && c.op === "message move").length;
+  const lists = (account) => ws.mailbox().calls.filter((c) => c.account === account && c.op === "envelope list").length;
+  const original = ws.mailbox().accounts.b.folders;
+  ws.setFake("b", { folders: { ...original, "Auto/Calendar": [...bulkInbox(1000, 5001), ...original["Auto/Calendar"]] } });
+  const listsBefore = lists("b");
+  const first = ws.run("undo", "--run-id", "r1", "--account", "b").json;
+  assert.deepEqual([first.reversed, first.remaining, first.undone], [2, 3, false]);
+  assert.deepEqual(first.unresolved.map((u) => [u.from, u.reason]), [
+    ["Auto/Calendar", "folder-not-fully-checked"],
+    ["Auto/Calendar", "folder-not-fully-checked"],
+  ]);
+  assert.equal(lists("b") - listsBefore, 5, "one budget for both of b's folders");
+  assert.equal(ws.run_("r1").undoneAt, undefined);
+
+  ws.setFake("b", { folders: { ...ws.mailbox().accounts.b.folders, "Auto/Calendar": original["Auto/Calendar"] } });
+  const movesBefore = moves("b");
+  const second = ws.run("undo", "--run-id", "r1", "--account", "b").json;
+  assert.deepEqual([second.reversed, second.alreadyReversed, second.remaining, second.undone], [2, 2, 1, false]);
+  assert.equal(moves("b") - movesBefore, 1, "only the calendar folder moved; the reversed messages weren't touched again");
+
+  // a's move is still owed: the run is undone only once every inbox is.
+  const third = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([third.reversed, third.alreadyReversed, third.remaining, third.undone], [1, 4, 0, true]);
+  assert.equal(ws.run("undo", "--run-id", "r1").json.reused, true);
+  const box = ws.mailbox().accounts;
+  assert.equal(box.a.folders.INBOX.length, 6);
+  assert.equal(box.b.folders.INBOX.length, 8);
+  assert.deepEqual([box.b.folders["Auto/Notifications"].length, box.b.folders["Auto/Calendar"].length], [0, 0]);
+});
+
+test("older journals: dry-run entries never count, and moves without sender, subject and date are never guessed", () => {
+  const ws = twoInboxes();
+  fs.mkdirSync(path.join(ws.dir, ".mailkeeper", "runs"), { recursive: true });
+  fs.writeFileSync(
+    path.join(ws.dir, ".mailkeeper", "runs", "legacy-1.json"),
+    JSON.stringify({
+      runId: "legacy-1",
+      startedAt: daysAgo(30),
+      actions: [
+        { kind: "move", account: "b", uid: "1", from: "INBOX", to: "Auto/Notifications", dryRun: false },
+        { kind: "move", account: "b", uid: "2", from: "INBOX", to: "Auto/Notifications", dryRun: true },
+      ],
+    })
+  );
+  const undone = ws.run("undo", "--run-id", "legacy-1").json;
+  assert.deepEqual([undone.reversed, undone.remaining, undone.undone], [0, 1, false]);
+  assert.deepEqual(undone.unresolved.map((u) => [u.uid, u.reason]), [["1", "no-fingerprint"]]);
+  assert.equal((ws.mailbox().calls || []).some((call) => call.account === "b"), false, "the inbox isn't contacted");
+});
+
+test("pages with repeated, overlapping or unusable rows never count as a complete read", () => {
+  const raw = (id, extra = {}) => ({ ...msg(id, `p${id}@people.example`, `Hello ${id}`), ...extra });
+  const full = bulkInbox(200);
+  for (const [name, messages, listPages, stopReason, read] of [
+    ["within-page duplicate", standardInbox(), { 1: [raw(1), raw(1), raw(2)] }, "overlap", 2],
+    ["missing id", standardInbox(), { 1: [raw(1), raw(2, { id: undefined })] }, "invalid_response", 1],
+    ["bad uid", standardInbox(), { 1: [raw(1), raw("abc")] }, "invalid_response", 1],
+    ["flags not a list", standardInbox(), { 1: [raw(1), raw(2, { flags: "Flagged" })] }, "invalid_response", 1],
+    ["no sender", standardInbox(), { 1: [raw(1), raw(2, { from: null })] }, "invalid_response", 1],
+    ["overlap with page 1", full, { 2: [full[199], raw(9999)] }, "overlap", 201],
+    ["longer than asked", standardInbox(), { 1: bulkInbox(201) }, "invalid_response", 201],
+  ]) {
+    const ws = twoInboxes({ b: { messages } });
+    ws.setFake("b", { listPages });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+    assert.equal(snap.ok, true, name);
+    assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead], [false, stopReason, read], name);
+    const applied = ws.run("apply", "--account", "b", "--promoted-only", "--run-id", "r1").json;
+    assert.deepEqual([applied.dryRun, applied.reportOnly], [true, "partial-coverage"], name);
+    assert.equal(ws.mailbox().calls.some((call) => call.op === "message move"), false, name);
+  }
+  // Nothing usable on the first page is a failure, not an empty inbox.
+  const ws = twoInboxes();
+  ws.setFake("b", { listPages: { 1: [{ id: "1" }] } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+});
+
+test("a page still running at the deadline is cut off, its read process ended, and the read is partial", () => {
+  const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+  ws.setFake("b", {
+    listSlowPage: 2,
+    listSlowMs: 30_000,
+    // Out-of-bounds text from a read that then times out is still not an end.
+    listSlowStderr: "Error: \n   0: cannot list imap envelopes: page 2 out of bounds\n",
+  });
+  ws.env.MAILKEEPER_READ_DEADLINE_MS = "3000";
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  const started = Date.now();
+  const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+  const took = Date.now() - started;
+  assert.ok(took < 15_000, `the read ended near its deadline, not the page's own (${took} ms)`);
+  assert.deepEqual(
+    [snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead, snap.coverage.code],
+    [false, "deadline", 200, "MAILKEEPER_TIMEOUT"]
+  );
+  const pid = Number(fs.readFileSync(path.join(ws.dir, "fake-mailbox.json.slow-pid"), "utf8"));
+  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "the cut-off read process is gone");
+});
+
+test("only Himalaya's own page-past-the-end answer ends a listing; other failures that mention bounds don't", () => {
+  for (const [name, stderr] of [
+    ["another bounds error", "index out of bounds while parsing a header"],
+    ["another page", "cannot list imap envelopes: page 7 out of bounds"],
+    ["with a further cause", "cannot list imap envelopes: page 2 out of bounds\n   1: connection reset"],
+  ]) {
+    const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+    ws.setFake("b", { listStderrPage: 2, listStderr: stderr });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+    assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead], [false, "transport", 200], name);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1007,6 +1154,54 @@ function cli(dir, args, env = {}) {
   });
   return { ...result, json: JSON.parse(result.stdout) };
 }
+
+test("real Himalaya: a full page followed by the page past the end is a complete read", { skip: !HAS_HIMALAYA && "himalaya not installed" }, async () => {
+  const password = `mk-pages-${crypto.randomBytes(10).toString("hex")}`;
+  for (const [messages, pages] of [
+    [0, 1],
+    [200, 2],
+    [201, 2],
+  ]) {
+    const stub = await startImapStub({ user: "w@example.com", password, messages });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "mk-pages-"));
+    const configFile = path.join(home, "config.toml");
+    try {
+      const dir = setupWorkspace(configFile);
+      cli(dir, ["account-config", "--account", "work", "--email", "w@example.com", "--host", "127.0.0.1", "--port", String(stub.port), "--encryption", "none"]);
+      const rulesFile = path.join(dir, ".mailkeeper", "rules.json");
+      const rules = JSON.parse(fs.readFileSync(rulesFile, "utf8"));
+      rules.himalayaConfig.paths = [configFile];
+      rules.config.emailAccounts = ["work"];
+      const key = core.accountKey("work");
+      rules.accounts.work = { key, contract: core.contractRelativePath(key) };
+      fs.mkdirSync(path.join(dir, "mailboxes", key), { recursive: true });
+      const credential = { kind: "realtimex-secret", passwordRef: "secret://work-imap#password" };
+      fs.writeFileSync(
+        path.join(dir, core.contractRelativePath(key)),
+        `# work\n\n${core.renderPolicyBlock({ ...core.draftPolicy("work", { ageThresholdDays: 90 }), credential })}\n`
+      );
+      fs.writeFileSync(rulesFile, JSON.stringify(rules));
+      const env = {
+        ...process.env,
+        MAILKEEPER_HIMALAYA_BIN: "himalaya",
+        HIMALAYA_CONFIG: configFile,
+        MAILKEEPER_RTXEXEC_BIN: FAKE_RTXEXEC,
+        FAKE_SECRETS: JSON.stringify({ "work-imap": password }),
+        FAKE_RTX_SESSION: "1",
+      };
+      const run = async (...args) => {
+        const { stdout } = await execFileAsync(process.execPath, [OPS, ...args], { cwd: dir, env }).catch((error) => error);
+        return JSON.parse(stdout);
+      };
+      assert.equal((await run("begin", "--run-id", "r1")).ok, true);
+      const snap = await run("snapshot", "--account", "work", "--run-id", "r1");
+      assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead], [true, null, messages], `${messages} messages`);
+      assert.equal(stub.log.filter((event) => event.login === "accepted").length, pages, `${messages} messages: pages read`);
+    } finally {
+      await stub.close();
+    }
+  }
+});
 
 test("account-config writes only the chosen inbox's entry, with no password", { skip: !HAS_HIMALAYA && "himalaya not installed" }, () => {
   const sentinel = `inline-${crypto.randomBytes(8).toString("hex")}`;

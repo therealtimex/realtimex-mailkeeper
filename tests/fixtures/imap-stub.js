@@ -3,8 +3,10 @@
 /**
  * Minimal plaintext IMAP server for offline tests of the Himalaya credential
  * path. It accepts one synthetic login and answers CAPABILITY, LIST and
- * LOGOUT. It records each command verb and whether the login matched, never
- * the credential itself.
+ * LOGOUT. With `messages: <n>` it also serves a read-only folder of n
+ * synthetic messages (SELECT/EXAMINE, SEARCH and FETCH), for listing tests.
+ * It records each command verb and whether the login matched, never the
+ * credential itself.
  *
  *   mode "ok"   — greet and serve
  *   mode "hang" — accept the TCP connection and never greet (timeout case)
@@ -12,7 +14,7 @@
 
 const net = require("net");
 
-function startImapStub({ user, password, mode = "ok", folders = ["INBOX", "Archive"], onEvent } = {}) {
+function startImapStub({ user, password, mode = "ok", folders = ["INBOX", "Archive"], messages, onEvent } = {}) {
   const log = [];
   const record = (event) => {
     log.push(event);
@@ -61,6 +63,42 @@ function startImapStub({ user, password, mode = "ok", folders = ["INBOX", "Archi
           if (!authenticated) return send(`${tag} NO not authenticated`);
           for (const name of folders) send(`* LIST (\\HasNoChildren) "/" "${name}"`);
           return send(`${tag} OK LIST completed`);
+        case "SELECT":
+        case "EXAMINE":
+          if (!authenticated || messages === undefined) return send(`${tag} BAD unsupported in test stub`);
+          send("* FLAGS (\\Seen \\Answered \\Flagged \\Deleted \\Draft)");
+          send(`* ${messages} EXISTS`);
+          send("* 0 RECENT");
+          send("* OK [UIDVALIDITY 777] synthetic");
+          send(`* OK [UIDNEXT ${messages + 101}] synthetic`);
+          return send(`${tag} OK [READ-ONLY] selected`);
+        case "SEARCH":
+        case "FETCH":
+        case "UID": {
+          if (!authenticated || messages === undefined) return send(`${tag} BAD unsupported in test stub`);
+          const sub = verb === "UID" ? String(args[0]).toUpperCase() : verb;
+          const all = Array.from({ length: messages }, (_, i) => i + 1);
+          if (sub === "SEARCH" || sub === "SORT") {
+            send(`* ${sub} ${all.map((n) => (verb === "UID" ? n + 100 : n)).join(" ")}`.trim());
+            return send(`${tag} OK ${sub} completed`);
+          }
+          if (sub !== "FETCH") return send(`${tag} BAD unsupported in test stub`);
+          const set = String(args[verb === "UID" ? 1 : 0] || "");
+          record({ verb: `${verb} FETCH`, set });
+          const top = verb === "UID" ? messages + 100 : messages;
+          const inSet = (n) =>
+            set.split(",").some((part) => {
+              const range = part.split(":").map((x) => (x === "*" ? top : Number(x)));
+              return range.length === 1 ? n === range[0] : n >= Math.min(...range) && n <= Math.max(...range);
+            });
+          for (const n of all) {
+            const uid = n + 100;
+            if (!inSet(verb === "UID" ? uid : n)) continue;
+            const headers = `Date: 1 Oct 2026 12:00:00 +0000\r\nFrom: Fixture <sender${n}@example.test>\r\nSubject: Fixture ${uid}\r\n\r\n`;
+            socket.write(`* ${n} FETCH (UID ${uid} FLAGS () BODY[HEADER.FIELDS (DATE FROM TO SUBJECT MESSAGE-ID)] {${Buffer.byteLength(headers)}}\r\n${headers})\r\n`);
+          }
+          return send(`${tag} OK FETCH completed`);
+        }
         case "LOGOUT":
           send("* BYE logging out");
           send(`${tag} OK LOGOUT completed`);

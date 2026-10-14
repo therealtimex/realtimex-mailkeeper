@@ -10,7 +10,7 @@ const { execFile, spawnSync } = require("child_process");
 const { promisify } = require("util");
 
 const { startImapStub } = require("./fixtures/imap-stub");
-const { himalayaArgs, classify } = require("../skills/mailbox-cleanup/scripts/himalaya-runner");
+const { himalayaArgs, classify, isPageEnd } = require("../skills/mailbox-cleanup/scripts/himalaya-runner");
 
 const execFileAsync = promisify(execFile);
 const SCRIPTS = path.join(__dirname, "..", "skills", "mailbox-cleanup", "scripts");
@@ -227,6 +227,54 @@ test("a filtered listing signs in as the requested inbox, never the default acco
     }
   } finally {
     await stub.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("only Himalaya's own page-past-the-end diagnostic, alone and for the page asked, is an empty last page", () => {
+  // As Himalaya 1.2.0 prints it, colours included.
+  const end = {
+    status: 1,
+    signal: null,
+    stderr:
+      "Error: \n   0: \u001b[91mcannot list imap envelopes: page 4 out of bounds\u001b[0m\n\n\u001b[96mNote\u001b[0m: Run with --debug to enable logs with spantrace.\n",
+  };
+  const args = { page: "4" };
+  assert.equal(isPageEnd("envelope-list", args, end), true);
+  assert.equal(isPageEnd("folder-list", args, end), false);
+  assert.equal(isPageEnd("envelope-list", { page: "3" }, end), false, "another page");
+  assert.equal(isPageEnd("envelope-list", args, { ...end, status: 2 }), false);
+  assert.equal(isPageEnd("envelope-list", args, { ...end, status: null, signal: "SIGTERM" }), false, "a timeout");
+  assert.equal(isPageEnd("envelope-list", args, { ...end, error: Object.assign(new Error("spawn"), { code: "ETIMEDOUT" }) }), false);
+  assert.equal(isPageEnd("envelope-list", args, { ...end, stderr: `${end.stderr}   1: connection reset\n` }), false, "a further cause");
+  assert.equal(isPageEnd("envelope-list", args, { ...end, stderr: "Error: \n   0: index out of bounds while parsing a header\n" }), false);
+  assert.equal(isPageEnd("envelope-list", args, { ...end, stderr: "cannot list imap envelopes: page 4 out of bounds" }), false, "not Himalaya's error format");
+});
+
+test("real Himalaya: an empty folder and the page past a full last page both end the listing", { skip: !HAS_HIMALAYA && "himalaya not installed" }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mk-pages-"));
+  try {
+    for (const [messages, page, expected] of [
+      [0, 1, []],
+      [4, 2, ["101", "102"]],
+      [4, 3, []],
+      [5, 3, ["101"]],
+      [5, 4, []],
+    ]) {
+      const stub = await startImapStub({ user: USER, password: SENTINEL, messages });
+      try {
+        const run = await runRunner([
+          "envelope-list", "--account", "probe", "--config", writeConfig(dir, stub.port),
+          "--folder", "INBOX", "--page", String(page), "--size", "2", "--timeout-ms", "15000",
+        ]);
+        assert.equal(run.result.ok, true, `${messages} messages, page ${page}`);
+        assert.deepEqual(run.result.data.map((row) => row.id).sort(), expected, `${messages} messages, page ${page}`);
+        assertNoLeak(run);
+      } finally {
+        await stub.close();
+      }
+    }
+  } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });

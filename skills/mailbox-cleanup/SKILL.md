@@ -174,7 +174,7 @@ One report per run. Give each inbox its own section, inbox name first, and say w
 
 An inbox whose `outcome` is `partial` was read only in part, so nothing was moved in it. Use `coverage.inboxRead` for <n>:
 - `coverage.stopReason` is `budget` or `deadline`: "work@example.com: checked <n> messages. MailKeeper couldn't finish checking this inbox within this check's limit, so it only reports for it. Nothing was changed."
-- `no_progress`, `invalid_response` or `transport`: "work@example.com: checked part of the inbox, then couldn't continue. Nothing was changed."
+- `no_progress`, `overlap`, `invalid_response` or `transport`: "work@example.com: checked part of the inbox, then couldn't continue. Nothing was changed."
 
 Never give a size, a cause or a promise to continue.
 
@@ -197,10 +197,13 @@ mailbox-ops undo --run-id <id> [--account <name>] --dry-run     # preview first
 mailbox-ops undo --run-id <id> [--account <name>]
 ```
 
-Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date. Say plainly which ones it can't match (`unresolved`) before acting; they are left where they are. Undo checks every inbox before changing any.
+Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date, and only in a folder it could list to the end. Say plainly which ones it can't match (`unresolved`) before acting; they are left where they are. Undo checks every inbox before changing any. Take <folder> from `from`, and never suggest a message was deleted.
 - `not-found`: say they can't be found, and that they stay where they are.
-- `not-found-in-checked-part` (the folder was larger than undo can check): "I couldn't find <n> of them in the part of <folder> I can check in this version, so they stay where they are." Take <folder> from `from`. Never suggest they were deleted.
 - `ambiguous`: say several messages look the same, so undo leaves them where they are.
+- `folder-not-fully-checked`: "I can't safely undo <n> of them, because I could only check part of <folder> in this version. They stay where they are."
+- `no-fingerprint`: "I can't undo <n> of them: an earlier version of MailKeeper moved them and didn't record what I need to find them again. They stay where they are."
+
+When `remaining` is more than 0 after an undo, the run isn't fully undone: "<n> moves from this run are still in place. You can ask me to undo it again later; I'll only try those." Undo never reverses a move twice (`alreadyReversed`).
 
 ## When something fails
 

@@ -159,6 +159,24 @@ function classify(op, result) {
   return MUTATING.has(op) ? "MAILKEEPER_MUTATION_UNCERTAIN" : "MAILKEEPER_OPERATION_FAILED";
 }
 
+/**
+ * Himalaya 1.2 ends a listing by refusing the first page past the folder's
+ * message count ("cannot list imap envelopes: page N out of bounds"). Only that
+ * diagnostic, alone, for the page asked for, from a run that exited normally
+ * with status 1, is an empty last page. Any other failure, including a timeout,
+ * a signal or other "out of bounds" text, stays a failure.
+ */
+function isPageEnd(op, args, result) {
+  if (op !== "envelope-list" || result.error || result.signal || result.status !== 1) return false;
+  const page = positiveInt(args.page, 100000);
+  const causes = String(result.stderr || "")
+    .replace(/\u001b\[[0-9;]*m/g, "")
+    .split(/\r?\n/)
+    .filter((line) => /^\s*\d+: /.test(line))
+    .map((line) => line.trim());
+  return Boolean(page) && causes.length === 1 && causes[0] === `0: cannot list imap envelopes: page ${page} out of bounds`;
+}
+
 function main() {
   const op = process.argv[2];
   const args = parseArgs(process.argv.slice(3));
@@ -203,7 +221,7 @@ function main() {
   result.stderr = String(result.stderr || "").slice(0, MAX_STDERR);
 
   if (result.status !== 0 || result.error) {
-    if (op === "envelope-list" && /out of bound/i.test(result.stderr)) emit({ ok: true, op, data: [] });
+    if (isPageEnd(op, args, result)) emit({ ok: true, op, data: [] });
     emit({ ok: false, op, code: classify(op, result) });
   }
   const stdout = String(result.stdout || "").trim();
@@ -231,4 +249,4 @@ if (require.main === module) {
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
 
-module.exports = { himalayaArgs, classify, cleanName };
+module.exports = { himalayaArgs, classify, cleanName, isPageEnd };

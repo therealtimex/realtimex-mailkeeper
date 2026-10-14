@@ -65,8 +65,16 @@ const BATCH = 200;
 // Containment until bounded reading lands (realtimex-mailkeeper#6): each inbox
 // reads at most this many pages, within this time, per snapshot or undo.
 const READ_PAGE_BUDGET = 5;
-const READ_DEADLINE_MS = 60_000;
+// MAILKEEPER_READ_DEADLINE_MS can only shorten the limit (tests use it); a
+// shorter limit only makes a read partial sooner.
+const READ_DEADLINE_MS = Math.min(60_000, Number(env.MAILKEEPER_READ_DEADLINE_MS) > 0 ? Number(env.MAILKEEPER_READ_DEADLINE_MS) : 60_000);
+// A page isn't started with less than this left before the deadline.
+const READ_MIN_PAGE_MS = 1_000;
+// The wrapper (rtxexec) gets this much more than the runner, whose own
+// timeout ends Himalaya first.
+const WRAPPER_MARGIN_MS = 5_000;
 const RUNNER_TIMEOUT_MS = 120_000;
+const UID_RE = /^[0-9]{1,12}$/;
 
 const MESSAGES = {
   MAILKEEPER_NOT_CONFIGURED: "MailKeeper isn't configured for this workspace yet.",
@@ -791,7 +799,7 @@ function lastJsonLine(stdout) {
  * A Secrets password is resolved by rtxexec into the runner's environment;
  * this process only ever handles the reference.
  */
-function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false } = {}) {
+function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, timeoutMs = RUNNER_TIMEOUT_MS } = {}) {
   const config = pinnedConfig(rules);
   if (config.missing) throw failure("MAILKEEPER_HIMALAYA_CONFIG_MISSING", { account: inbox.account });
   const credential = inbox.policy.credential;
@@ -801,7 +809,7 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false } = {}) {
     RUNNER, op,
     "--account", inbox.account,
     ...config.paths.flatMap((file) => ["--config", file]),
-    "--timeout-ms", String(RUNNER_TIMEOUT_MS),
+    "--timeout-ms", String(timeoutMs),
     ...opArgs,
   ];
   const childEnv = { ...env, MAILKEEPER_CREDENTIAL_KIND: credential.kind };
@@ -816,7 +824,7 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false } = {}) {
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     maxBuffer: 80 * 1024 * 1024,
-    timeout: RUNNER_TIMEOUT_MS + 30_000,
+    timeout: timeoutMs + (timeoutMs < RUNNER_TIMEOUT_MS ? WRAPPER_MARGIN_MS : 30_000),
   });
   if (result.error?.code === "ENOENT") {
     throw failure(command === RTXEXEC ? "MAILKEEPER_RTXEXEC_UNAVAILABLE" : "MAILKEEPER_OPERATION_FAILED", { account: inbox.account });
@@ -863,14 +871,39 @@ function readBudget() {
 }
 
 /**
+ * A listing row MailKeeper can act on: a UID it can move, and every field its
+ * protections read (sender, subject, date, flags), in Himalaya 1.2's shape.
+ */
+function validRow(row) {
+  return (
+    Boolean(row) &&
+    typeof row === "object" &&
+    !Array.isArray(row) &&
+    (typeof row.id === "string" || Number.isInteger(row.id)) &&
+    UID_RE.test(String(row.id)) &&
+    Array.isArray(row.flags) &&
+    row.flags.every((flag) => typeof flag === "string") &&
+    typeof row.subject === "string" &&
+    typeof row.date === "string" &&
+    Boolean(row.from) &&
+    typeof row.from === "object" &&
+    typeof row.from.addr === "string"
+  );
+}
+
+/**
  * List a folder's envelopes, unfiltered, within a shared page and time budget.
  * Himalaya's filtered queries repeat pages (pimalaya/himalaya#668), so none is
- * used. The result says whether the listing reached its natural end
- * (an empty or short page: `complete`) or why it stopped: `budget` (a full
- * page at the cap proves nothing), `deadline`, `no_progress` (a page with
- * nothing new), `invalid_response`, or `transport` (a failure after earlier
- * pages, whose rows are kept). A failure or invalid answer before any row is thrown. Even a complete
- * listing is unverified: page numbers can shift while the mailbox changes.
+ * used. The listing is `complete` only when a short or empty page arrives in
+ * time and every page was valid and new. Otherwise it stops with a reason:
+ * `budget` (a full page at the cap proves nothing), `deadline` (including a
+ * page cut off or returned after it), `no_progress` (a page with nothing new),
+ * `overlap` (a page repeating some earlier UIDs), `invalid_response` (an answer
+ * that isn't a list, is too long or has a row MailKeeper can't use), or
+ * `transport` (a failure after earlier pages). Valid unique rows already read
+ * are kept for the report. A failure or invalid answer before any row is
+ * thrown. Even a complete listing is unverified: page numbers can shift while
+ * the mailbox changes.
  */
 function listCapped(rules, inbox, folder, budget) {
   const out = [];
@@ -880,27 +913,48 @@ function listCapped(rules, inbox, folder, budget) {
   const stop = (stopReason, extra = {}) => ({ envelopes: out, complete: false, stopReason, pages, ...extra });
   for (let page = 1; ; page += 1) {
     if (budget.pagesLeft <= 0) return stop("budget");
-    if (Date.now() >= budget.deadline) return stop("deadline");
+    const left = budget.deadline - Date.now();
+    if (left < READ_MIN_PAGE_MS) return stop("deadline");
     budget.pagesLeft -= 1;
+    // The page's own timeout ends at the deadline, so no page outlives it.
+    const timeoutMs = Math.min(RUNNER_TIMEOUT_MS, left);
     let rows;
     try {
-      rows = mailboxOp(rules, inbox, "envelope-list", ["--folder", folder, "--page", String(page), "--size", String(BATCH)]);
+      rows = mailboxOp(rules, inbox, "envelope-list", ["--folder", folder, "--page", String(page), "--size", String(BATCH)], { timeoutMs });
     } catch (error) {
       if (!out.length) throw error;
-      return stop("transport", { code: error.code || null });
+      const cutOff = error.code === "MAILKEEPER_TIMEOUT" && timeoutMs < RUNNER_TIMEOUT_MS;
+      return stop(cutOff ? "deadline" : "transport", { code: error.code || null });
     }
     pages += 1;
+    const late = Date.now() > budget.deadline;
     if (!Array.isArray(rows)) {
       if (!out.length) throw failure("MAILKEEPER_OPERATION_FAILED", { account: inbox.account });
       return stop("invalid_response");
     }
-    if (!rows.length) return { envelopes: out, complete: true, stopReason: null, pages };
-    const fresh = rows.filter((row) => !seen.has(String(row.id)));
-    if (!fresh.length) return stop("no_progress");
-    for (const row of fresh) {
-      seen.add(String(row.id));
+    let invalid = rows.length > BATCH;
+    let repeated = false;
+    let added = 0;
+    for (const row of rows) {
+      if (!validRow(row)) {
+        invalid = true;
+        continue;
+      }
+      const uid = String(row.id);
+      if (seen.has(uid)) {
+        repeated = true;
+        continue;
+      }
+      seen.add(uid);
       out.push(normalize(row, folder, now));
+      added += 1;
     }
+    if (invalid) {
+      if (!out.length) throw failure("MAILKEEPER_OPERATION_FAILED", { account: inbox.account });
+      return stop("invalid_response");
+    }
+    if (repeated) return stop(added ? "overlap" : "no_progress");
+    if (late) return stop("deadline");
     if (rows.length < BATCH) return { envelopes: out, complete: true, stopReason: null, pages };
   }
 }
@@ -1196,6 +1250,11 @@ function ensureFolder(rules, inbox, name) {
  * becomes `uncertain` and stops further moves for this inbox. Confirmed
  * chunks are kept whatever happens later.
  */
+/** One recorded move, by inbox, source, UID and destination. */
+function moveKey(action) {
+  return `${action.account}\n${action.from}\n${action.uid}\n${action.to}`;
+}
+
 function moveChunks(run, rules, inbox, envelopes, from, to, extra) {
   let moved = 0;
   for (let i = 0; i < envelopes.length; i += BATCH) {
@@ -1220,6 +1279,7 @@ function moveChunks(run, rules, inbox, envelopes, from, to, extra) {
         date: e.date,
         fromAddress: e.fromAddress,
         subject: e.subject.slice(0, 200),
+        ...(e.reverses ? { reverses: e.reverses } : {}),
         ...extra,
       });
     }
@@ -2159,8 +2219,12 @@ const commands = {
   /**
    * Reverse a run's confirmed moves. IMAP gives a message a new UID in its
    * destination folder, so a moved message is found again by its recorded
-   * sender, subject and date; a message that matches none or several is
-   * reported as unresolved instead of guessed.
+   * sender, subject and date, and only in a destination folder listed to its
+   * end: a single match in part of a folder can't rule out its twin in the
+   * rest. Anything not matched exactly once is reported unresolved, never
+   * guessed. Each reversal is recorded against the move it reverses, so a
+   * later attempt works only on what is left, and the run counts as undone
+   * only once every move in it has been reversed.
    */
   undo(args) {
     const rules = loadRules();
@@ -2173,8 +2237,10 @@ const commands = {
       output({ ok: true, runId, reused: true, undoneAt: run.undoneAt });
       return;
     }
-    const actions = (run.actions || []).filter((a) => a.kind === "move" && (!only || a.account === only));
-    const accounts = [...new Set(actions.map((a) => a.account))];
+    // A dry-run entry (older versions recorded them) never moved anything.
+    const moves = (run.actions || []).filter((a) => a.kind === "move" && a.dryRun !== true);
+    const scoped = moves.filter((a) => !only || a.account === only);
+    const accounts = [...new Set(scoped.map((a) => a.account))];
     // Preflight every inbox before touching any of them.
     const inboxes = new Map();
     for (const account of accounts) {
@@ -2187,50 +2253,82 @@ const commands = {
     acquireGuard(undoRunId, "undo", undoOwner);
     const undoRun = readJson(runFile(undoRunId)) || newRun(undoRunId, rules, accounts, "undo", undoOwner);
     if (undoRun.uncertain?.length) throw failure("MAILKEEPER_MUTATION_UNCERTAIN");
-    const report = { reversed: 0, unresolved: [] };
+    const reversedKeys = () =>
+      new Set(undoRun.actions.filter((a) => a.undoOf === runId && typeof a.reverses === "string").map((a) => a.reverses));
+    const before = reversedKeys();
+    const report = { reversed: 0, alreadyReversed: 0, unresolved: [] };
+    const unresolved = (action, reason) =>
+      report.unresolved.push({ account: action.account, uid: action.uid, from: action.to, to: action.from, reason });
     try {
       for (const account of accounts) {
         const inbox = inboxes.get(account);
         enrollAccount(undoRun, inbox);
+        // One read budget per inbox, shared by all its destination folders.
+        const budget = readBudget();
         const groups = new Map();
-        for (const action of actions.filter((a) => a.account === account)) {
+        for (const action of scoped.filter((a) => a.account === account)) {
+          if (before.has(moveKey(action))) {
+            report.alreadyReversed += 1;
+            continue;
+          }
+          // Moves recorded without sender, subject and date can't be found again.
+          if (![action.fromAddress, action.subject, action.date].every((field) => typeof field === "string")) {
+            unresolved(action, "no-fingerprint");
+            continue;
+          }
           const key = `${action.to}\n${action.from}`;
           if (!groups.has(key)) groups.set(key, { from: action.to, to: action.from, items: [] });
           groups.get(key).items.push(action);
         }
         for (const group of groups.values()) {
-          // The destination's most recent pages, unfiltered and within the read
-          // budget; a message beyond them is reported unresolved, never guessed.
-          // Not found in a listing that stopped early is only "not in the part
-          // checked", never "gone".
-          const listing = listCapped(rules, inbox, group.from, readBudget());
-          const present = listing.envelopes;
-          const missing = listing.complete ? "not-found" : "not-found-in-checked-part";
-          const matches = [];
+          const listing = listCapped(rules, inbox, group.from, budget);
+          if (!listing.complete) {
+            for (const action of group.items) unresolved(action, "folder-not-fully-checked");
+            continue;
+          }
+          // A destination message claimed by two moves is ambiguous for both.
+          const claims = new Map();
           for (const action of group.items) {
-            const hits = present.filter(
+            const hits = listing.envelopes.filter(
               (e) => e.fromAddress === action.fromAddress && e.subject.slice(0, 200) === action.subject && e.date === action.date
             );
-            if (hits.length === 1) matches.push(hits[0]);
-            else report.unresolved.push({ account, uid: action.uid, from: group.from, to: group.to, reason: hits.length ? "ambiguous" : missing });
+            if (hits.length !== 1) {
+              unresolved(action, hits.length ? "ambiguous" : "not-found");
+              continue;
+            }
+            claims.set(hits[0].uid, [...(claims.get(hits[0].uid) || []), { action, hit: hits[0] }]);
           }
-          if (!dryRun && matches.length) {
-            report.reversed += moveChunks(undoRun, rules, inbox, matches, group.from, group.to, { undoOf: runId });
-          } else if (dryRun) {
-            report.reversed += matches.length;
+          const matches = [];
+          for (const claimants of claims.values()) {
+            if (claimants.length > 1) for (const { action } of claimants) unresolved(action, "ambiguous");
+            else matches.push({ ...claimants[0].hit, reverses: moveKey(claimants[0].action) });
           }
+          if (dryRun) report.reversed += matches.length;
+          else if (matches.length) report.reversed += moveChunks(undoRun, rules, inbox, matches, group.from, group.to, { undoOf: runId });
         }
       }
     } finally {
       saveRun(undoRun);
       releaseGuard(undoRunId, undoRun);
     }
+    const reversed = reversedKeys();
+    const remaining = moves.filter((a) => !reversed.has(moveKey(a))).length - (dryRun ? report.reversed : 0);
     if (!dryRun) {
-      run.undoneAt = new Date().toISOString();
-      run.undo = { reversed: report.reversed, unresolved: report.unresolved.length };
+      const at = new Date().toISOString();
+      run.undo = { reversed: moves.length - remaining, remaining, unresolved: report.unresolved.length, at };
+      if (remaining === 0) run.undoneAt = at;
       saveRun(run);
     }
-    output({ ok: true, runId, dryRun, reversed: report.reversed, unresolved: report.unresolved });
+    output({
+      ok: true,
+      runId,
+      dryRun,
+      reversed: report.reversed,
+      alreadyReversed: report.alreadyReversed,
+      remaining,
+      undone: !dryRun && remaining === 0,
+      unresolved: report.unresolved,
+    });
   },
 
   release(args) {

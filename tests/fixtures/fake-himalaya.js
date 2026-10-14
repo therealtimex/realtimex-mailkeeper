@@ -8,7 +8,9 @@
  *   { accounts: { <name>: { credential: { kind: "secret", password } | { kind: "native" },
  *                           folders: { INBOX: [ { id, from: { addr, name }, subject, date, flags, unsubscribe } ] },
  *                           nextUid, failMove: null | "unknown" | "auth", failMoveAfter: <n successful moves>,
- *                           listFailPage, listInvalidPage, listRepeatPage: <page number> } },
+ *                           listFailPage, listInvalidPage, listRepeatPage, listSlowPage: <page number>,
+ *                           listSlowMs, listStderrPage + listStderr (a custom failure),
+ *                           listPages: { <page>: [rows as returned, valid or not] } } },
  *     calls: [ { op, account } ] }
  *
  * Like the real tool, a moved message gets a new UID in its destination.
@@ -91,13 +93,24 @@ if (group === "folder" && action === "list") {
   // Test switches for one listing page: a transport failure, an answer that
   // isn't a list, or the previous page again (pimalaya/himalaya#668).
   if (account.listFailPage === page) die("connection reset by peer");
+  if (account.listStderrPage === page) die(account.listStderr);
+  if (account.listSlowPage === page) {
+    // Record this process so a test can check it was ended, then outlast the caller.
+    fs.writeFileSync(`${file}.slow-pid`, String(process.pid));
+    if (account.listSlowStderr) process.stderr.write(account.listSlowStderr);
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, account.listSlowMs || 30_000);
+  }
+  if (account.listPages && account.listPages[page]) {
+    process.stdout.write(JSON.stringify(account.listPages[page]));
+    return;
+  }
   if (account.listInvalidPage === page) {
     process.stdout.write(JSON.stringify({ envelopes: [] }));
     return;
   }
   const shown = account.listRepeatPage === page ? page - 1 : page;
   const slice = list.slice((shown - 1) * size, shown * size);
-  if (page > 1 && slice.length === 0) die("page out of bounds");
+  if (page > 1 && slice.length === 0) die(`cannot list imap envelopes: page ${page} out of bounds`);
   process.stdout.write(JSON.stringify(slice.map(({ unsubscribe, ...row }) => row)));
 } else if (group === "message" && action === "move") {
   const from = options.f;

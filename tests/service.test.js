@@ -622,7 +622,11 @@ test("readAdmission is read-only and reports begin evidence without inferring a 
   fs.writeFileSync(f.lock, JSON.stringify({ runId: "r1" }));
   assert.equal((await f.service.readAdmission(f.workspace)).begin, "observed", "its guard is held");
   fs.rmSync(f.lock);
-  fs.writeFileSync(path.join(state, "runs", "r1.json"), "{}");
+  for (const bytes of ["{}", "not json", JSON.stringify({ runId: "r2" })]) {
+    fs.writeFileSync(path.join(state, "runs", "r1.json"), bytes);
+    assert.equal((await f.service.readAdmission(f.workspace)).begin, "unknown", `a file that isn't r1's journal: ${bytes}`);
+  }
+  fs.writeFileSync(path.join(state, "runs", "r1.json"), JSON.stringify({ runId: "r1", actions: [] }));
   view = await f.service.readAdmission(f.workspace);
   assert.deepEqual([view.state, view.begin], ["held", "observed"], "a journal never hides the hold");
 

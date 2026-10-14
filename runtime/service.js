@@ -37,7 +37,7 @@ function text(value, max = 500) {
 }
 
 const INBOX_OUTCOMES = ["completed", "partial", "skipped", "blocked", "failed"];
-const READ_STOP_REASONS = ["budget", "deadline", "no_progress", "invalid_response", "transport"];
+const READ_STOP_REASONS = ["budget", "deadline", "no_progress", "overlap", "invalid_response", "transport"];
 
 /**
  * Each inbox's outcome for the run list, from fixed values only: whether its
@@ -600,8 +600,9 @@ class MailKeeperService {
    * The Run admission as the store holds it now, read-only: whether it holds
    * the next run (the admission rule in mailkeeper-core), which run and
    * occurrence, its trigger and start, and whether that run was seen to
-   * begin (`observed` when its guard or journal exists, `not_observed` when
-   * neither does, `unknown` when they can't be read). Not observing a begin
+   * begin (`observed` when its guard or its own journal names it,
+   * `not_observed` when neither exists, `unknown` when they can't be read or
+   * don't name it). Not observing a begin
    * never means the launch failed or stopped. Nothing is ingested or changed.
    */
   async readAdmission(workspace) {
@@ -620,8 +621,14 @@ class MailKeeperService {
     const journal = readable(path.join(state, "runs", `${path.basename(active.runId)}.json`));
     let begin = "not_observed";
     if (lock === undefined || journal === undefined) begin = "unknown";
-    else if (journal !== null) begin = "observed";
-    else if (lock !== null) {
+    else if (journal !== null) {
+      // Only a MailKeeper journal for this run is evidence that it began.
+      try {
+        begin = JSON.parse(journal)?.runId === active.runId ? "observed" : "unknown";
+      } catch {
+        begin = "unknown";
+      }
+    } else if (lock !== null) {
       try {
         begin = JSON.parse(lock).runId === active.runId ? "observed" : "not_observed";
       } catch {
