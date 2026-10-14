@@ -336,6 +336,7 @@ class MailKeeperService {
     const workspaces = await this.host.workspaces.listEnabledForPlugin();
     for (const workspace of workspaces) {
       try {
+        await this.reconcileAdmission(workspace);
         await this.provision(workspace);
       } catch (error) {
         this.api.log?.error?.(`MailKeeper boot provision failed for ${workspace.slug}`, {
@@ -555,13 +556,86 @@ class MailKeeperService {
   withRunState(workspace, work) {
     const key = String(workspace.id);
     const prior = this.runStateQueues.get(key) || Promise.resolve();
-    const run = prior.then(work);
+    // Every change, and every failed one, ends by rebuilding the workspace's
+    // admission projection from the store, so a failed write heals next time.
+    const run = prior.then(async () => {
+      try {
+        return await work();
+      } finally {
+        await this.syncAdmissionProjection(workspace);
+      }
+    });
     const settled = run.catch(() => {});
     this.runStateQueues.set(key, settled);
     settled.then(() => {
       if (this.runStateQueues.get(key) === settled) this.runStateQueues.delete(key);
     });
     return run;
+  }
+
+  /**
+   * The Run admission as the store holds it now, read-only: whether it holds
+   * the next run (the admission rule in mailkeeper-core), which run and
+   * occurrence, its trigger and start, and whether that run was seen to
+   * begin (`observed` when its guard or journal exists, `not_observed` when
+   * neither does, `unknown` when they can't be read). Not observing a begin
+   * never means the launch failed or stopped. Nothing is ingested or changed.
+   */
+  async readAdmission(workspace) {
+    const observedAt = new Date().toISOString();
+    const active = await this.store.get(this.activeRunKey(workspace));
+    if (!core.admissionHeld(active)) return { state: "clear", observedAt };
+    const state = path.join(workspace.workingDirectory, ".mailkeeper");
+    const readable = (file) => {
+      try {
+        return fs.readFileSync(file, "utf8");
+      } catch (error) {
+        return error?.code === "ENOENT" ? null : undefined;
+      }
+    };
+    const lock = readable(path.join(state, "run.lock"));
+    const journal = readable(path.join(state, "runs", `${path.basename(active.runId)}.json`));
+    let begin = "not_observed";
+    if (lock === undefined || journal === undefined) begin = "unknown";
+    else if (journal !== null) begin = "observed";
+    else if (lock !== null) {
+      try {
+        begin = JSON.parse(lock).runId === active.runId ? "observed" : "not_observed";
+      } catch {
+        begin = "unknown";
+      }
+    }
+    return {
+      state: "held",
+      runId: active.runId,
+      heartbeatRunId: active.heartbeatRunId || null,
+      trigger: typeof active.trigger === "string" ? active.trigger : null,
+      admittedAt: active.startedAt,
+      begin,
+      observedAt,
+    };
+  }
+
+  /**
+   * Write `.mailkeeper/admission.json` from the store, for the workspace
+   * helper, which can't read the plugin store. It is a last-observed copy,
+   * never the authority: failures are logged and repaired on the next change.
+   */
+  async syncAdmissionProjection(workspace) {
+    try {
+      if (!workspace?.workingDirectory || !fs.existsSync(workspace.workingDirectory)) return;
+      const view = await this.readAdmission(workspace);
+      const { begin, ...projection } = view;
+      const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "admission.json"));
+      writeJsonAtomic(target, { schemaVersion: 1, ...projection });
+    } catch (error) {
+      this.api.log?.warn?.("MailKeeper admission projection not written", { workspace: workspace?.slug, code: error?.code || null });
+    }
+  }
+
+  /** Rebuild the admission projection from the store (at plugin start). */
+  async reconcileAdmission(workspace) {
+    return this.withRunState(workspace, async () => {});
   }
 
   /** Clear the active run marker only if it is still `runId`'s. */
@@ -906,13 +980,14 @@ class MailKeeperService {
       // A run that submitted its receipt has ended, whatever the host reported.
       await this.ingestOutboxLocked(workspace);
       const active = await this.store.get(this.activeRunKey(workspace));
-      if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {
+      if (core.admissionHeld(active)) {
         return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
       }
       const runId = crypto.randomUUID();
       await this.store.set(this.activeRunKey(workspace), {
         runId,
         heartbeatRunId: context.heartbeatRunId || null,
+        trigger: typeof context.trigger === "string" ? context.trigger : null,
         startedAt: new Date().toISOString(),
       });
       return { mailkeeperRunId: runId };

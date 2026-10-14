@@ -360,7 +360,20 @@ function ruleId({ account, pass, query, action }) {
     .slice(0, 16);
 }
 
+// A heartbeat admission holds the next one for this long. The plugin admits by
+// this rule and the workspace helper reads the hold with it, so they agree.
+const ADMISSION_HOLD_MS = 6 * 60 * 60 * 1000;
+
+/** Whether an admission marker `{ runId, startedAt }` still holds the next run. */
+function admissionHeld(marker, now = Date.now()) {
+  if (!marker || typeof marker.runId !== "string" || !marker.runId) return false;
+  const started = Date.parse(marker.startedAt);
+  return Number.isFinite(started) && now - started < ADMISSION_HOLD_MS;
+}
+
 module.exports = {
+  ADMISSION_HOLD_MS,
+  admissionHeld,
   MODES,
   AGGRESSIVENESS,
   PASSES_BY_AGGRESSIVENESS,

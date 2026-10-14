@@ -125,6 +125,8 @@ Adding another inbox later repeats steps 2–4 for that inbox only.
 
 ## Running
 
+After a chat run's `submit`, run `mailbox-ops status`. If `schedule.admission.state` is `held` and its `runId` isn't this run's, add once: "The Run button and scheduled checks may still be on hold: MailKeeper couldn't confirm what happened to its last check, today at 19:08. I can keep running it here when you ask." Say "last Run" only when `trigger` is `manual`, take the time from `since` (leave it out when missing), and never give an end time or a cause.
+
 Every run uses one run ID and one guard per workspace. Chat, the schedule and undo never run at the same time. `MAILKEEPER_RUN_BUSY` means an earlier run hasn't been confirmed as ended: don't start, don't `submit`, and report it as the failure table says. Always finish with `submit`, which writes the run's single receipt.
 
 ```sh

@@ -611,6 +611,55 @@ function managedTaskNow(taskId) {
 }
 
 /**
+ * The Run admission as the plugin last wrote it (`.mailkeeper/admission.json`).
+ * It is a last-observed copy this helper can't confirm is current, so a hold
+ * is only ever "may be held". Unknown when the file is missing, unreadable or
+ * unsupported; a held copy past the shared admission window no longer holds.
+ * `begin` says whether that run was seen to begin here: its journal or guard
+ * exists (`observed`), neither does (`not_observed`), or they can't be read.
+ */
+function admissionNow() {
+  let projection;
+  try {
+    projection = JSON.parse(fs.readFileSync(statePath("admission.json"), "utf8"));
+  } catch {
+    return { state: "unknown" };
+  }
+  if (!projection || typeof projection !== "object" || projection.schemaVersion !== 1) return { state: "unknown" };
+  const observedAt = typeof projection.observedAt === "string" ? projection.observedAt : null;
+  if (projection.state === "clear") return { state: "clear", observedAt };
+  if (projection.state !== "held" || typeof projection.runId !== "string" || !projection.runId) return { state: "unknown" };
+  if (!core.admissionHeld({ runId: projection.runId, startedAt: projection.admittedAt })) return { state: "clear", observedAt };
+  const read = (file) => {
+    try {
+      return fs.readFileSync(file, "utf8");
+    } catch (error) {
+      return error?.code === "ENOENT" ? null : undefined;
+    }
+  };
+  const journal = read(runFile(projection.runId));
+  const lock = read(lockFile());
+  let begin = "not_observed";
+  if (journal === undefined || lock === undefined) begin = "unknown";
+  else if (journal !== null) begin = "observed";
+  else if (lock !== null) {
+    try {
+      begin = JSON.parse(lock).runId === projection.runId ? "observed" : "not_observed";
+    } catch {
+      begin = "unknown";
+    }
+  }
+  return {
+    state: "held",
+    runId: projection.runId,
+    trigger: typeof projection.trigger === "string" ? projection.trigger : null,
+    since: Number.isFinite(Date.parse(projection.admittedAt)) ? projection.admittedAt : null,
+    begin,
+    observedAt,
+  };
+}
+
+/**
  * The schedule as it is now. rules.json's schedule counts only while the
  * latest provisioning attempt is the ready one that wrote it; then a schedule
  * is claimed only when the heartbeat is on and the host's task list has the
@@ -649,7 +698,7 @@ function scheduleNow(rules) {
     task,
     scheduled,
   };
-  return { ...schedule, closing: scheduleClosing(schedule) };
+  return { ...schedule, closing: scheduleClosing(schedule), admission: admissionNow() };
 }
 
 /**

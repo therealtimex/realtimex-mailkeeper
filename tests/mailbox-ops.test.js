@@ -559,6 +559,37 @@ test("begin records its terminal session; another run's guard is reported as unc
   assert.deepEqual(lock().owner, { terminalSessionId: null }, "disagreeing sources record no owner");
 });
 
+test("status reads the admission projection as last observed, never as a confirmed hold", () => {
+  const ws = twoInboxes();
+  ws.writeRules({ provisionAttempt: "a1", schedule: { cadence: "manual", manual: true } });
+  const file = path.join(ws.dir, ".mailkeeper", "admission.json");
+  const admission = () => ws.run("status").json.schedule.admission;
+  const now = new Date().toISOString();
+
+  assert.deepEqual(admission(), { state: "unknown" }, "no projection");
+  fs.writeFileSync(file, "{");
+  assert.deepEqual(admission(), { state: "unknown" }, "corrupt");
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, state: "clear" }));
+  assert.deepEqual(admission(), { state: "unknown" }, "unsupported version");
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "clear", observedAt: now }));
+  assert.equal(admission().state, "clear");
+
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", trigger: "manual", admittedAt: now, observedAt: now }));
+  assert.deepEqual(
+    [admission().state, admission().runId, admission().trigger, admission().since, admission().begin],
+    ["held", "r1", "manual", now, "not_observed"]
+  );
+  fs.mkdirSync(path.join(ws.dir, ".mailkeeper", "runs"), { recursive: true });
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "runs", "r1.json"), "{}");
+  assert.equal(admission().begin, "observed");
+
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", admittedAt: "not a time", observedAt: now }));
+  assert.equal(admission().state, "clear", "no trustworthy admission time: the shared rule doesn't hold it");
+  const old = new Date(Date.now() - 7 * 3600 * 1000).toISOString();
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", admittedAt: old, observedAt: old }));
+  assert.equal(admission().state, "clear", "past the shared admission window");
+});
+
 test("status reports the four setup criteria per inbox and the schedule", () => {
   const ws = twoInboxes();
   ws.writeRules({ schedule: { cadence: "1d", paused: true, threadSlug: "mailkeeper-maintenance-7" } });

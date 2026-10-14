@@ -585,6 +585,61 @@ test("a failed owner-file write is repaired when the same event repeats", async 
   assert.equal(fs.existsSync(sidecar), true, "an identical event restores a missing owner file");
 });
 
+test("readAdmission is read-only and reports begin evidence without inferring a stop", async () => {
+  const f = runFixture();
+  const state = path.dirname(f.lock);
+  f.store.set("ws-7-active", { runId: "r1", heartbeatRunId: "hb-1", trigger: "manual", startedAt: new Date().toISOString() });
+  f.receipt("old-run");
+  const snapshot = () => [JSON.stringify(f.active()), fs.existsSync(f.lock), fs.readdirSync(path.join(state, "outbox")).join(",")];
+  const before = snapshot();
+
+  let view = await f.service.readAdmission(f.workspace);
+  assert.deepEqual([view.state, view.runId, view.trigger, view.begin], ["held", "r1", "manual", "not_observed"], "a marker with no journal");
+  await f.service.readAdmission(f.workspace);
+  assert.deepEqual(snapshot(), before, "repeated reads leave the outbox, marker and guard unchanged");
+
+  fs.writeFileSync(f.lock, JSON.stringify({ runId: "r1" }));
+  assert.equal((await f.service.readAdmission(f.workspace)).begin, "observed", "its guard is held");
+  fs.rmSync(f.lock);
+  fs.writeFileSync(path.join(state, "runs", "r1.json"), "{}");
+  view = await f.service.readAdmission(f.workspace);
+  assert.deepEqual([view.state, view.begin], ["held", "observed"], "a journal never hides the hold");
+
+  f.store.set("ws-7-active", { runId: "r1", startedAt: new Date(Date.now() - 7 * 3600 * 1000).toISOString() });
+  assert.equal((await f.service.readAdmission(f.workspace)).state, "clear", "past the shared admission window");
+});
+
+test("the admission projection follows the store through admission, end, stale events and failures", async () => {
+  const f = runFixture();
+  const projection = path.join(path.dirname(f.lock), "admission.json");
+  const read = () => JSON.parse(fs.readFileSync(projection, "utf8"));
+
+  const a = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual", heartbeatRunId: "hb-a" });
+  assert.deepEqual([read().state, read().runId, read().trigger], ["held", a.mailkeeperRunId, "manual"]);
+  assert.equal("begin" in read(), false, "the projection carries the hold, not a liveness claim");
+
+  // A's receipt admits B; a late end event from A can't clear B's projection.
+  f.receipt(a.mailkeeperRunId);
+  const b = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "scheduled", heartbeatRunId: "hb-b" });
+  await f.end("hb-a");
+  assert.deepEqual([read().state, read().runId], ["held", b.mailkeeperRunId]);
+
+  // A failed projection write leaves a stale copy; the next change repairs it.
+  fs.rmSync(projection);
+  fs.mkdirSync(path.join(projection, "blocked"), { recursive: true });
+  await f.end("hb-b");
+  assert.equal(f.active(), null, "the end still ends the run");
+  fs.rmSync(projection, { recursive: true });
+  await f.service.status(f.workspace);
+  assert.equal(read().state, "clear", "repaired on the next change");
+
+  // Plugin start rebuilds it from the store, whatever the file says.
+  f.store.set("ws-7-active", { runId: "r9", heartbeatRunId: "hb-9", startedAt: new Date().toISOString() });
+  fs.writeFileSync(projection, "corrupt");
+  await f.service.reconcileAdmission(f.workspace);
+  assert.deepEqual([read().state, read().runId], ["held", "r9"]);
+});
+
 test("concurrent admissions start at most one run", async () => {
   const f = runFixture();
   const results = await Promise.all(
