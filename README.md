@@ -126,7 +126,11 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 
 ### Upgrading from 0.1
 
-The first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
+**Not yet:** updating from 0.1 currently removes your approved cleanup rules and in-app run history, because of a RealTimeX issue (realtimex-ai-app#2460). Keep 0.1 until that's fixed; this page will say when it's safe to update.
+
+Moves made by MailKeeper 0.1 can't be undone in this version, because that version didn't record enough information to find the moved messages again.
+
+Once updating is safe, the first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
 
 - **One inbox:** its text is copied into that inbox's contract.
 - **Several inboxes:** each gets a conservative draft.
@@ -139,7 +143,7 @@ To roll back to 0.1:
 2. Install 0.1.
 3. Before you enable it again, reconcile the old shared `MAILBOX.md` with the inboxes you want: 0.1 doesn't read per-inbox contracts.
 
-Receipts and contracts are kept either way.
+Contracts and the run records in the workspace (`.mailkeeper/runs`) are kept either way; until realtimex-ai-app#2460 is fixed, a reinstall in either direction removes the in-app run history and approved rules.
 
 ## Development
 

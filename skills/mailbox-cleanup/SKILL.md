@@ -197,13 +197,17 @@ mailbox-ops undo --run-id <id> [--account <name>] --dry-run     # preview first
 mailbox-ops undo --run-id <id> [--account <name>]
 ```
 
-Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date, and only in a folder it could list to the end. Say plainly which ones it can't match (`unresolved`) before acting; they are left where they are. Undo checks every inbox before changing any. Take <folder> from `from`, and never suggest a message was deleted.
-- `not-found`: say they can't be found, and that they stay where they are.
-- `ambiguous`: say several messages look the same, so undo leaves them where they are.
-- `folder-not-fully-checked`: "I can't safely undo <n> of them, because I could only check part of <folder> in this version. They stay where they are."
-- `no-fingerprint`: "I can't undo <n> of them: an earlier version of MailKeeper moved them and didn't record what I need to find them again. They stay where they are."
+Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date, and only in a folder it could list to the end. Undo checks every inbox before changing any. Before acting, say which ones it can't undo (`unresolved`), one line per reason, with <n> their count and <folder> from `from`:
+- `not-found`: "I couldn't find <n> of them in <folder>. I didn't move those messages."
+- `ambiguous`: "I can't safely undo <n> of them, because I can't tell which messages in <folder> belong to those moves. I didn't move those messages."
+- `folder-not-fully-checked`: "I can't safely undo <n> of them, because I could only check part of <folder> in this version. I didn't move those messages."
+- `no-fingerprint`: "I can't undo <n> of them, because MailKeeper didn't record what I need to find them again. I didn't move those messages."
 
-When `remaining` is more than 0 after an undo, the run isn't fully undone: "<n> moves from this run are still in place. You can ask me to undo it again later; I'll only try those." Undo never reverses a move twice (`alreadyReversed`).
+"I didn't move those messages" covers only these unresolved ones. Never say it, or anything about where a message is, for a move whose result is unknown.
+
+When `remaining` is more than 0 after an undo: "I haven't undone <n> moves from this run." Add "You can ask me to undo it again later." only when `retryMayHelp` is true. Asking again tries only moves without a confirmed reversal.
+
+If undo returns `MUTATION_UNCERTAIN`, an earlier undo move was never confirmed: use the failure table's line and its check, and never start another undo before that check.
 
 ## When something fails
 

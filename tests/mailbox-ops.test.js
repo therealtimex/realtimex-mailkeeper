@@ -973,18 +973,59 @@ test("undo never moves from a folder it couldn't list to its end, not even a sin
   const before = listCalls(ws, "b", "Auto/Notifications").length;
   const undone = ws.run("undo", "--run-id", "r1").json;
   assert.deepEqual([undone.reversed, undone.remaining, undone.undone], [0, 2, false]);
-  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["folder-not-fully-checked", "folder-not-fully-checked"]);
+  assert.deepEqual(undone.unresolved.map((u) => [u.reason, u.stopReason]), [
+    ["folder-not-fully-checked", "budget"],
+    ["folder-not-fully-checked", "budget"],
+  ]);
+  assert.equal(undone.retryMayHelp, false, "a folder too large to check isn't helped by trying again");
   assert.ok(undone.unresolved.every((u) => u.from === "Auto/Notifications" && u.to === "INBOX"));
+
   const calls = listCalls(ws, "b", "Auto/Notifications").slice(before);
   assert.equal(calls.length, 5);
   assert.ok(calls.every((call) => call.query === ""));
   assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 1003, "nothing moved back, not even the look-alike");
+  // A connection problem part-way through the listing is one a retry may get past.
+  ws.setFake("b", { listFailPage: 2 });
+  const dropped = ws.run("undo", "--run-id", "r1", "--dry-run").json;
+  assert.deepEqual([dropped.reversed, dropped.retryMayHelp, dropped.unresolved[0].stopReason], [0, true, "transport"]);
+  ws.setFake("b", { listFailPage: null });
 
   // The run stays undoable: once the folder can be listed to its end, it is.
   ws.setFake("b", { folders });
   const later = ws.run("undo", "--run-id", "r1").json;
   assert.deepEqual([later.reversed, later.remaining, later.undone], [2, 0, true]);
   assert.equal(ws.run("undo", "--run-id", "r1").json.reused, true);
+});
+
+test("an undo move never confirmed blocks the next undo until it is reconciled", () => {
+  const ws = twoInboxes();
+  maintenance(ws, "r1");
+  ws.run("undo", "--run-id", "r1", "--dry-run");
+  const undoFile = path.join(ws.dir, ".mailkeeper", "runs", "undo-r1.json");
+  const lock = path.join(ws.dir, ".mailkeeper", "run.lock");
+  // As left by a crash after the move was sent, before it was confirmed.
+  const journal = JSON.parse(fs.readFileSync(undoFile, "utf8"));
+  const destination = ws.mailbox().accounts.b.folders["Auto/Notifications"];
+  journal.pending = { account: "b", from: "Auto/Notifications", to: "INBOX", uids: destination.map((e) => e.id), undoOf: "r1", at: new Date().toISOString() };
+  fs.writeFileSync(undoFile, JSON.stringify(journal));
+  fs.writeFileSync(lock, JSON.stringify({ runId: "undo-r1", trigger: "undo", startedAt: new Date().toISOString() }));
+  const callsBefore = ws.mailbox().calls.length;
+  const lockBefore = fs.readFileSync(lock, "utf8");
+
+  for (const args of [["--dry-run"], []]) {
+    const refused = ws.run("undo", "--run-id", "r1", ...args).json;
+    assert.equal(refused.code, "MAILKEEPER_MUTATION_UNCERTAIN", args.join(" "));
+  }
+  assert.equal(ws.mailbox().calls.length, callsBefore, "no listing or move");
+  assert.deepEqual(JSON.parse(fs.readFileSync(undoFile, "utf8")).pending, journal.pending, "the pending move is kept");
+  assert.equal(fs.readFileSync(lock, "utf8"), lockBefore, "the guard is kept");
+  assert.equal(ws.run_("r1").undoneAt, undefined);
+
+  // After the person checks the inbox, reconciling releases it; nothing is replayed.
+  assert.equal(ws.run("release", "--run-id", "undo-r1", "--reconciled").json.released, true);
+  assert.equal(ws.mailbox().calls.length, callsBefore);
+  const after = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([after.reversed, after.undone], [2, true]);
 });
 
 test("a partial undo stays recoverable across destinations, inboxes and attempts, sharing one read budget per inbox", () => {
@@ -1089,26 +1130,58 @@ test("pages with repeated, overlapping or unusable rows never count as a complet
   assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
 });
 
-test("a page still running at the deadline is cut off, its read process ended, and the read is partial", () => {
-  const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
-  ws.setFake("b", {
-    listSlowPage: 2,
-    listSlowMs: 30_000,
-    // Out-of-bounds text from a read that then times out is still not an end.
-    listSlowStderr: "Error: \n   0: cannot list imap envelopes: page 2 out of bounds\n",
-  });
-  ws.env.MAILKEEPER_READ_DEADLINE_MS = "3000";
-  ws.run("begin", "--run-id", "r1", "--account", "b");
-  const started = Date.now();
-  const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
-  const took = Date.now() - started;
-  assert.ok(took < 15_000, `the read ended near its deadline, not the page's own (${took} ms)`);
-  assert.deepEqual(
-    [snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead, snap.coverage.code],
-    [false, "deadline", 200, "MAILKEEPER_TIMEOUT"]
-  );
-  const pid = Number(fs.readFileSync(path.join(ws.dir, "fake-mailbox.json.slow-pid"), "utf8"));
-  assert.throws(() => process.kill(pid, 0), { code: "ESRCH" }, "the cut-off read process is gone");
+const alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+test("a page still running at the deadline is cut off, and its read process and runner end, even if it ignores SIGTERM", () => {
+  for (const ignoreTerm of [false, true]) {
+    const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+    ws.setFake("b", {
+      listSlowPage: 2,
+      listSlowMs: 30_000,
+      listIgnoreTerm: ignoreTerm,
+      // Out-of-bounds text from a read that then times out is still not an end.
+      listSlowStderr: "Error: \n   0: cannot list imap envelopes: page 2 out of bounds\n",
+    });
+    ws.env.MAILKEEPER_READ_DEADLINE_MS = "3000";
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    const started = Date.now();
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+    const took = Date.now() - started;
+    assert.ok(took < 6_000, `ignoreTerm ${ignoreTerm}: the read ended at its deadline (${took} ms)`);
+    assert.deepEqual(
+      [snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead, snap.coverage.code],
+      [false, "deadline", 200, "MAILKEEPER_TIMEOUT"]
+    );
+    const { pid, runner } = JSON.parse(fs.readFileSync(path.join(ws.dir, "fake-mailbox.json.slow-pid"), "utf8"));
+    assert.equal(alive(pid), false, `ignoreTerm ${ignoreTerm}: the read process is gone`);
+    assert.equal(alive(runner), false, `ignoreTerm ${ignoreTerm}: its runner is gone`);
+  }
+});
+
+test("a wrapper that starts late never starts the read, and one stuck past the deadline is ended", () => {
+  for (const delay of [6_000, 9_000]) {
+    const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+    Object.assign(ws.env, { MAILKEEPER_READ_DEADLINE_MS: "3000", FAKE_RTXEXEC_DELAY_PAGE: "2", FAKE_RTXEXEC_DELAY_MS: String(delay) });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    const started = Date.now();
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+    const took = Date.now() - started;
+    // 6 s: the runner starts after the deadline and runs nothing. 9 s: the
+    // wrapper is killed at the deadline plus its margin, before it starts one.
+    assert.ok(took < Math.min(delay, 8_000) + 1_500, `delay ${delay}: returned after ${took} ms`);
+    assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead], [false, "deadline", 200], `delay ${delay}`);
+    const wrapper = Number(fs.readFileSync(path.join(ws.dir, "fake-mailbox.json.wrapper-pid"), "utf8"));
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay === 9_000 ? 2_000 : 0);
+    assert.equal(alive(wrapper), false, `delay ${delay}: the wrapper is gone`);
+    assert.equal(listCalls(ws, "b").some((call) => call.page === 2), false, `delay ${delay}: page 2 was never read`);
+  }
 });
 
 test("only Himalaya's own page-past-the-end answer ends a listing; other failures that mention bounds don't", () => {

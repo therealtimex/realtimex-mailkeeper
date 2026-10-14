@@ -9,7 +9,8 @@
  *                           folders: { INBOX: [ { id, from: { addr, name }, subject, date, flags, unsubscribe } ] },
  *                           nextUid, failMove: null | "unknown" | "auth", failMoveAfter: <n successful moves>,
  *                           listFailPage, listInvalidPage, listRepeatPage, listSlowPage: <page number>,
- *                           listSlowMs, listStderrPage + listStderr (a custom failure),
+ *                           listSlowMs, listIgnoreTerm (the slow page ignores SIGTERM),
+ *                           listStderrPage + listStderr (a custom failure),
  *                           listPages: { <page>: [rows as returned, valid or not] } } },
  *     calls: [ { op, account } ] }
  *
@@ -61,7 +62,7 @@ function mailboxCommand() {
 
 const account = state.accounts[options.a];
 if (!account) die(`cannot find configuration for account ${options.a}`);
-state.calls.push({ op: `${group} ${action}`, account: options.a, ...(group === "envelope" ? { folder: options.f, query: rest.join(" ") } : {}) });
+state.calls.push({ op: `${group} ${action}`, account: options.a, ...(group === "envelope" ? { folder: options.f, page: Number(options.p), query: rest.join(" ") } : {}) });
 save();
 
 // Authentication, as the real tool would perform it through the auth command.
@@ -95,8 +96,9 @@ if (group === "folder" && action === "list") {
   if (account.listFailPage === page) die("connection reset by peer");
   if (account.listStderrPage === page) die(account.listStderr);
   if (account.listSlowPage === page) {
-    // Record this process so a test can check it was ended, then outlast the caller.
-    fs.writeFileSync(`${file}.slow-pid`, String(process.pid));
+    // Record this process and its runner so a test can check both ended, then outlast the caller.
+    fs.writeFileSync(`${file}.slow-pid`, JSON.stringify({ pid: process.pid, runner: process.ppid }));
+    if (account.listIgnoreTerm) process.on("SIGTERM", () => {});
     if (account.listSlowStderr) process.stderr.write(account.listSlowStderr);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, account.listSlowMs || 30_000);
   }

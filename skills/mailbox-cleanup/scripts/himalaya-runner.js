@@ -15,6 +15,10 @@
  * parsed as JSON, stderr is only matched against fixed patterns, and neither
  * is ever printed. Only allowlisted codes leave.
  *
+ * `--deadline-at <epoch ms>` bounds a read in absolute time: checked when
+ * this process starts (after the wrapper resolved the credential), so a late
+ * start runs nothing, and Himalaya is killed (SIGKILL) when it is reached.
+ *
  *   folder-list
  *   envelope-list --folder <f> --page <n> --size <n> [--query <q>]
  *   message-move  --from <f> --to <f> --uid <uid> [--uid <uid> ...]
@@ -23,7 +27,7 @@
 
 const fs = require("fs");
 const path = require("path");
-const { spawnSync } = require("child_process");
+const { spawn } = require("child_process");
 
 // realtimex-plugin-validator: allow-process-env -- terminal-side runner: the Himalaya binary path and the rtxexec-injected credential are runtime transport, never plugin configuration.
 const env = process.env;
@@ -32,6 +36,8 @@ const MAX_UIDS = 200;
 const MAX_STDOUT = 64 * 1024 * 1024;
 const MAX_STDERR = 64 * 1024;
 const MUTATING = new Set(["message-move", "folder-add"]);
+// Himalaya isn't started with less than this left before --deadline-at.
+const MIN_START_MS = 250;
 
 /** Ends main() with one result; written once, after main returns. */
 class Result {
@@ -177,7 +183,54 @@ function isPageEnd(op, args, result) {
   return Boolean(page) && causes.length === 1 && causes[0] === `0: cannot list imap envelopes: page ${page} out of bounds`;
 }
 
-function main() {
+/**
+ * Run Himalaya once. At the timeout it is killed with SIGKILL, which it can't
+ * ignore, and the result returns as soon as it exits, without waiting for any
+ * pipe another process may still hold.
+ */
+function runHimalaya(argv, childEnv, timeoutMs) {
+  return new Promise((resolve) => {
+    const child = spawn(HIMALAYA, argv, { env: childEnv, shell: false, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let timedOut = false;
+    let overflow = false;
+    let settled = false;
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      resolve({ stdout, stderr, ...result });
+    };
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGKILL");
+    }, timeoutMs);
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk;
+      if (stdout.length > MAX_STDOUT) {
+        overflow = true;
+        child.kill("SIGKILL");
+      }
+    });
+    child.stderr.on("data", (chunk) => {
+      if (stderr.length < MAX_STDERR) stderr += chunk;
+    });
+    child.on("error", (error) => finish({ error, status: null, signal: null }));
+    child.on("exit", (status, signal) => {
+      if (timedOut) finish({ error: { code: "ETIMEDOUT" }, status, signal });
+    });
+    child.on("close", (status, signal) => {
+      finish({ error: overflow ? { code: "ENOBUFS" } : timedOut ? { code: "ETIMEDOUT" } : undefined, status, signal });
+    });
+  });
+}
+
+async function main() {
   const op = process.argv[2];
   const args = parseArgs(process.argv.slice(3));
   if (!args) emit({ ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" });
@@ -199,23 +252,23 @@ function main() {
     emit({ ok: false, op, code: "MAILKEEPER_CREDENTIAL_UNAVAILABLE" });
   }
 
-  const timeoutMs = positiveInt(args["timeout-ms"] ?? 120000, 600000) || 120000;
-  const result = spawnSync(
-    HIMALAYA,
+  let timeoutMs = positiveInt(args["timeout-ms"] ?? 120000, 600000) || 120000;
+  if (args["deadline-at"] !== undefined) {
+    const deadlineAt = positiveInt(args["deadline-at"], Number.MAX_SAFE_INTEGER);
+    if (!deadlineAt) emit({ ok: false, op, code: "MAILKEEPER_OPERATION_FAILED" });
+    const left = deadlineAt - Date.now();
+    if (left < MIN_START_MS) emit({ ok: false, op, code: "MAILKEEPER_TIMEOUT" });
+    timeoutMs = Math.min(timeoutMs, left);
+  }
+  const result = await runHimalaya(
     [
       ...opArgs.command,
       ...opArgs.options,
       "-a", account, "-o", "json", "--quiet", ...configs.flatMap((file) => ["-c", file]),
       ...opArgs.positionals,
     ],
-    {
-      env: childEnv,
-      shell: false,
-      stdio: ["ignore", "pipe", "pipe"],
-      timeout: timeoutMs,
-      maxBuffer: MAX_STDOUT,
-      encoding: "utf8",
-    }
+    childEnv,
+    timeoutMs
   );
   // Bound what we inspect; we never print it.
   result.stderr = String(result.stderr || "").slice(0, MAX_STDERR);
@@ -236,17 +289,15 @@ function main() {
 }
 
 if (require.main === module) {
-  let result;
-  try {
-    main();
-    result = { ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" };
-  } catch (error) {
-    result = error instanceof Result ? error.value : { ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" };
-  }
-  // Exit naturally: on macOS a pipe write is asynchronous, and process.exit()
-  // right after it would cut a large envelope page short.
-  process.exitCode = result.ok ? 0 : 1;
-  process.stdout.write(`${JSON.stringify(result)}\n`);
+  main()
+    .then(() => ({ ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" }))
+    .catch((error) => (error instanceof Result ? error.value : { ok: false, op: null, code: "MAILKEEPER_OPERATION_FAILED" }))
+    .then((result) => {
+      // Exit naturally: on macOS a pipe write is asynchronous, and process.exit()
+      // right after it would cut a large envelope page short.
+      process.exitCode = result.ok ? 0 : 1;
+      process.stdout.write(`${JSON.stringify(result)}\n`);
+    });
 }
 
 module.exports = { himalayaArgs, classify, cleanName, isPageEnd };

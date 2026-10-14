@@ -70,8 +70,9 @@ const READ_PAGE_BUDGET = 5;
 const READ_DEADLINE_MS = Math.min(60_000, Number(env.MAILKEEPER_READ_DEADLINE_MS) > 0 ? Number(env.MAILKEEPER_READ_DEADLINE_MS) : 60_000);
 // A page isn't started with less than this left before the deadline.
 const READ_MIN_PAGE_MS = 1_000;
-// The wrapper (rtxexec) gets this much more than the runner, whose own
-// timeout ends Himalaya first.
+// A deadline-bound read's wrapper (rtxexec) is killed this long after the
+// deadline. The runner itself checks the deadline when it starts and kills
+// Himalaya when it is reached, so this only ends a wrapper stuck before that.
 const WRAPPER_MARGIN_MS = 5_000;
 const RUNNER_TIMEOUT_MS = 120_000;
 const UID_RE = /^[0-9]{1,12}$/;
@@ -799,7 +800,7 @@ function lastJsonLine(stdout) {
  * A Secrets password is resolved by rtxexec into the runner's environment;
  * this process only ever handles the reference.
  */
-function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, timeoutMs = RUNNER_TIMEOUT_MS } = {}) {
+function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, deadlineAt = null } = {}) {
   const config = pinnedConfig(rules);
   if (config.missing) throw failure("MAILKEEPER_HIMALAYA_CONFIG_MISSING", { account: inbox.account });
   const credential = inbox.policy.credential;
@@ -809,7 +810,8 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, timeoutMs 
     RUNNER, op,
     "--account", inbox.account,
     ...config.paths.flatMap((file) => ["--config", file]),
-    "--timeout-ms", String(timeoutMs),
+    "--timeout-ms", String(RUNNER_TIMEOUT_MS),
+    ...(deadlineAt ? ["--deadline-at", String(deadlineAt)] : []),
     ...opArgs,
   ];
   const childEnv = { ...env, MAILKEEPER_CREDENTIAL_KIND: credential.kind };
@@ -824,7 +826,9 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, timeoutMs 
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     maxBuffer: 80 * 1024 * 1024,
-    timeout: timeoutMs + (timeoutMs < RUNNER_TIMEOUT_MS ? WRAPPER_MARGIN_MS : 30_000),
+    ...(deadlineAt
+      ? { timeout: Math.max(0, deadlineAt - Date.now()) + WRAPPER_MARGIN_MS, killSignal: "SIGKILL" }
+      : { timeout: RUNNER_TIMEOUT_MS + 30_000 }),
   });
   if (result.error?.code === "ENOENT") {
     throw failure(command === RTXEXEC ? "MAILKEEPER_RTXEXEC_UNAVAILABLE" : "MAILKEEPER_OPERATION_FAILED", { account: inbox.account });
@@ -916,15 +920,15 @@ function listCapped(rules, inbox, folder, budget) {
     const left = budget.deadline - Date.now();
     if (left < READ_MIN_PAGE_MS) return stop("deadline");
     budget.pagesLeft -= 1;
-    // The page's own timeout ends at the deadline, so no page outlives it.
-    const timeoutMs = Math.min(RUNNER_TIMEOUT_MS, left);
+    // The page runs against the same absolute deadline, so no page outlives it.
     let rows;
     try {
-      rows = mailboxOp(rules, inbox, "envelope-list", ["--folder", folder, "--page", String(page), "--size", String(BATCH)], { timeoutMs });
+      rows = mailboxOp(rules, inbox, "envelope-list", ["--folder", folder, "--page", String(page), "--size", String(BATCH)], {
+        deadlineAt: budget.deadline,
+      });
     } catch (error) {
       if (!out.length) throw error;
-      const cutOff = error.code === "MAILKEEPER_TIMEOUT" && timeoutMs < RUNNER_TIMEOUT_MS;
-      return stop(cutOff ? "deadline" : "transport", { code: error.code || null });
+      return stop(error.code === "MAILKEEPER_TIMEOUT" ? "deadline" : "transport", { code: error.code || null });
     }
     pages += 1;
     const late = Date.now() > budget.deadline;
@@ -2252,13 +2256,15 @@ const commands = {
     const undoOwner = { terminalSessionId: terminalSessionId() };
     acquireGuard(undoRunId, "undo", undoOwner);
     const undoRun = readJson(runFile(undoRunId)) || newRun(undoRunId, rules, accounts, "undo", undoOwner);
-    if (undoRun.uncertain?.length) throw failure("MAILKEEPER_MUTATION_UNCERTAIN");
+    // An earlier attempt's move that was never confirmed is reconciled first
+    // (`release --reconciled`), never retried or overwritten.
+    if (undoRun.pending || undoRun.uncertain?.length) throw failure("MAILKEEPER_MUTATION_UNCERTAIN");
     const reversedKeys = () =>
       new Set(undoRun.actions.filter((a) => a.undoOf === runId && typeof a.reverses === "string").map((a) => a.reverses));
     const before = reversedKeys();
     const report = { reversed: 0, alreadyReversed: 0, unresolved: [] };
-    const unresolved = (action, reason) =>
-      report.unresolved.push({ account: action.account, uid: action.uid, from: action.to, to: action.from, reason });
+    const unresolved = (action, reason, extra = {}) =>
+      report.unresolved.push({ account: action.account, uid: action.uid, from: action.to, to: action.from, reason, ...extra });
     try {
       for (const account of accounts) {
         const inbox = inboxes.get(account);
@@ -2283,7 +2289,7 @@ const commands = {
         for (const group of groups.values()) {
           const listing = listCapped(rules, inbox, group.from, budget);
           if (!listing.complete) {
-            for (const action of group.items) unresolved(action, "folder-not-fully-checked");
+            for (const action of group.items) unresolved(action, "folder-not-fully-checked", { stopReason: listing.stopReason });
             continue;
           }
           // A destination message claimed by two moves is ambiguous for both.
@@ -2327,6 +2333,9 @@ const commands = {
       alreadyReversed: report.alreadyReversed,
       remaining,
       undone: !dryRun && remaining === 0,
+      // Another attempt could get further only when a folder's listing was cut
+      // short by the time limit or a connection problem.
+      retryMayHelp: report.unresolved.some((u) => ["deadline", "transport"].includes(u.stopReason)),
       unresolved: report.unresolved,
     });
   },
