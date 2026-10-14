@@ -45,8 +45,8 @@ function writeConfig(dir, port, { account = "probe", helperAccount = account, au
   return file;
 }
 
-async function runRunner(args, { kind = "realtimex-secret", credential = SENTINEL } = {}) {
-  const env = { ...process.env, MAILKEEPER_CREDENTIAL_KIND: kind };
+async function runRunner(args, { kind = "realtimex-secret", credential = SENTINEL, env: extra = {} } = {}) {
+  const env = { ...process.env, MAILKEEPER_CREDENTIAL_KIND: kind, ...extra };
   delete env.MAILKEEPER_IMAP_PASSWORD;
   if (credential !== null) env.MAILKEEPER_IMAP_PASSWORD = credential;
   try {
@@ -198,7 +198,7 @@ test("a filtered listing signs in as the requested inbox, never the default acco
       'email = "decoy@example.invalid"',
       'backend.type = "imap"',
       'backend.host = "127.0.0.1"',
-      "backend.port = 9",
+      `backend.port = ${stub.port}`, // reachable, so a resolved decoy really runs its auth command
       'backend.encryption.type = "none"',
       'backend.login = "decoy@example.invalid"',
       'backend.auth.type = "password"',
@@ -207,15 +207,24 @@ test("a filtered listing signs in as the requested inbox, never the default acco
     ].join("\n");
     const config = writeConfig(dir, stub.port);
     fs.writeFileSync(config, decoy + fs.readFileSync(config, "utf8"));
+    // Pin every default-config lookup to the fixture too, so even if `-c` were
+    // swallowed Himalaya could only reach this decoy, never the machine's config.
+    const home = path.join(dir, "home");
+    fs.mkdirSync(home);
+    const isolated = { HIMALAYA_CONFIG: config, HOME: home, XDG_CONFIG_HOME: path.join(home, ".config") };
     for (const query of ["body unsubscribe", "after 2026-01-01"]) {
-      const run = await runRunner([
-        "envelope-list", "--account", "probe", "--config", config,
-        "--folder", "INBOX", "--page", "1", "--size", "2", "--query", query, "--timeout-ms", "15000",
-      ]);
+      const accepted = stub.log.filter((event) => event.login === "accepted").length;
+      const run = await runRunner(
+        [
+          "envelope-list", "--account", "probe", "--config", config,
+          "--folder", "INBOX", "--page", "1", "--size", "2", "--query", query, "--timeout-ms", "15000",
+        ],
+        { env: isolated }
+      );
       assert.equal(fs.existsSync(marker), false, `the default account's auth never runs for "${query}"`);
+      assert.equal(stub.log.filter((event) => event.login === "accepted").length, accepted + 1, `"${query}" signed in as the requested inbox`);
       assertNoLeak(run, fs.readFileSync(config, "utf8"));
     }
-    assert.ok(stub.log.some((event) => event.login === "accepted"), "the requested inbox signed in");
   } finally {
     await stub.close();
     fs.rmSync(dir, { recursive: true, force: true });
