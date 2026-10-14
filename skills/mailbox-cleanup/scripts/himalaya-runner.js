@@ -89,18 +89,28 @@ function validConfigs(list) {
   return list;
 }
 
-/** Map one operation to Himalaya argv. Per-subcommand options go last. */
+/**
+ * Map one operation to Himalaya's command, its options and its positional
+ * arguments. Every option, including the account and config, must come before
+ * the positionals: Himalaya reads everything after an envelope query as more
+ * query text, so a trailing `-a`/`-c` would be ignored and its default
+ * account used instead.
+ */
 function himalayaArgs(op, args) {
   switch (op) {
     case "folder-list":
-      return ["folder", "list"];
+      return { command: ["folder", "list"], options: [], positionals: [] };
     case "envelope-list": {
       const folder = cleanName(args.folder);
       const page = positiveInt(args.page, 100000);
       const size = positiveInt(args.size, 1000);
       const query = args.query === undefined ? "" : cleanName(args.query, 500);
       if (!folder || !page || !size || query === null) return null;
-      return ["envelope", "list", "-f", folder, "-p", String(page), "-s", String(size), ...(query ? [query] : [])];
+      return {
+        command: ["envelope", "list"],
+        options: ["-f", folder, "-p", String(page), "-s", String(size)],
+        positionals: query ? [query] : [],
+      };
     }
     case "message-move": {
       const from = cleanName(args.from);
@@ -108,11 +118,11 @@ function himalayaArgs(op, args) {
       const uids = args.uid;
       if (!from || !to || from === to || !uids.length || uids.length > MAX_UIDS) return null;
       if (!uids.every((uid) => /^[0-9]{1,12}$/.test(uid))) return null;
-      return ["message", "move", "-f", from, to, ...uids];
+      return { command: ["message", "move"], options: ["-f", from], positionals: [to, ...uids] };
     }
     case "folder-add": {
       const name = cleanName(args.name);
-      return name ? ["folder", "add", name] : null;
+      return name ? { command: ["folder", "add"], options: [], positionals: [name] } : null;
     }
     default:
       return null;
@@ -174,7 +184,12 @@ function main() {
   const timeoutMs = positiveInt(args["timeout-ms"] ?? 120000, 600000) || 120000;
   const result = spawnSync(
     HIMALAYA,
-    [...opArgs, "-a", account, "-o", "json", "--quiet", ...configs.flatMap((file) => ["-c", file])],
+    [
+      ...opArgs.command,
+      ...opArgs.options,
+      "-a", account, "-o", "json", "--quiet", ...configs.flatMap((file) => ["-c", file]),
+      ...opArgs.positionals,
+    ],
     {
       env: childEnv,
       shell: false,

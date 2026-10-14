@@ -76,14 +76,18 @@ function assertNoLeak(run, ...surfaces) {
 }
 
 test("runner maps operations to bounded Himalaya argv", () => {
-  assert.deepEqual(himalayaArgs("folder-list", {}), ["folder", "list"]);
-  assert.deepEqual(
-    himalayaArgs("envelope-list", { folder: "INBOX", page: "2", size: "200", query: "after 2026-01-01" }),
-    ["envelope", "list", "-f", "INBOX", "-p", "2", "-s", "200", "after 2026-01-01"]
-  );
-  assert.deepEqual(himalayaArgs("message-move", { from: "INBOX", to: "Auto/Bulk", uid: ["1", "22"] }), [
-    "message", "move", "-f", "INBOX", "Auto/Bulk", "1", "22",
-  ]);
+  assert.deepEqual(himalayaArgs("folder-list", {}), { command: ["folder", "list"], options: [], positionals: [] });
+  // The query is a positional: it is placed after every option, so it can't swallow -a/-c.
+  assert.deepEqual(himalayaArgs("envelope-list", { folder: "INBOX", page: "2", size: "200", query: "after 2026-01-01" }), {
+    command: ["envelope", "list"],
+    options: ["-f", "INBOX", "-p", "2", "-s", "200"],
+    positionals: ["after 2026-01-01"],
+  });
+  assert.deepEqual(himalayaArgs("message-move", { from: "INBOX", to: "Auto/Bulk", uid: ["1", "22"] }), {
+    command: ["message", "move"],
+    options: ["-f", "INBOX"],
+    positionals: ["Auto/Bulk", "1", "22"],
+  });
   // Unknown operations, control characters, non-numeric UIDs and no-op moves are refused.
   assert.equal(himalayaArgs("message-delete", { uid: ["1"] }), null);
   assert.equal(himalayaArgs("folder-add", { name: "Auto/\nInjected" }), null);
@@ -175,6 +179,43 @@ test("Secrets credential reaches Himalaya only through the auth pipe", { skip: !
 
     const notConfigured = await runRunner(["folder-list", "--account", "other", "--config", writeConfig(dir, stub.port)]);
     assert.equal(notConfigured.result.code, "MAILKEEPER_ACCOUNT_NOT_FOUND");
+  } finally {
+    await stub.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a filtered listing signs in as the requested inbox, never the default account", { skip: !HAS_HIMALAYA && "himalaya not installed" }, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mk-argv-"));
+  const stub = await startImapStub({ user: USER, password: SENTINEL });
+  const marker = path.join(dir, "decoy-auth-ran");
+  try {
+    // A default account whose auth command leaves a marker if Himalaya ever
+    // resolves it, ahead of the inbox the runner asks for.
+    const decoy = [
+      "[accounts.decoy]",
+      "default = true",
+      'email = "decoy@example.invalid"',
+      'backend.type = "imap"',
+      'backend.host = "127.0.0.1"',
+      "backend.port = 9",
+      'backend.encryption.type = "none"',
+      'backend.login = "decoy@example.invalid"',
+      'backend.auth.type = "password"',
+      `backend.auth.cmd = ${JSON.stringify(`/usr/bin/touch ${JSON.stringify(marker)}`)}`,
+      "",
+    ].join("\n");
+    const config = writeConfig(dir, stub.port);
+    fs.writeFileSync(config, decoy + fs.readFileSync(config, "utf8"));
+    for (const query of ["body unsubscribe", "after 2026-01-01"]) {
+      const run = await runRunner([
+        "envelope-list", "--account", "probe", "--config", config,
+        "--folder", "INBOX", "--page", "1", "--size", "2", "--query", query, "--timeout-ms", "15000",
+      ]);
+      assert.equal(fs.existsSync(marker), false, `the default account's auth never runs for "${query}"`);
+      assertNoLeak(run, fs.readFileSync(config, "utf8"));
+    }
+    assert.ok(stub.log.some((event) => event.login === "accepted"), "the requested inbox signed in");
   } finally {
     await stub.close();
     fs.rmSync(dir, { recursive: true, force: true });
