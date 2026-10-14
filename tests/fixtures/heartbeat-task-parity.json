@@ -1,0 +1,202 @@
+{
+  "hostParser": "server/utils/heartbeat/taskBlock.js parseTaskBlock",
+  "hostParserSha256": "6968d4725a15546ed4e925c3562c54bc8d26a3f0ca906f3303c15872621532ec",
+  "taskId": "mailkeeper-maintenance-7",
+  "note": "host = the task with this id in parseTaskBlock(text); expected = mailbox-ops status schedule.task (null: can't be established here)",
+  "cases": [
+    {
+      "name": "host-written control",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": null
+      },
+      "expected": {
+        "found": true,
+        "interval": "1d"
+      }
+    },
+    {
+      "name": "control, interval disabled",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: disabled\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "disabled",
+        "cron": null
+      },
+      "expected": {
+        "found": true,
+        "interval": "disabled"
+      }
+    },
+    {
+      "name": "task missing, another accepted",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: other\n    name: Other\n    interval: 1h\n    prompt: do it\n",
+      "host": {
+        "found": false
+      },
+      "expected": {
+        "found": false,
+        "interval": null
+      }
+    },
+    {
+      "name": "only task has no prompt",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "task without prompt, another accepted",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    owner:\n      pluginId: p\n      workspaceId: 7\n  - id: other\n    name: Other\n    interval: 1h\n    prompt: do it\n",
+      "host": {
+        "found": false
+      },
+      "expected": {
+        "found": false,
+        "interval": null
+      }
+    },
+    {
+      "name": "owner with duplicate pluginId",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      pluginId: q\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "owner value [bad",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: [bad\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "second root tasks: []",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\ntasks: []\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "cron block scalar",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    cron: |-\n      0 0 * * *\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": "0 0 * * *"
+      },
+      "expected": null
+    },
+    {
+      "name": "cron plain",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    cron: 0 0 * * *\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": "0 0 * * *"
+      },
+      "expected": null
+    },
+    {
+      "name": "duplicated id",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "duplicate": true
+      },
+      "expected": null
+    },
+    {
+      "name": "shell executor without command",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: shell\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "typed interval",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 60\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "60",
+        "cron": null
+      },
+      "expected": null
+    },
+    {
+      "name": "empty prompt block",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "no heartbeat block, yaml-only feature",
+      "text": "tasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": null
+      },
+      "expected": {
+        "found": true,
+        "interval": "1d"
+      }
+    },
+    {
+      "name": "no heartbeat block, no yaml-only feature",
+      "text": "tasks:\n  - id: other\n    name: Other\n    interval: 1h\n    prompt: do it\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "front matter",
+      "text": "---\nx: 1\n---\nheartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "heading ends block",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n\n## Notes\nfree text\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": null
+      },
+      "expected": {
+        "found": true,
+        "interval": "1d"
+      }
+    },
+    {
+      "name": "prose after list",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n\nSome prose.\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "compact sequence at key indent",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n- id: mailkeeper-maintenance-7\n  name: MailKeeper maintenance\n  interval: 1d\n  executor: agent\n  agent: claude\n  runtime-options:\n    effort: high\n  prompt: |-\n    Inbox 1 of 1 — a: b\n      - not: a task\n  owner:\n    pluginId: p\n    workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": null
+      },
+      "expected": null
+    }
+  ]
+}

@@ -83,6 +83,7 @@ class MailKeeperService {
     this.api = api;
     this.host = hostFor(api);
     this.store = api.getStore();
+    this.provisioningQueues = new Map();
   }
 
   // -------------------------------------------------------------------------
@@ -143,7 +144,36 @@ class MailKeeperService {
   // Provisioning
   // -------------------------------------------------------------------------
 
+  /**
+   * Provision (or disable) one workspace. Each call first records a new
+   * pending attempt, before any work that can fail and before waiting for an
+   * earlier call on the same workspace, so the CLI never reads an older
+   * schedule as current. Calls on one workspace then run one at a time, and
+   * an attempt publishes its outcome only while it is still the latest.
+   */
   async provision(workspace) {
+    return this.serializeProvisioning(workspace, (attempt) => this.provisionAttempt(workspace, attempt));
+  }
+
+  async disable(workspace) {
+    return this.serializeProvisioning(workspace, (attempt) => this.disableAttempt(workspace, attempt));
+  }
+
+  serializeProvisioning(workspace, work) {
+    const attempt = crypto.randomUUID();
+    this.recordProvisioning(workspace, attempt, "pending");
+    const key = String(workspace.id);
+    const prior = this.provisioningQueues.get(key) || Promise.resolve();
+    const run = prior.then(() => work(attempt));
+    const settled = run.catch(() => {});
+    this.provisioningQueues.set(key, settled);
+    settled.then(() => {
+      if (this.provisioningQueues.get(key) === settled) this.provisioningQueues.delete(key);
+    });
+    return run;
+  }
+
+  async provisionAttempt(workspace, attempt) {
     const { config, errors } = this.profileConfig(workspace);
     const profile = (await this.store.get(this.profileKey(workspace))) || {};
 
@@ -162,14 +192,12 @@ class MailKeeperService {
         workspace: workspace.slug,
         errors,
       });
-      this.recordProvisioning(workspace, "config_invalid");
+      this.publishProvisioning(workspace, attempt, "config_invalid");
       return { state: "config_invalid", errors };
     }
 
     // Provisioned means scheduled and configured, not "IMAP verified": the
-    // terminal checks each inbox when a run starts. Until this attempt
-    // finishes, the schedule in rules.json is not current.
-    this.recordProvisioning(workspace, "pending");
+    // terminal checks each inbox when a run starts.
     const discovery = await this.discover();
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
@@ -200,7 +228,7 @@ class MailKeeperService {
       promptArtifactRetention: "durable",
     });
     const settings = await this.host.heartbeat.readSettings(workspace);
-    const rulesWrittenAt = this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
+    this.syncRulesFile(workspace, config, rules, discovery, inboxes, attempt, {
       taskId: taskIdentity(workspace.id),
       cadence: config.cadence,
       cadenceLabel: cadenceLabel(config.cadence),
@@ -231,11 +259,11 @@ class MailKeeperService {
       updatedAt: new Date().toISOString(),
     };
     await this.store.set(this.profileKey(workspace), next);
-    this.recordProvisioning(workspace, "ready", rulesWrittenAt);
+    this.publishProvisioning(workspace, attempt, "ready");
     return next;
   }
 
-  async disable(workspace) {
+  async disableAttempt(workspace, attempt) {
     await this.host.heartbeat.removeManagedTask(workspace, {
       id: taskIdentity(workspace.id),
     });
@@ -245,7 +273,7 @@ class MailKeeperService {
       state: "disabled",
       updatedAt: new Date().toISOString(),
     });
-    this.recordProvisioning(workspace, "disabled");
+    this.publishProvisioning(workspace, attempt, "disabled");
     // Thread, contracts, rules and run receipts are intentionally kept:
     // they are the user's audit trail and survive re-enable.
   }
@@ -401,13 +429,14 @@ class MailKeeperService {
    * config, inbox keys, and account-scoped approved rules. It is a generated
    * view, rewritten on every provision; the contracts stay the user's policy.
    */
-  syncRulesFile(workspace, config, rules, discovery, inboxes, schedule) {
+  syncRulesFile(workspace, config, rules, discovery, inboxes, attempt, schedule) {
     const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "rules.json"));
-    const writtenAt = new Date().toISOString();
     writeJsonAtomic(target, {
       schemaVersion: 2,
       revision: rules.revision,
-      writtenAt,
+      writtenAt: new Date().toISOString(),
+      // The provisioning attempt that wrote this file; see recordProvisioning.
+      provisionAttempt: attempt,
       himalayaConfig: {
         paths: discovery.himalayaConfig.paths,
         target: discovery.himalayaConfig.target,
@@ -439,20 +468,34 @@ class MailKeeperService {
       legacyContract: fs.existsSync(path.join(workspace.workingDirectory, LEGACY_CONTRACT)) ? LEGACY_CONTRACT : null,
       promoted: rules.promoted.filter((rule) => typeof rule.account === "string"),
     });
-    return writtenAt;
   }
 
   /**
-   * The latest provisioning attempt's outcome, for the workspace CLI:
-   * `pending` while an attempt runs (or after one threw), `config_invalid`,
-   * `disabled`, or `ready` with the `writtenAt` of the rules.json it wrote.
-   * The CLI reads the schedule in rules.json as current only when it is that
-   * file, so a failed attempt never leaves an older schedule looking current.
+   * The latest provisioning attempt and its outcome, for the workspace CLI:
+   * `pending` from the moment an attempt is requested (and after one that
+   * threw), then `config_invalid`, `disabled`, or `ready`. A ready outcome
+   * vouches only for the rules.json whose `provisionAttempt` is this attempt.
    */
-  recordProvisioning(workspace, state, rulesWrittenAt = null) {
+  recordProvisioning(workspace, attempt, state) {
+    if (!workspace?.workingDirectory || !fs.existsSync(workspace.workingDirectory)) return;
     const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "provisioning.json"));
-    writeJsonAtomic(target, { schemaVersion: 1, state, rulesWrittenAt, at: new Date().toISOString() });
+    writeJsonAtomic(target, { schemaVersion: 1, attempt, state, at: new Date().toISOString() });
   }
+
+  /** Record an attempt's outcome unless a newer attempt has been requested since. */
+  publishProvisioning(workspace, attempt, state) {
+    const file = path.join(workspace.workingDirectory, ".mailkeeper", "provisioning.json");
+    let latest = null;
+    try {
+      latest = JSON.parse(fs.readFileSync(file, "utf8")).attempt;
+    } catch {
+      latest = null;
+    }
+    if (latest !== attempt) return false;
+    this.recordProvisioning(workspace, attempt, state);
+    return true;
+  }
+
 
   /**
    * Pick up receipts the agent queued in `.mailkeeper/outbox/` and record them.

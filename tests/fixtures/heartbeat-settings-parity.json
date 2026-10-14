@@ -1,7 +1,7 @@
 {
-  "hostParser": "server/utils/heartbeat/taskBlock.js",
+  "hostParser": "server/utils/heartbeat/taskBlock.js parseHeartbeatSettingsBlock",
   "hostParserSha256": "6968d4725a15546ed4e925c3562c54bc8d26a3f0ca906f3303c15872621532ec",
-  "note": "host = parseHeartbeatSettingsBlock(text)?.enabled !== false at that revision; expected = what mailbox-ops reports (null: outside the supported subset)",
+  "note": "host = parseHeartbeatSettingsBlock(text)?.enabled !== false; expected = mailbox-ops status heartbeatEnabled (null: outside the supported subset)",
   "cases": [
     {
       "name": "plain paused control",
@@ -31,7 +31,7 @@
       "name": "literal scalar false",
       "text": "heartbeat:\n  enabled: |-\n    false\n",
       "host": false,
-      "expected": null
+      "expected": false
     },
     {
       "name": "quoted key in flow",
@@ -157,7 +157,7 @@
       "name": "folded scalar",
       "text": "heartbeat:\n  enabled: >\n    false\n",
       "host": false,
-      "expected": null
+      "expected": false
     },
     {
       "name": "main-task before heartbeat",
@@ -175,7 +175,7 @@
       "name": "broken front matter, good body",
       "text": "---\nheartbeat:\n  enabled: |\n    false\n---\nheartbeat:\n  enabled: true\n",
       "host": false,
-      "expected": null
+      "expected": false
     },
     {
       "name": "empty heartbeat",
@@ -205,7 +205,7 @@
       "name": "sequence under heartbeat",
       "text": "heartbeat:\n  - enabled: false\n",
       "host": true,
-      "expected": null
+      "expected": true
     },
     {
       "name": "multi-line plain continuation",
@@ -236,6 +236,30 @@
       "text": "heartbeat:\n  enabled: true\n  timezone: UTC\n",
       "host": true,
       "expected": true
+    },
+    {
+      "name": "typed keys colliding (01 and 1)",
+      "text": "heartbeat:\n  enabled: false\n  01: a\n  1: b\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "typed keys colliding (TRUE and true)",
+      "text": "heartbeat:\n  enabled: false\n  TRUE: a\n  true: b\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "comment inside flow mapping",
+      "text": "heartbeat: { enabled: false, timezone: UTC # comment }\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "literal scalar false with clip",
+      "text": "heartbeat:\n  enabled: |\n    false\n",
+      "host": false,
+      "expected": false
     }
   ]
 }

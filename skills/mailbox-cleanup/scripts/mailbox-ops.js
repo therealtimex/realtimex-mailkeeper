@@ -292,11 +292,11 @@ function pinnedConfig(rules) {
   return localHimalayaConfig();
 }
 
-// The host's readSettings derives "heartbeat on" from HEARTBEAT.md with
-// parseHeartbeatSettingsBlock (server/utils/heartbeat/taskBlock.js, tested at
-// sha256 6968d4725a15546ed4e925c3562c54bc8d26a3f0ca906f3303c15872621532ec).
-// This reader picks the same text and reads a strict YAML subset; anything
-// outside it is unknown rather than a guess.
+// The host reads heartbeat settings and tasks from HEARTBEAT.md with
+// server/utils/heartbeat/taskBlock.js (parseHeartbeatSettingsBlock and
+// parseTaskBlock, tested at sha256 6968d4725a15546ed4e925c3562c54bc8d26a3f0ca906f3303c15872621532ec).
+// These readers pick the same text and parse a strict YAML subset; anything
+// outside it makes the answer unknown rather than a guess.
 
 /** Front-matter `heartbeat:`/`main-task:` blocks, as the host extracts them. */
 function heartbeatFrontMatter(text) {
@@ -322,23 +322,36 @@ function heartbeatFrontMatter(text) {
   return blocks.length ? blocks.join("\n") : null;
 }
 
-/** The first body block from `heartbeat:`/`main-task:` to a heading or `tasks:`. */
-function heartbeatBodyBlock(text) {
+/** The body text from the first line matching `start` to a heading (or `stop`). */
+function heartbeatBodyBlock(text, start, stop = null) {
   const lines = text.split("\n");
-  const start = lines.findIndex((line) => /^(heartbeat|main-task)\s*:/.test(line.trim()));
-  if (start === -1) return null;
-  const block = [lines[start]];
-  for (const line of lines.slice(start + 1)) {
-    if (/^#{1,6}\s/.test(line) || /^tasks\s*:/.test(line.trim())) break;
+  const first = lines.findIndex(start);
+  if (first === -1) return null;
+  const block = [lines[first]];
+  for (const line of lines.slice(first + 1)) {
+    if (/^#{1,6}\s/.test(line) || (stop && stop.test(line.trim()))) break;
     block.push(line);
   }
   return block.join("\n");
 }
 
-const YAML_KEY = String.raw`(?:([A-Za-z0-9_][A-Za-z0-9_.-]*)|"([^"\\]*)"|'((?:[^']|'')*)')`;
-const yamlKey = (m) => m[1] ?? m[2] ?? m[3].replace(/''/g, "'");
+const UNSUPPORTED = Symbol("unsupported YAML");
+const YAML_KEY = String.raw`(?:([A-Za-z_][A-Za-z0-9_.-]*)|"([^"\\#]*)"|'((?:[^'#]|'')*)')`;
+const YAML_KEY_LINE = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+(.*))?$`);
+// Plain scalars YAML 1.2 types as numbers, booleans or null.
+const YAML_TYPED =
+  /^(?:[-+]?[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?[0-9]+)?|[-+]?\.[0-9_]+(?:[eE][-+]?[0-9]+)?|0o[0-7_]+|0x[0-9a-fA-F_]+|0b[01_]+|[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)|null|Null|NULL|~|true|True|TRUE|false|False|FALSE)$/;
 
-/** A one-line scalar: its text, null when empty, undefined outside the subset. */
+/** A key's text; typed plain keys (`1`, `TRUE`, `null`) may collide, so they are unsupported. */
+function yamlKey(match) {
+  if (match[1] !== undefined) {
+    if (/^(true|false|null)$/i.test(match[1])) throw UNSUPPORTED;
+    return match[1];
+  }
+  return match[2] ?? match[3].replace(/''/g, "'");
+}
+
+/** A one-line scalar: a string, `{ typed }` for typed plain text, or null when empty. */
 function yamlScalar(raw) {
   const text = raw.replace(/^\s*#.*$/, "").trim();
   if (!text) return null;
@@ -347,79 +360,161 @@ function yamlScalar(raw) {
   match = /^'((?:[^']|'')*)'\s*(?:#.*)?$/.exec(text);
   if (match) return match[1].replace(/''/g, "'");
   const plain = text.replace(/\s+#.*$/, "");
-  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(plain) || /:(\s|$)|\s#/.test(plain)) return undefined;
-  return plain;
+  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(plain) || /:(\s|$)|\s#/.test(plain)) throw UNSUPPORTED;
+  return YAML_TYPED.test(plain) ? { typed: plain } : plain;
 }
 
-/** A flat flow mapping `{ key: scalar, ... }`, or undefined outside the subset. */
+/** A flat flow mapping with no comments: a Map, or UNSUPPORTED thrown. */
 function yamlFlowMap(raw) {
-  const match = /^\{([^{}[\]]*)\}\s*(?:#.*)?$/.exec(raw.trim());
-  if (!match) return undefined;
+  const match = /^\{([^{}[\]#]*)\}$/.exec(raw.trim());
+  if (!match) throw UNSUPPORTED;
   const map = new Map();
   if (!match[1].trim()) return map;
   for (const part of match[1].split(",")) {
     const entry = new RegExp(String.raw`^\s*${YAML_KEY}\s*:(?:\s+(.*?))?\s*$`).exec(part);
-    if (!entry) return undefined;
-    const value = entry[4] === undefined ? null : yamlScalar(entry[4]);
-    if (value === undefined || map.has(yamlKey(entry))) return undefined;
-    map.set(yamlKey(entry), { scalar: value });
+    if (!entry) throw UNSUPPORTED;
+    const key = yamlKey(entry);
+    if (map.has(key)) throw UNSUPPORTED;
+    map.set(key, entry[4] === undefined ? null : yamlScalar(entry[4]));
   }
   return map;
 }
 
 /**
- * Nested block mappings of one-line scalars or flat flow mappings. Returns
- * the top-level Map (key → {scalar} or {map}), null for an empty text, or
- * undefined for anything else (sequences, block scalars, anchors, tags, tabs,
- * duplicate keys, continuation lines), which the host's YAML parser may read
- * differently or reject.
+ * Parse a strict YAML subset: block mappings (Map), block sequences (Array),
+ * one-line scalars, literal/folded block scalars and flat flow mappings.
+ * Returns UNSUPPORTED for anything else: duplicate or typed keys, anchors,
+ * aliases, tags, tabs, directives, continuation lines, nested flow, explicit
+ * block indentation and compact sequences at a mapping's own indent.
  */
-function yamlSubset(text) {
-  const keyLine = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+(.*))?$`);
-  const root = new Map();
-  const stack = [];
-  let last = null;
-  for (const line of text.split(/\r?\n/)) {
-    if (/^\s*(#.*)?$/.test(line)) continue;
-    const indent = line.length - line.trimStart().length;
-    if (line.slice(0, indent).includes("\t") || /^(---|\.\.\.)(\s|$)/.test(line)) return undefined;
-    const match = keyLine.exec(line.trim());
-    if (!match) return undefined;
-    if (!stack.length) stack.push({ indent, map: root });
-    if (last && indent > last.indent) {
-      if (last.entry.scalar !== null) return undefined;
-      last.entry = { map: new Map() };
-      last.parent.set(last.key, last.entry);
-      stack.push({ indent, map: last.entry.map });
-    } else {
-      while (stack.length && stack[stack.length - 1].indent > indent) stack.pop();
-      if (!stack.length || stack[stack.length - 1].indent !== indent) return undefined;
-    }
-    const parent = stack[stack.length - 1].map;
-    const key = yamlKey(match);
-    if (parent.has(key)) return undefined;
-    const rest = match[4] ?? "";
-    let entry;
-    if (rest.trim().startsWith("{")) {
-      const map = yamlFlowMap(rest);
-      if (map === undefined) return undefined;
-      entry = { map };
-    } else {
-      const scalar = yamlScalar(rest);
-      if (scalar === undefined) return undefined;
-      entry = { scalar };
-    }
-    parent.set(key, entry);
-    last = { indent, key, parent, entry };
+function yamlDocument(text) {
+  const lines = text.split(/\r?\n/);
+  let i = 0;
+  const indentOf = (line) => line.length - line.trimStart().length;
+  const next = () => {
+    while (i < lines.length && /^\s*(#.*)?$/.test(lines[i])) i += 1;
+    if (i >= lines.length) return null;
+    const line = lines[i];
+    if (line.slice(0, indentOf(line)).includes("\t") || /^(---|\.\.\.|%)/.test(line)) throw UNSUPPORTED;
+    return line;
+  };
+  const isItem = (body) => body === "-" || body.startsWith("- ");
+
+  function node(indent) {
+    const line = next();
+    if (indentOf(line) !== indent) throw UNSUPPORTED;
+    return isItem(line.trim()) ? sequence(indent) : mapping(indent, null);
   }
-  return stack.length ? root : null;
+
+  function mapping(indent, first) {
+    const map = new Map();
+    let pending = first;
+    for (;;) {
+      let key;
+      let rest;
+      if (pending) {
+        ({ key, rest } = pending);
+        pending = null;
+      } else {
+        const line = next();
+        if (line === null || indentOf(line) < indent) break;
+        if (indentOf(line) > indent || isItem(line.trim())) throw UNSUPPORTED;
+        const match = YAML_KEY_LINE.exec(line.trim());
+        if (!match) throw UNSUPPORTED;
+        key = yamlKey(match);
+        rest = match[4];
+        i += 1;
+      }
+      if (map.has(key)) throw UNSUPPORTED;
+      map.set(key, value(rest, indent));
+    }
+    return map;
+  }
+
+  function sequence(indent) {
+    const list = [];
+    for (;;) {
+      const line = next();
+      if (line === null || indentOf(line) < indent) break;
+      const body = line.trim();
+      if (indentOf(line) > indent || !isItem(body)) throw UNSUPPORTED;
+      i += 1;
+      const after = body.slice(1);
+      const rest = after.trim();
+      const match = rest ? YAML_KEY_LINE.exec(rest) : null;
+      if (match) {
+        const column = indent + 1 + (after.length - after.trimStart().length);
+        list.push(mapping(column, { key: yamlKey(match), rest: match[4] }));
+      } else {
+        list.push(value(rest, indent));
+      }
+    }
+    return list;
+  }
+
+  function value(rest, indent) {
+    const text = (rest ?? "").replace(/^\s*#.*$/, "").trim();
+    if (!text) {
+      const line = next();
+      return line === null || indentOf(line) <= indent ? null : node(indentOf(line));
+    }
+    const block = /^([|>])([-+]?)\s*(?:#.*)?$/.exec(text);
+    if (block) return blockScalar(indent, block[2]);
+    let result;
+    if (text.startsWith("{")) result = yamlFlowMap(text);
+    else if (/^\[\s*\]$/.test(text)) result = [];
+    else result = yamlScalar(text);
+    const line = next();
+    if (line !== null && indentOf(line) > indent) throw UNSUPPORTED; // continuation line
+    return result;
+  }
+
+  function blockScalar(indent, chomp) {
+    const content = [];
+    let column = null;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) {
+        content.push("");
+        i += 1;
+        continue;
+      }
+      const n = indentOf(line);
+      if (n <= indent) break;
+      if (line.slice(0, n).includes("\t")) throw UNSUPPORTED;
+      column ??= n;
+      if (n < column) throw UNSUPPORTED;
+      content.push(line.slice(column));
+      i += 1;
+    }
+    while (content.length && content[content.length - 1] === "") content.pop();
+    if (!content.length) {
+      if (chomp === "+") throw UNSUPPORTED;
+      return "";
+    }
+    return content.join("\n") + (chomp === "-" ? "" : "\n");
+  }
+
+  try {
+    return next() === null ? null : node(indentOf(next()));
+  } catch (error) {
+    if (error === UNSUPPORTED) return UNSUPPORTED;
+    throw error;
+  }
+}
+
+/** A parsed value as the host's String(...) sees it, or UNSUPPORTED when that depends on YAML typing. */
+function yamlText(parsed) {
+  if (parsed === null || parsed === undefined) return null;
+  if (typeof parsed === "string") return parsed;
+  return UNSUPPORTED;
 }
 
 /**
- * Whether this workspace's heartbeat is on now, as the host reads it. A
- * missing file, block or `enabled` value means on (the host's default), and
- * only false (any case, quoted or not) pauses. Null (unknown) for a read
- * error, a path that isn't a file, or YAML outside the subset above.
+ * Whether this workspace's heartbeat is on now, as the host's readSettings
+ * reads it. A missing file, block or `enabled` value means on (the host's
+ * default), and only false (any case, quoted or not) pauses. Null (unknown)
+ * for a read error, a path that isn't a file, or YAML outside the subset.
  */
 function heartbeatEnabledNow() {
   const file = path.join(ROOT, "HEARTBEAT.md");
@@ -430,25 +525,30 @@ function heartbeatEnabledNow() {
   } catch (error) {
     return error?.code === "ENOENT" ? true : null;
   }
+  // The host uses the front-matter blocks when they parse to a mapping, else the body block.
   const front = heartbeatFrontMatter(text);
-  let doc = front === null ? null : yamlSubset(front);
-  if (doc === null) {
-    const body = heartbeatBodyBlock(text);
-    doc = body === null ? null : yamlSubset(body);
+  let doc = front === null ? null : yamlDocument(front);
+  if (doc === UNSUPPORTED) return null;
+  if (!(doc instanceof Map)) {
+    const body = heartbeatBodyBlock(text, (line) => /^(heartbeat|main-task)\s*:/.test(line.trim()), /^tasks\s*:/);
+    doc = body === null ? null : yamlDocument(body);
+    if (doc === UNSUPPORTED) return null;
   }
-  if (doc === undefined) return null;
-  const enabled = doc?.get("heartbeat")?.map?.get("enabled");
-  if (!enabled || enabled.map) return true;
-  return String(enabled.scalar ?? "").trim().toLowerCase() !== "false";
+  const settings = doc instanceof Map ? doc.get("heartbeat") : null;
+  if (!(settings instanceof Map)) return true;
+  const enabled = settings.get("enabled");
+  if (enabled && typeof enabled === "object" && "typed" in enabled) {
+    return enabled.typed.toLowerCase() !== "false";
+  }
+  return typeof enabled !== "string" || enabled.trim().toLowerCase() !== "false";
 }
 
 /**
- * This workspace's heartbeat task `taskId` as the host would read it from
- * HEARTBEAT.md: `{ interval, cron }`, null when the tasks list has no such
- * task, or undefined when this reader can't tell. It follows the layout the
- * host writes for managed tasks (block list items of `key: value` lines whose
- * multi-line values are block scalars) and gives up on anything else,
- * including front matter.
+ * This workspace's heartbeat task `taskId` as the host's parseTaskBlock would
+ * return it: `{ interval }`, null when the host's task list provably doesn't
+ * contain it, or undefined when that can't be established here (front matter,
+ * YAML outside the subset, a list the host would set aside for its older
+ * formats, typed values, a duplicated id, or any `cron` key on the task).
  */
 function managedTaskNow(taskId) {
   const file = path.join(ROOT, "HEARTBEAT.md");
@@ -456,96 +556,52 @@ function managedTaskNow(taskId) {
   try {
     if (!fs.statSync(file).isFile()) return undefined;
     text = fs.readFileSync(file, "utf8");
-  } catch (error) {
-    return error?.code === "ENOENT" ? null : undefined;
+  } catch {
+    return undefined;
   }
   if (text.trimStart().startsWith("---")) return undefined;
-  const lines = text.split(/\r?\n/);
-  const first = lines.findIndex((line) => /^(heartbeat|main-task|tasks)\s*:/.test(line));
-  if (first === -1) return null;
-  const keyLine = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+(.*))?$`);
-  const items = [];
-  let inTasks = false;
-  let item = null;
-  let listIndent = null;
-  let deeper = null; // the key whose block-scalar or nested value may continue below
-  for (const line of lines.slice(first)) {
-    if (/^#{1,6}\s/.test(line)) break;
-    if (/^\s*(#.*)?$/.test(line)) continue;
-    const indent = line.length - line.trimStart().length;
-    if (line.slice(0, indent).includes("\t")) return undefined;
-    const body = line.trim();
-    if (indent === 0) {
-      const top = keyLine.exec(body);
-      if (!top) return undefined;
-      inTasks = yamlKey(top) === "tasks";
-      if (inTasks && top[4] !== undefined && !/^\[\]\s*(#.*)?$/.test(top[4].trim())) return undefined;
-      item = null;
-      deeper = { indent: 0 };
-      continue;
-    }
-    if (!inTasks) {
-      if (!deeper) return undefined;
-      continue; // heartbeat/main-task settings: read by heartbeatEnabledNow
-    }
-    const isItem = body === "-" || body.startsWith("- ");
-    if (isItem && (listIndent === null || indent === listIndent)) {
-      listIndent = indent;
-      item = { keys: new Map(), indent: indent + 2 };
-      items.push(item);
-      const rest = body.slice(1).trim();
-      if (!rest) continue;
-      const entry = keyLine.exec(rest);
-      if (!entry) return undefined;
-      deeper = taskKey(item, entry);
-      if (deeper === undefined) return undefined;
-      continue;
-    }
-    if (!item) return undefined;
-    if (indent === item.indent) {
-      const entry = keyLine.exec(body);
-      if (!entry) return undefined;
-      deeper = taskKey(item, entry);
-      if (deeper === undefined) return undefined;
-    } else if (indent > item.indent && deeper?.indent === item.indent) {
-      // content of a block scalar or nested mapping under the last key
-    } else {
-      return undefined;
-    }
+  const body = heartbeatBodyBlock(text, (line) => /^(heartbeat|main-task|tasks)\s*:/.test(line));
+  const doc = body === null ? UNSUPPORTED : yamlDocument(body);
+  if (!(doc instanceof Map) || !Array.isArray(doc.get("tasks"))) return undefined;
+  const settings = doc.get("heartbeat");
+  const yamlOnly = /^\s+(runtime-options|runtimeOptions|runtime-option-values|runtimeOptionValues|skills)\s*:\s*(?:$|[[{])/m.test(text);
+  if (!yamlOnly && !(settings instanceof Map || Array.isArray(settings) || (typeof settings === "string" && settings))) {
+    return undefined;
   }
-  const matches = items.filter((entry) => entry.keys.get("id") === taskId);
-  if (matches.length > 1) return undefined;
-  const task = matches[0];
-  if (!task || !String(task.keys.get("name") ?? "").trim()) return null;
-  return { interval: task.keys.get("interval") ?? null, cron: task.keys.get("cron") ?? null };
-}
-
-/** Record one `key: value` line of a task item; undefined if outside the layout. */
-function taskKey(item, entry) {
-  const key = yamlKey(entry);
-  if (item.keys.has(key)) return undefined;
-  const rest = (entry[4] ?? "").trim();
-  if (/^[|>][-+0-9]*\s*(#.*)?$/.test(rest) || /^(#.*)?$/.test(rest)) {
-    item.keys.set(key, null);
-    return { indent: item.indent };
+  const accepted = [];
+  for (const item of doc.get("tasks")) {
+    if (!(item instanceof Map)) continue;
+    const fields = {};
+    for (const key of ["id", "name", "interval", "executor", "command", "prompt"]) {
+      const text = yamlText(item.get(key));
+      if (text === UNSUPPORTED) return undefined;
+      fields[key] = text;
+    }
+    if (!String(fields.name ?? "").trim()) continue;
+    const executor = String(fields.executor ?? "").trim().toLowerCase();
+    if (executor === "shell" ? !String(fields.command ?? "").trim() : !fields.prompt) continue;
+    accepted.push({ ...fields, cron: item.has("cron") });
   }
-  const value = rest.startsWith("{") ? yamlFlowMap(rest) : yamlScalar(rest);
-  if (value === undefined) return undefined;
-  item.keys.set(key, typeof value === "string" ? value : null);
-  return null;
+  if (!accepted.length) return undefined;
+  const mine = accepted.filter((task) => String(task.id ?? "").trim() === taskId);
+  if (mine.length > 1 || mine[0]?.cron) return undefined;
+  if (!mine.length) return null;
+  return { interval: mine[0].interval === null ? null : mine[0].interval.trim() };
 }
 
 /**
  * The schedule as it is now. rules.json's schedule counts only while the
  * latest provisioning attempt is the ready one that wrote it; then a schedule
- * is claimed only when the heartbeat is on and the managed task exists with
- * that interval. Each value is null when it can't be established.
+ * is claimed only when the heartbeat is on and the host's task list has the
+ * managed task with that interval. Each value is null when it can't be
+ * established.
  */
 function scheduleNow(rules) {
   const saved = rules.schedule || {};
   const provisioning = readJson(statePath("provisioning.json"));
   const outcome = typeof provisioning?.state === "string" ? provisioning.state : null;
-  const current = outcome === "ready" && provisioning.rulesWrittenAt === rules.writtenAt;
+  const attempt = typeof provisioning?.attempt === "string" && provisioning.attempt ? provisioning.attempt : null;
+  const current = outcome === "ready" && attempt !== null && rules.provisionAttempt === attempt;
   const enabled = heartbeatEnabledNow();
   let task = null;
   let scheduled = null;
@@ -555,7 +611,7 @@ function scheduleNow(rules) {
     const found = typeof saved.taskId === "string" ? managedTaskNow(saved.taskId) : undefined;
     task = found === undefined ? null : { found: Boolean(found), interval: found?.interval ?? null };
     if (found === null) scheduled = false;
-    else if (found && !found.cron && enabled !== null) {
+    else if (found && enabled !== null) {
       scheduled = enabled && String(found.interval || "").toLowerCase() === String(saved.cadence).toLowerCase();
     }
   }

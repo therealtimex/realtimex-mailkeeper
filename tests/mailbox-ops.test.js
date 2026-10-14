@@ -552,9 +552,8 @@ test("status reports the four setup criteria per inbox and the schedule", () => 
 
 test("status reads whether the heartbeat is on now, not as of the last settings save", () => {
   const ws = twoInboxes();
-  const writtenAt = "2026-10-14T10:00:00.000Z";
-  ws.writeRules({ writtenAt, schedule: { taskId: "mailkeeper-maintenance-7", cadence: "manual", cadenceLabel: "Manual", manual: true, heartbeatEnabled: true, paused: false } });
-  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, state: "ready", rulesWrittenAt: writtenAt }));
+  ws.writeRules({ provisionAttempt: "a1", schedule: { taskId: "mailkeeper-maintenance-7", cadence: "manual", cadenceLabel: "Manual", manual: true, heartbeatEnabled: true, paused: false } });
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, attempt: "a1", state: "ready" }));
   const heartbeat = path.join(ws.dir, "HEARTBEAT.md");
   const schedule = () => ws.run("status").json.schedule;
   const state = () => [schedule().heartbeatEnabled, schedule().paused];
@@ -583,11 +582,10 @@ test("status reads whether the heartbeat is on now, not as of the last settings 
 
 test("a schedule is claimed only from the ready provisioning that wrote rules.json, with its task in place", () => {
   const ws = twoInboxes();
-  const writtenAt = "2026-10-14T10:00:00.000Z";
   const taskId = "mailkeeper-maintenance-7";
-  ws.writeRules({ writtenAt, schedule: { taskId, cadence: "1d", cadenceLabel: "Daily", manual: false, heartbeatEnabled: true, paused: false } });
-  const provisioning = (state, rulesWrittenAt = null) =>
-    fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, state, rulesWrittenAt }));
+  ws.writeRules({ provisionAttempt: "a1", schedule: { taskId, cadence: "1d", cadenceLabel: "Daily", manual: false, heartbeatEnabled: true, paused: false } });
+  const provisioning = (state, attempt = "a2") =>
+    fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, attempt, state }));
   const heartbeat = (enabled, tasks) =>
     fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), `heartbeat:\n  enabled: ${enabled}\n  timezone: UTC\ntasks:\n${tasks}`);
   const managed = (interval) =>
@@ -601,14 +599,14 @@ test("a schedule is claimed only from the ready provisioning that wrote rules.js
   heartbeat(true, managed("1d"));
   assert.deepEqual(pick(), { applied: null, outcome: null, cadence: null, manual: null, scheduled: null, task: null }, "no provisioning record: nothing is claimed");
 
-  provisioning("ready", writtenAt);
+  provisioning("ready", "a1");
   assert.deepEqual(pick(), { applied: true, outcome: "ready", cadence: "1d", manual: false, scheduled: true, task: { found: true, interval: "1d" } });
 
   heartbeat(false, managed("disabled"));
   assert.equal(pick().scheduled, false, "provisioned while paused: the host keeps the task off");
   heartbeat(true, managed("disabled"));
   assert.deepEqual([pick().scheduled, pick().task], [false, { found: true, interval: "disabled" }], "resuming alone doesn't schedule it");
-  heartbeat(true, "  - id: someone-else\n    name: Other\n    interval: 1d\n");
+  heartbeat(true, "  - id: someone-else\n    name: Other\n    interval: 1d\n    prompt: do it\n");
   assert.deepEqual([pick().scheduled, pick().task], [false, { found: false, interval: null }], "task missing");
   heartbeat(true, managed("1d") + managed("1d"));
   assert.deepEqual([pick().scheduled, pick().task], [null, null], "a duplicated task id can't be read");
@@ -616,28 +614,48 @@ test("a schedule is claimed only from the ready provisioning that wrote rules.js
   assert.equal(pick().scheduled, null, "front matter is outside what this reader follows");
 
   heartbeat(true, managed("1d"));
-  provisioning("ready", "2026-10-14T09:00:00.000Z");
+  provisioning("ready", "a2");
   assert.deepEqual([pick().applied, pick().cadence, pick().scheduled], [null, null, null], "ready, but for another rules.json");
+  provisioning("ready", "");
+  assert.equal(pick().applied, null, "a ready outcome without an attempt vouches for nothing");
   provisioning("config_invalid");
   assert.deepEqual([pick().applied, pick().outcome, pick().cadence, pick().manual], [false, "config_invalid", null, null]);
   provisioning("pending");
   assert.deepEqual([pick().applied, pick().outcome], [false, "pending"]);
 });
 
-test("the heartbeat reader agrees with the host parser or says unknown", () => {
+test("the heartbeat readers agree with the host parser or say unknown", () => {
   // Each case records the host's answer at the pinned parser revision. Set
-  // MAILKEEPER_HOST_TASKBLOCK to a host taskBlock.js to re-check it live.
-  const parity = require("./fixtures/heartbeat-settings-parity.json");
+  // MAILKEEPER_HOST_TASKBLOCK to a host taskBlock.js to re-check them live.
   const hostFile = process.env.MAILKEEPER_HOST_TASKBLOCK;
   const host = hostFile ? require(hostFile) : null;
+
+  const settings = require("./fixtures/heartbeat-settings-parity.json");
   const ws = twoInboxes();
-  ws.writeRules({ schedule: { cadence: "1d", manual: false, heartbeatEnabled: true, paused: false } });
-  for (const { name, text, host: recorded, expected } of parity.cases) {
+  ws.writeRules({ provisionAttempt: "a1", schedule: { taskId: "mailkeeper-maintenance-7", cadence: "1d", manual: false } });
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, attempt: "a1", state: "ready" }));
+  for (const { name, text, host: recorded, expected } of settings.cases) {
     if (host) assert.equal(host.parseHeartbeatSettingsBlock(text)?.enabled !== false, recorded, `host changed: ${name}`);
     fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), text);
     const enabled = ws.run("status").json.schedule.heartbeatEnabled;
     assert.equal(enabled, expected, name);
     assert.ok(enabled === recorded || enabled === null, `never the opposite of the host: ${name}`);
+  }
+
+  const tasks = require("./fixtures/heartbeat-task-parity.json");
+  for (const { name, text, host: recorded, expected } of tasks.cases) {
+    if (host) {
+      const mine = (host.parseTaskBlock(text) || []).filter((task) => String(task.id || "") === tasks.taskId);
+      const live = mine.length === 1 ? { found: true, interval: mine[0].interval ?? null, cron: mine[0].cron ?? null } : mine.length ? { duplicate: true } : { found: false };
+      assert.deepEqual(live, recorded, `host changed: ${name}`);
+    }
+    fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), text);
+    const task = ws.run("status").json.schedule.task;
+    assert.deepEqual(task, expected, name);
+    if (task) {
+      assert.equal(task.found, recorded.found === true, `never the opposite of the host: ${name}`);
+      if (task.found) assert.deepEqual([task.interval, recorded.cron], [recorded.interval, null], `same interval, no cron: ${name}`);
+    }
   }
 });
 

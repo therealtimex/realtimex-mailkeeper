@@ -219,14 +219,15 @@ test("each provisioning attempt records its outcome; only a ready one vouches fo
   const read = (name) => JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", name), "utf8"));
 
   await service.provision(workspace);
-  const rules = read("rules.json");
-  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").rulesWrittenAt], ["ready", rules.writtenAt]);
-  assert.equal(rules.schedule.taskId, taskIdentity(7));
+  const ready = read("provisioning.json");
+  assert.equal(ready.state, "ready");
+  assert.equal(read("rules.json").provisionAttempt, ready.attempt);
+  assert.equal(read("rules.json").schedule.taskId, taskIdentity(7));
 
   state.config = { ...state.config, AGENT: "" };
   await service.provision(workspace);
-  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").rulesWrittenAt], ["config_invalid", null]);
-  assert.equal(read("rules.json").writtenAt, rules.writtenAt, "the older schedule stays on disk, no longer vouched for");
+  assert.equal(read("provisioning.json").state, "config_invalid");
+  assert.notEqual(read("provisioning.json").attempt, read("rules.json").provisionAttempt, "the older rules.json is no longer vouched for");
 
   state.config = { ...state.config, AGENT: "codex" };
   service.discover = async () => {
@@ -237,6 +238,73 @@ test("each provisioning attempt records its outcome; only a ready one vouches fo
 
   await service.disable(workspace);
   assert.equal(read("provisioning.json").state, "disabled");
+});
+
+test("a failure anywhere in an attempt leaves it pending, never the earlier ready", async () => {
+  setMailbox(["work"]);
+  const { service, workspace, state } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  const outcome = () => JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", "provisioning.json"), "utf8")).state;
+  const fail = async () => {
+    throw new Error("injected");
+  };
+  const fresh = async () => {
+    await service.provision(workspace);
+    assert.equal(outcome(), "ready");
+  };
+
+  await fresh();
+  const get = service.store.get;
+  service.store.get = fail;
+  await assert.rejects(service.provision(workspace));
+  assert.equal(outcome(), "pending", "profile read failed");
+  service.store.get = get;
+
+  await fresh();
+  const remove = service.host.heartbeat.removeManagedTask;
+  service.host.heartbeat.removeManagedTask = fail;
+  state.config = { ...state.config, AGENT: "" };
+  await assert.rejects(service.provision(workspace));
+  assert.equal(outcome(), "pending", "invalid settings, then removing the task failed");
+  state.config = { ...state.config, AGENT: "codex" };
+  service.host.heartbeat.removeManagedTask = remove;
+
+  await fresh();
+  service.host.heartbeat.removeManagedTask = fail;
+  await assert.rejects(service.disable(workspace));
+  assert.equal(outcome(), "pending", "disable failed");
+});
+
+test("an earlier attempt never publishes over a newer one", async () => {
+  setMailbox(["work"]);
+  const { service, workspace } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", name), "utf8"));
+  const set = service.store.set;
+  let release;
+  const blocked = new Promise((resolve) => {
+    release = resolve;
+  });
+  let first = true;
+  service.store.set = async (key, value) => {
+    if (first && key === service.profileKey(workspace)) {
+      first = false;
+      await blocked; // A has written rules.json and waits here
+    }
+    return set(key, value);
+  };
+
+  const a = service.provision(workspace);
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const b = service.provision(workspace);
+  const newer = read("provisioning.json");
+  assert.equal(newer.state, "pending", "B is recorded the moment it is requested");
+
+  release();
+  await a;
+  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").attempt], ["pending", newer.attempt], "A finished but didn't publish over B");
+  await b;
+  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").attempt], ["ready", newer.attempt]);
+  assert.equal(read("rules.json").provisionAttempt, newer.attempt, "ready vouches for B's own rules.json");
 });
 
 test("a paused workspace stays paused after repair", async () => {
