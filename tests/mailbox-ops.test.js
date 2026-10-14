@@ -1165,6 +1165,26 @@ test("a page still running at the deadline is cut off, and its read process and 
   }
 });
 
+test("the runner ends at the deadline even when Himalaya has exited but something it started holds the pipes", () => {
+  const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+  ws.setFake("b", { listPipeHolderPage: 2, listSlowMs: 20_000 });
+  ws.env.MAILKEEPER_READ_DEADLINE_MS = "3000";
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  const started = Date.now();
+  const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+  const took = Date.now() - started;
+  const { pid, runner, holder } = JSON.parse(fs.readFileSync(path.join(ws.dir, "fake-mailbox.json.slow-pid"), "utf8"));
+  try {
+    assert.ok(took < 6_000, `the runner returned at its deadline, not through the wrapper's (${took} ms)`);
+    assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.code], [false, "deadline", "MAILKEEPER_TIMEOUT"]);
+    assert.equal(alive(pid), false, "Himalaya is gone");
+    assert.equal(alive(runner), false, "the runner is gone");
+  } finally {
+    // The pipe holder is the fixture's own; MailKeeper doesn't manage it.
+    if (alive(holder)) process.kill(holder, "SIGKILL");
+  }
+});
+
 test("a wrapper that starts late never starts the read, and one stuck past the deadline is ended", () => {
   for (const delay of [6_000, 9_000]) {
     const ws = twoInboxes({ b: { messages: bulkInbox(450) } });

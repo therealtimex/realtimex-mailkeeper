@@ -10,6 +10,8 @@
  *                           nextUid, failMove: null | "unknown" | "auth", failMoveAfter: <n successful moves>,
  *                           listFailPage, listInvalidPage, listRepeatPage, listSlowPage: <page number>,
  *                           listSlowMs, listIgnoreTerm (the slow page ignores SIGTERM),
+ *                           listPipeHolderPage (that page answers, exits, and leaves a child
+ *                           holding its stdout/stderr open for listSlowMs),
  *                           listStderrPage + listStderr (a custom failure),
  *                           listPages: { <page>: [rows as returned, valid or not] } } },
  *     calls: [ { op, account } ] }
@@ -101,6 +103,15 @@ if (group === "folder" && action === "list") {
     if (account.listIgnoreTerm) process.on("SIGTERM", () => {});
     if (account.listSlowStderr) process.stderr.write(account.listSlowStderr);
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, account.listSlowMs || 30_000);
+  }
+  if (account.listPipeHolderPage === page) {
+    const holder = require("child_process").spawn(process.execPath, ["-e", `setTimeout(() => {}, ${account.listSlowMs || 30_000})`], {
+      stdio: ["ignore", "inherit", "inherit"],
+    });
+    holder.unref();
+    fs.writeFileSync(`${file}.slow-pid`, JSON.stringify({ pid: process.pid, runner: process.ppid, holder: holder.pid }));
+    process.stdout.write("[]");
+    return;
   }
   if (account.listPages && account.listPages[page]) {
     process.stdout.write(JSON.stringify(account.listPages[page]));

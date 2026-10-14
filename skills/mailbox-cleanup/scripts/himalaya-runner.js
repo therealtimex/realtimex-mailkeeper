@@ -185,8 +185,11 @@ function isPageEnd(op, args, result) {
 
 /**
  * Run Himalaya once. At the timeout it is killed with SIGKILL, which it can't
- * ignore, and the result returns as soon as it exits, without waiting for any
- * pipe another process may still hold.
+ * ignore, and the result returns as soon as it has exited, without waiting for
+ * any pipe another process may still hold. That includes a Himalaya that
+ * exited before the timeout while something it started kept the pipes open.
+ * Before the timeout, a finished run waits for its pipes to close so the
+ * whole output is read.
  */
 function runHimalaya(argv, childEnv, timeoutMs) {
   return new Promise((resolve) => {
@@ -196,6 +199,7 @@ function runHimalaya(argv, childEnv, timeoutMs) {
     let timedOut = false;
     let overflow = false;
     let settled = false;
+    let exited = null;
     const finish = (result) => {
       if (settled) return;
       settled = true;
@@ -206,7 +210,8 @@ function runHimalaya(argv, childEnv, timeoutMs) {
     };
     const timer = setTimeout(() => {
       timedOut = true;
-      child.kill("SIGKILL");
+      if (exited) finish({ error: { code: "ETIMEDOUT" }, ...exited });
+      else child.kill("SIGKILL");
     }, timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
@@ -222,6 +227,7 @@ function runHimalaya(argv, childEnv, timeoutMs) {
     });
     child.on("error", (error) => finish({ error, status: null, signal: null }));
     child.on("exit", (status, signal) => {
+      exited = { status, signal };
       if (timedOut) finish({ error: { code: "ETIMEDOUT" }, status, signal });
     });
     child.on("close", (status, signal) => {
