@@ -121,6 +121,7 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 
 ### Known limitations
 
+- Very large inboxes may not be checked fully within a check's limit; MailKeeper then only reports for them. In this version it doesn't check for unsubscribe links, and the “Repeat senders” and “Personalized outreach” cleanups are off. A fix is tracked in realtimex-mailkeeper#6.
 - If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. To clear it, ask for help through Community & support in the RealTimeX sidebar. A fix is tracked in realtimex-ai-app#2456.
 
 ### Upgrading from 0.1

@@ -869,7 +869,7 @@ function readBudget() {
  * (an empty or short page: `complete`) or why it stopped: `budget` (a full
  * page at the cap proves nothing), `deadline`, `no_progress` (a page with
  * nothing new), `invalid_response`, or `transport` (a failure after earlier
- * pages, whose rows are kept). A failure before any row is thrown as before. Even a complete
+ * pages, whose rows are kept). A failure or invalid answer before any row is thrown. Even a complete
  * listing is unverified: page numbers can shift while the mailbox changes.
  */
 function listCapped(rules, inbox, folder, budget) {
@@ -890,7 +890,10 @@ function listCapped(rules, inbox, folder, budget) {
       return stop("transport", { code: error.code || null });
     }
     pages += 1;
-    if (!Array.isArray(rows)) return stop("invalid_response");
+    if (!Array.isArray(rows)) {
+      if (!out.length) throw failure("MAILKEEPER_OPERATION_FAILED", { account: inbox.account });
+      return stop("invalid_response");
+    }
     if (!rows.length) return { envelopes: out, complete: true, stopReason: null, pages };
     const fresh = rows.filter((row) => !seen.has(String(row.id)));
     if (!fresh.length) return stop("no_progress");
@@ -1130,6 +1133,18 @@ function passAvailability(passName) {
   if (core.PASSES_NEEDING_SENT.includes(passName)) return { available: false, skipReason: "reply-history-unavailable", uncheckedSignals: [] };
   if (passName === "no-reply") return { available: true, skipReason: null, uncheckedSignals: ["unsubscribe-link"] };
   return { available: true, skipReason: null, uncheckedSignals: [] };
+}
+
+// Notices about approved rules are owed once per inbox, rule and this
+// revision of what the version can check.
+const CAPABILITY_REVISION = "containment-1";
+
+/** What an approved rule can do in this version: skipped in full, reduced, or nothing to say. */
+function ruleNoticeKind(rule) {
+  const availability = passAvailability(rule.pass);
+  if (!availability.available) return "skipped";
+  if (availability.uncheckedSignals.length) return "reduced";
+  return null;
 }
 
 /** Whether this run's own snapshot read the inbox to a clear end. */
@@ -1802,6 +1817,15 @@ const commands = {
           core.own(inboxes, account).migrationNotice = true;
         }
         if (entry.contractStatus === "invalid") recordFailure(run, account, entry.code);
+        // Approved rules this version can't run in full get one notice each.
+        const surfaced = (notices.rules && notices.rules[CAPABILITY_REVISION]) || {};
+        const owed = (rules.promoted || [])
+          .filter((rule) => rule.account === account && ruleNoticeKind(rule) && !core.own(surfaced, `${account}\n${rule.id}`))
+          .map((rule) => ({ account, ruleId: rule.id, pass: rule.pass, rule: rule.query, kind: ruleNoticeKind(rule) }));
+        if (owed.length) {
+          run.ruleNotices = [...(run.ruleNotices || []), ...owed];
+          core.own(inboxes, account).ruleNotices = owed.map(({ account: _account, ...notice }) => notice);
+        }
       } catch (error) {
         core.setOwn(run.accounts, account, { steps: [], outcome: null, code: null });
         recordFailure(run, account, error.code);
@@ -2064,6 +2088,9 @@ const commands = {
         contractDigest: entry.contractDigest || null,
         mode: entry.mode || null,
         coverage: entry.coverage || null,
+        ruleNotices: (run.ruleNotices || [])
+          .filter((notice) => notice.account === account)
+          .map(({ account: _account, ...notice }) => notice),
         moved: run.actions.filter((a) => a.account === account).length,
         // Report material: what moved where, what was suggested, what is urgent.
         movedByDestination: run.actions
@@ -2102,6 +2129,15 @@ const commands = {
     run.outcome = outcome;
     run.accountsOutcome = accounts;
     saveRun(run);
+    // The report is written from this output, so the notices it carries are
+    // marked surfaced here, not when they were first owed.
+    if (run.ruleNotices?.length) {
+      const notices = readJson(statePath("notices.json")) || {};
+      notices.rules = notices.rules || {};
+      const surfaced = (notices.rules[CAPABILITY_REVISION] = notices.rules[CAPABILITY_REVISION] || {});
+      for (const notice of run.ruleNotices) core.setOwn(surfaced, `${notice.account}\n${notice.ruleId}`, receipt.finishedAt);
+      writeJson(statePath("notices.json"), notices);
+    }
     const released = releaseGuard(runId, run);
     output({
       ok: true,

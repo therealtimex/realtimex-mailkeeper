@@ -7,7 +7,8 @@
  * FAKE_MAILBOX names a JSON file:
  *   { accounts: { <name>: { credential: { kind: "secret", password } | { kind: "native" },
  *                           folders: { INBOX: [ { id, from: { addr, name }, subject, date, flags, unsubscribe } ] },
- *                           nextUid, failMove: null | "unknown" | "auth", failMoveAfter: <n successful moves> } },
+ *                           nextUid, failMove: null | "unknown" | "auth", failMoveAfter: <n successful moves>,
+ *                           listFailPage, listInvalidPage, listRepeatPage: <page number> } },
  *     calls: [ { op, account } ] }
  *
  * Like the real tool, a moved message gets a new UID in its destination.
@@ -58,7 +59,7 @@ function mailboxCommand() {
 
 const account = state.accounts[options.a];
 if (!account) die(`cannot find configuration for account ${options.a}`);
-state.calls.push({ op: `${group} ${action}`, account: options.a });
+state.calls.push({ op: `${group} ${action}`, account: options.a, ...(group === "envelope" ? { folder: options.f, query: rest.join(" ") } : {}) });
 save();
 
 // Authentication, as the real tool would perform it through the auth command.
@@ -87,7 +88,15 @@ if (group === "folder" && action === "list") {
   else if (query === "body unsubscribe") list = list.filter((row) => row.unsubscribe === true);
   const size = Number(options.s);
   const page = Number(options.p);
-  const slice = list.slice((page - 1) * size, page * size);
+  // Test switches for one listing page: a transport failure, an answer that
+  // isn't a list, or the previous page again (pimalaya/himalaya#668).
+  if (account.listFailPage === page) die("connection reset by peer");
+  if (account.listInvalidPage === page) {
+    process.stdout.write(JSON.stringify({ envelopes: [] }));
+    return;
+  }
+  const shown = account.listRepeatPage === page ? page - 1 : page;
+  const slice = list.slice((shown - 1) * size, shown * size);
   if (page > 1 && slice.length === 0) die("page out of bounds");
   process.stdout.write(JSON.stringify(slice.map(({ unsubscribe, ...row }) => row)));
 } else if (group === "message" && action === "move") {

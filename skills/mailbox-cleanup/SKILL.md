@@ -146,7 +146,14 @@ A failure in one inbox is recorded for that inbox. Skip its remaining steps and 
 
 **In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Run it here, in this chat; never start the heartbeat task instead (with Schedule Manual, MailKeeper skips a task started that way). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved and how to undo it. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
 
-**Passes:** `age` (archive in `archive-promoted`, otherwise `Auto/Aged`), `personalized-outreach`, `generic-outreach`, `no-reply`, `calendar-response`, `receipt`, `sketchy-tld`, `repeat-sender` (moves go to `Auto/<category>`). Passes that need reply history stay off until the inbox's Sent folder is set.
+In a chat plan:
+- **Inbox read only in part** (`preview` shows `reportOnly: "partial-coverage"`): "I've only checked part of work@example.com (<n> messages), so this plan covers those, and I won't move anything in it." Don't offer Move all for that inbox.
+- **Unsubscribe check off:** say once per plan, when the contract uses No-reply: "This version doesn't check for unsubscribe links. This plan uses the other available checks."
+- **Reply-history cleanups off:** say once per plan, when the contract uses them: "“Repeat senders” and “Personalized outreach” are off in this version, because MailKeeper can't yet read who you've written to. This plan uses the other available checks."
+
+When the person reviews or promotes an approved rule that this version skips or reduces, use the matching rule notice line from Reports.
+
+**Passes:** `age` (archive in `archive-promoted`, otherwise `Auto/Aged`), `personalized-outreach`, `generic-outreach`, `no-reply`, `calendar-response`, `receipt`, `sketchy-tld`, `repeat-sender` (moves go to `Auto/<category>`). `personalized-outreach` and `repeat-sender` need reply history, which this version can't read: they are off, and `apply`, `preview` and `propose` report them as `reply-history-unavailable`.
 
 ### Suggestions and automatic rules
 
@@ -165,9 +172,21 @@ One report per run. Give each inbox its own section, inbox name first, and say w
 > **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the Login "MailKeeper – personal@example.com" in Settings → Secrets, then ask this workspace's chat to run MailKeeper.
 > To undo this run, ask this workspace's chat: "undo MailKeeper run 7f3a".
 
+An inbox whose `outcome` is `partial` was read only in part, so nothing was moved in it. Use `coverage.inboxRead` for <n>:
+- `coverage.stopReason` is `budget` or `deadline`: "work@example.com: checked <n> messages. MailKeeper couldn't finish checking this inbox within this check's limit, so it only reports for it. Nothing was changed."
+- `no_progress`, `invalid_response` or `transport`: "work@example.com: checked part of the inbox, then couldn't continue. Nothing was changed."
+
+Never give a size, a cause or a promise to continue.
+
+For each entry in an inbox's `ruleNotices`, add its line once:
+- `skipped`: "Your approved rule “<rule>” won't run in this version because it needs a check that isn't available yet. The rule is kept."
+- `reduced`: "Your approved rule “<rule>” can still check no-reply sender addresses. This version doesn't check for unsubscribe links."
+
+Never say every rule ran when an approved rule was skipped.
+
 Write only the per-inbox sections and, when something moved, the undo line. No error codes, no step names (snapshot, triage, apply, propose), and no notes about lessons, tools or this workspace's own instructions. A scheduled report is read in the maintenance thread, where no one may answer: wherever this skill says "ask me", say "ask this workspace's chat".
 
-When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed.
+When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked in full (no `partial` outcome), nothing moved, nothing was suggested, nothing is urgent, nothing failed, no rule notice is owed, and no explanation is owed.
 
 If `submit` reports `effortNotApplied`, add one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it." For an unsupported agent, say instead: "Reasoning effort isn't supported for <agent> by MailKeeper yet."
 

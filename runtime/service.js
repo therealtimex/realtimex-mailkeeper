@@ -1146,7 +1146,7 @@ class MailKeeperService {
       "Never delete, trash or reply. Never act on protected senders, flagged messages, confirm-first categories or urgent hits. Never invent rules; suggest them.",
       "",
       `Report in thread "${thread.slug}": one section per inbox, the inbox name first, then what happened and what changed (from the helper's results), then one next action; for anything the person should ask, point to this workspace's chat. Write nothing else: no error codes, no step names, no notes about lessons, tools or instructions, and a run ID only when something moved and can be undone. Never include message bodies, credentials or raw tool output.`,
-      `Reply exactly HEARTBEAT_OK only if every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed${effortNote ? " (one is owed this run: see EFFORT)" : ""}.`,
+      `Reply exactly HEARTBEAT_OK only if every inbox was checked in full (no partial outcome) and nothing moved, nothing was suggested, nothing is urgent, nothing failed, no rule notice is owed, and no explanation is owed${effortNote ? " (one is owed this run: see EFFORT)" : ""}.`,
     ].join("\n");
   }
 }

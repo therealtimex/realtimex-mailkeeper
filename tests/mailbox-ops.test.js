@@ -777,6 +777,202 @@ test("the migration notice is owed once; the review status stays until confirmed
 });
 
 // ---------------------------------------------------------------------------
+// Containment: a capped, unfiltered read (the full one is tracked in #6)
+// ---------------------------------------------------------------------------
+
+function bulkInbox(n, firstId = 1001) {
+  return Array.from({ length: n }, (_, i) => msg(firstId + i, `person${i}@bulk.example`, `Note ${i}`));
+}
+
+function listCalls(ws, account, folder = "INBOX") {
+  return ws.mailbox().calls.filter((call) => call.op === "envelope list" && call.account === account && call.folder === folder);
+}
+
+const REPEAT_QUERY = "20+ messages from one sender, none replied to";
+const repeatRuleB = {
+  id: core.ruleId({ account: "b", pass: "repeat-sender", query: REPEAT_QUERY, action: "move → Auto/Repeat" }),
+  account: "b",
+  pass: "repeat-sender",
+  query: REPEAT_QUERY,
+  action: "move → Auto/Repeat",
+};
+
+test("the read stops at five pages: only a short or empty last page is a complete read", () => {
+  for (const [size, complete, pages] of [
+    [200, true, 2],
+    [999, true, 5],
+    [1000, false, 5],
+  ]) {
+    const ws = twoInboxes({ b: { messages: bulkInbox(size) } });
+    ws.run("begin", "--run-id", "r1");
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1", "--since-last-run").json;
+    assert.equal(snap.ok, true, `${size}`);
+    assert.deepEqual(snap.coverage, {
+      complete,
+      verified: false,
+      stopReason: complete ? null : "budget",
+      code: null,
+      inboxRead: size,
+      replyHistory: "unavailable",
+      unsubscribeSignal: "not-checked",
+    });
+    const calls = listCalls(ws, "b");
+    assert.equal(calls.length, pages, `${size}: pages read`);
+    assert.ok(calls.every((call) => call.query === ""), "never a filtered or dated query");
+    assert.equal(ws.mailbox().calls.some((call) => call.folder === "Sent"), false, "Sent is not read");
+  }
+});
+
+test("a repeated page, an answer that isn't a list, or a later failure stops the read and keeps what was read", () => {
+  for (const [patch, stopReason, read] of [
+    [{ listRepeatPage: 2 }, "no_progress", 200],
+    [{ listInvalidPage: 2 }, "invalid_response", 200],
+    [{ listFailPage: 3 }, "transport", 400],
+  ]) {
+    const ws = twoInboxes({ b: { messages: bulkInbox(450) } });
+    ws.setFake("b", patch);
+    ws.run("begin", "--run-id", "r1");
+    const snap = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+    assert.equal(snap.ok, true, stopReason);
+    assert.deepEqual([snap.coverage.complete, snap.coverage.stopReason, snap.coverage.inboxRead], [false, stopReason, read]);
+    assert.equal(snap.coverage.code, stopReason === "transport" ? "MAILKEEPER_OPERATION_FAILED" : null);
+    const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+    assert.deepEqual([submit.accounts.b.outcome, submit.accounts.b.code], ["partial", null]);
+    assert.equal(submit.outcome, "blocked", "a partial read is never a completed run");
+  }
+  // Nothing read at all is a failure, not a partial read.
+  for (const patch of [{ listFailPage: 1 }, { listInvalidPage: 1 }]) {
+    const ws = twoInboxes();
+    ws.setFake("b", patch);
+    ws.run("begin", "--run-id", "r1");
+    assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+    assert.equal(ws.run("submit", "--run-id", "r1", "--summary", "t").json.accounts.b.outcome, "failed");
+  }
+});
+
+test("an inbox read in part only reports, while a fully read inbox in the same run still moves", () => {
+  const ruleA = { ...ruleB, account: "a", id: core.ruleId({ ...ruleB, account: "a" }) };
+  const ws = twoInboxes({
+    promoted: [ruleA, ruleB],
+    a: { folders: { "Auto/Notifications": [] } },
+    b: { messages: [...standardInbox(), ...bulkInbox(1000)] },
+  });
+  const { steps, submit } = maintenance(ws, "r1");
+  const applyA = steps.a[2].json;
+  const applyB = steps.b[2].json;
+  assert.deepEqual([applyA.dryRun, applyA.reportOnly, applyA.results[0].moved], [false, undefined, 1]);
+  assert.deepEqual([applyB.dryRun, applyB.reportOnly], [true, "partial-coverage"]);
+  assert.deepEqual([applyB.results[0].count, applyB.results[0].moved], [2, 0], "found, but not moved");
+  const box = ws.mailbox();
+  assert.equal(box.calls.some((call) => call.account === "b" && call.op === "message move"), false);
+  assert.equal(box.accounts.b.folders["Auto/Notifications"].length, 0);
+
+  // A chat plan for b says it is report-only, and an interactive apply moves nothing.
+  ws.run("begin", "--run-id", "r2", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r2");
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r2").json;
+  assert.deepEqual([preview.wouldMove, preview.reportOnly, preview.coverage.inboxRead], [false, "partial-coverage", 1000]);
+  assert.deepEqual(preview.uncheckedSignals, ["unsubscribe-link"]);
+  const applied = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r2").json;
+  assert.deepEqual([applied.dryRun, applied.results[0].moved], [true, 0]);
+
+  assert.equal(submit.json.outcome, "blocked");
+  const receipt = ws.receipt("r1");
+  assert.deepEqual([receipt.accounts.a.outcome, receipt.accounts.a.moved], ["completed", 1]);
+  assert.deepEqual([receipt.accounts.b.outcome, receipt.accounts.b.moved], ["partial", 0]);
+  assert.deepEqual([receipt.accounts.b.coverage.stopReason, receipt.accounts.b.coverage.inboxRead], ["budget", 1000]);
+  assert.ok(receipt.actions.every((action) => action.account === "a"));
+});
+
+test("only this run's own complete read supports a move: an earlier run's snapshot is report-only", () => {
+  const ws = twoInboxes();
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.coverage.complete, true);
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  // r2 skips its own snapshot; the file on disk is r1's complete read.
+  ws.run("begin", "--run-id", "r2", "--account", "b");
+  const promoted = ws.run("apply", "--account", "b", "--promoted-only", "--run-id", "r2").json;
+  assert.deepEqual([promoted.dryRun, promoted.reportOnly, promoted.results[0].moved], [true, "partial-coverage", 0]);
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r2").json;
+  assert.deepEqual([preview.wouldMove, preview.reportOnly], [false, "partial-coverage"]);
+  const direct = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r2").json;
+  assert.deepEqual([direct.dryRun, direct.results[0].moved], [true, 0]);
+  assert.equal(ws.mailbox().calls.some((call) => call.op === "message move"), false);
+  assert.equal(ws.run("submit", "--run-id", "r2", "--summary", "t").json.accounts.b.outcome, "skipped");
+});
+
+test("passes that need reply history are off, and say so instead of finding nothing", () => {
+  const friend = Array.from({ length: 25 }, (_, i) => msg(100 + i, "friend@people.example", `Hello ${i}`));
+  const ws = twoInboxes({
+    workspace: { promotablePasses: core.PASSES_BY_AGGRESSIVENESS.aggressive },
+    b: {
+      policy: { mode: "label-only", aggressiveness: "aggressive", sentFolder: "Sent", credential: secretB },
+      messages: [...standardInbox(), ...friend],
+      folders: { "Auto/Notifications": [], Sent: [] },
+    },
+  });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.replyHistory, false);
+  const preview = ws.run("preview", "--account", "b", "--pass", "repeat-sender", "--run-id", "r1").json;
+  assert.deepEqual([preview.skipped, preview.wouldMove, preview.count], ["reply-history-unavailable", false, 0]);
+  const applied = ws.run("apply", "--account", "b", "--pass", "repeat-sender", "--run-id", "r1").json;
+  assert.deepEqual(applied.results.map((r) => r.skipped), ["reply-history-unavailable"]);
+  const proposed = ws.run("propose", "--account", "b", "--run-id", "r1").json;
+  assert.deepEqual(proposed.unavailable.map((u) => `${u.pass}:${u.skipped}`).sort(), [
+    "personalized-outreach:reply-history-unavailable",
+    "repeat-sender:reply-history-unavailable",
+  ]);
+  assert.equal(ws.mailbox().calls.some((call) => call.op === "message move"), false);
+});
+
+test("an approved rule this version skips or reduces is owed one notice per inbox, marked surfaced at submit", () => {
+  const ruleA = { ...ruleB, account: "a", id: core.ruleId({ ...ruleB, account: "a" }) };
+  const ws = twoInboxes({ promoted: [ruleA, ruleB, repeatRuleB], a: { folders: { "Auto/Notifications": [] } } });
+  const first = ws.run("begin", "--run-id", "r1").json;
+  assert.deepEqual(first.inboxes.a.ruleNotices, [{ ruleId: ruleA.id, pass: "no-reply", rule: NOREPLY_QUERY, kind: "reduced" }]);
+  assert.deepEqual(first.inboxes.b.ruleNotices, [
+    { ruleId: ruleB.id, pass: "no-reply", rule: NOREPLY_QUERY, kind: "reduced" },
+    { ruleId: repeatRuleB.id, pass: "repeat-sender", rule: REPEAT_QUERY, kind: "skipped" },
+  ]);
+  const notices = () => JSON.parse(fs.readFileSync(path.join(ws.dir, ".mailkeeper", "notices.json"), "utf8"));
+  assert.equal(notices().rules, undefined, "owed, not yet surfaced");
+
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const applied = ws.run("apply", "--account", "b", "--promoted-only", "--run-id", "r1").json;
+  assert.deepEqual(applied.results.map((r) => [r.ruleId, r.skipped || null, r.moved ?? null]), [
+    [ruleB.id, null, 2],
+    [repeatRuleB.id, "reply-history-unavailable", null],
+  ]);
+  assert.deepEqual(applied.results[0].uncheckedSignals, ["unsubscribe-link"]);
+  const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+  assert.deepEqual(submit.accounts.b.ruleNotices.map((n) => n.kind), ["reduced", "skipped"]);
+  assert.deepEqual(submit.accounts.a.ruleNotices.map((n) => n.ruleId), [ruleA.id]);
+  assert.deepEqual(Object.keys(notices().rules["containment-1"]).sort(), [`a\n${ruleA.id}`, `b\n${ruleB.id}`, `b\n${repeatRuleB.id}`].sort());
+
+  const second = ws.run("begin", "--run-id", "r2").json;
+  assert.equal(second.inboxes.a.ruleNotices, undefined);
+  assert.equal(second.inboxes.b.ruleNotices, undefined);
+});
+
+test("undo looks for moved messages only within the capped, unfiltered read", () => {
+  const ws = twoInboxes();
+  maintenance(ws, "r1");
+  const folders = ws.mailbox().accounts.b.folders;
+  const moved = folders["Auto/Notifications"];
+  assert.equal(moved.length, 2);
+  // The destination now holds 1000 newer messages ahead of the moved ones.
+  ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [...bulkInbox(1000, 5001), ...moved] } });
+  const before = listCalls(ws, "b", "Auto/Notifications").length;
+  const undone = ws.run("undo", "--run-id", "r1").json;
+  assert.equal(undone.reversed, 0);
+  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["not-found", "not-found"]);
+  const calls = listCalls(ws, "b", "Auto/Notifications").slice(before);
+  assert.equal(calls.length, 5);
+  assert.ok(calls.every((call) => call.query === ""));
+  assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 1002, "nothing moved back");
+});
+
+// ---------------------------------------------------------------------------
 // With the real Himalaya binary
 // ---------------------------------------------------------------------------
 
