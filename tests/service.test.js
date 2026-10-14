@@ -405,20 +405,124 @@ test("server undo points to the workspace chat", async () => {
   await assert.rejects(service.undoRun(workspace, { runId: "7f3a" }, { id: 1 }), { code: "MAILKEEPER_TERMINAL_REQUIRED" });
 });
 
-test("heartbeat end releases the run guard unless a move is uncertain", async () => {
+function runFixture() {
   setMailbox(["work"]);
-  const { service, workspace, dir, store } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
-  const state = path.join(dir, ".mailkeeper");
+  const h = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  const state = path.join(h.dir, ".mailkeeper");
   fs.mkdirSync(path.join(state, "runs"), { recursive: true });
-  const finish = async (runId, run) => {
-    fs.writeFileSync(path.join(state, "run.lock"), JSON.stringify({ runId }));
-    fs.writeFileSync(path.join(state, "runs", `${runId}.json`), JSON.stringify(run));
-    store.set("ws-7-active", { runId, startedAt: new Date().toISOString() });
-    await service.recordHeartbeatLifecycle({ workspace: { id: 7 }, dispatch: { dispatchStatus: "completed" } });
-    return fs.existsSync(path.join(state, "run.lock"));
+  fs.mkdirSync(path.join(state, "outbox"), { recursive: true });
+  const lock = path.join(state, "run.lock");
+  return {
+    ...h,
+    lock,
+    active: () => h.store.get("ws-7-active") || null,
+    // An admitted run: the marker, the helper's file guard and its journal.
+    start(runId, heartbeatRunId, journal = {}) {
+      h.store.set("ws-7-active", { runId, heartbeatRunId, startedAt: new Date().toISOString() });
+      fs.writeFileSync(lock, JSON.stringify({ runId }));
+      const file = path.join(state, "runs", `${runId}.json`);
+      fs.writeFileSync(file, typeof journal === "string" ? journal : JSON.stringify({ runId, pending: null, uncertain: [], ...journal }));
+    },
+    receipt(runId) {
+      fs.writeFileSync(path.join(state, "outbox", `${runId}.json`), JSON.stringify({ runId, outcome: "blocked" }));
+    },
+    end(heartbeatRunId, { state: executorState = "task_completed", dispatch = { success: true, managed: false, reason: "dispatch_not_found" } } = {}) {
+      return h.service.recordHeartbeatLifecycle({ workspace: { id: 7 }, dispatch, event: { state: executorState, heartbeatRunId } });
+    },
   };
-  assert.equal(await finish("r-ok", { runId: "r-ok", uncertain: [] }), false);
-  assert.equal(await finish("r-bad", { runId: "r-bad", uncertain: [{ account: "work" }] }), true);
+}
+
+test("a person's Run that ends releases the next Run and chat; only its own occurrence can end it", async () => {
+  const f = runFixture();
+  f.start("r1", "hb-1");
+  await f.end("hb-1", { state: "task_blocked" });
+  assert.equal(f.active(), null, "marker released");
+  assert.equal(fs.existsSync(f.lock), false, "guard released, so chat begin can start");
+  const next = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual", heartbeatRunId: "hb-2" });
+  assert.ok(next.mailkeeperRunId, "the next Run is admitted");
+
+  // A crash before submit: the session exits, no receipt. Cleanup only.
+  f.start("r3", "hb-3");
+  await f.end("hb-3", { state: "session_exited" });
+  assert.deepEqual([f.active(), fs.existsSync(f.lock)], [null, false]);
+  assert.equal(f.store.get("ws-7-run-r3") ?? null, null, "no receipt is invented for a crashed run");
+
+  // A dispatched (scheduled) run reports the host's dispatch status.
+  f.start("r4", "hb-4");
+  await f.end("hb-4", { dispatch: { success: true, managed: true, status: "completed" } });
+  assert.equal(f.active(), null);
+});
+
+test("lifecycle events that don't end this occurrence change nothing", async () => {
+  const f = runFixture();
+  f.start("r1", "hb-1");
+  const untouched = () => assert.deepEqual([f.active()?.runId, fs.existsSync(f.lock)], ["r1", true]);
+  await f.end("hb-old");
+  untouched();
+  await f.end("");
+  untouched();
+  for (const state of ["session_active", "task_started", "launch_received", "resume_failed", "write_failed", "activity_event_persisted"]) {
+    await f.end("hb-1", { state });
+    untouched();
+  }
+  await f.end("hb-1", { dispatch: { success: true, managed: false, reason: "non_state_event" } });
+  untouched();
+  await f.end("hb-1", { dispatch: { success: true, managed: true, status: "running" } });
+  untouched();
+  await f.end("hb-1", { dispatch: { success: false, managed: true, reason: "stale_fence" } });
+  untouched();
+});
+
+test("receipts end only their own run; a duplicate reconciles its own stale marker", async () => {
+  const f = runFixture();
+  f.start("new-run", "hb-new");
+  await f.service.submitRun(f.workspace, { runId: "old-run", outcome: "blocked" });
+  assert.equal(f.active()?.runId, "new-run", "an old receipt never clears a newer run");
+  assert.equal(fs.existsSync(f.lock), true);
+
+  await f.service.submitRun(f.workspace, { runId: "new-run", outcome: "completed" });
+  assert.equal(f.active(), null);
+  f.store.set("ws-7-active", { runId: "new-run", heartbeatRunId: "hb-new", startedAt: new Date().toISOString() });
+  const again = await f.service.submitRun(f.workspace, { runId: "new-run", outcome: "completed" });
+  assert.deepEqual([again.reused, f.active()], [true, null], "the duplicate clears its own stale marker");
+});
+
+test("a submitted receipt admits the next Run, and a late event from that run can't release it", async () => {
+  const f = runFixture();
+  f.start("a", "hb-a");
+  f.receipt("a");
+  const b = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual", heartbeatRunId: "hb-b" });
+  assert.ok(b.mailkeeperRunId, "A's receipt is ingested before the in-flight check");
+  fs.writeFileSync(f.lock, JSON.stringify({ runId: b.mailkeeperRunId }));
+  await f.end("hb-a");
+  assert.deepEqual([f.active()?.runId, JSON.parse(fs.readFileSync(f.lock, "utf8")).runId], [b.mailkeeperRunId, b.mailkeeperRunId]);
+});
+
+test("the guard stays for pending, uncertain or unreadable journals", async () => {
+  for (const [name, journal] of [
+    ["pending", { pending: { account: "work" } }],
+    ["uncertain", { uncertain: [{ account: "work" }] }],
+    ["corrupt", "{"],
+  ]) {
+    const f = runFixture();
+    f.start("r1", "hb-1", journal);
+    await f.end("hb-1");
+    assert.equal(fs.existsSync(f.lock), true, `${name}: guard kept`);
+  }
+  const f = runFixture();
+  f.start("r1", "hb-1");
+  fs.rmSync(path.join(path.dirname(f.lock), "runs", "r1.json"));
+  await f.end("hb-1");
+  assert.equal(fs.existsSync(f.lock), false, "no journal at all: the run ended before begin");
+});
+
+test("concurrent admissions start at most one run", async () => {
+  const f = runFixture();
+  const results = await Promise.all(
+    ["hb-a", "hb-b", "hb-c"].map((heartbeatRunId) => f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual", heartbeatRunId }))
+  );
+  assert.equal(results.filter((result) => result.mailkeeperRunId).length, 1);
+  assert.equal(results.filter((result) => result.skipLaunch).length, 2);
 });
 
 test("a Manual schedule keeps the task disabled and refuses scheduled launches only", async () => {

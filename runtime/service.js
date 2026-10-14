@@ -78,12 +78,38 @@ function writeJsonAtomic(file, value) {
   fs.renameSync(temp, file);
 }
 
+// How the host reports the end of a heartbeat occurrence to the managed
+// lifecycle hook (server/models/heartbeatSource.js recordExecutorLifecycle and
+// server/utils/heartbeat/executorLifecycle.js). A dispatched run carries the
+// dispatch `status`; a person's Run has no dispatch record, so the host sends
+// `reason: "dispatch_not_found"` and its executor state decides. Activity and
+// fallback states are not ends: the host may still launch or run afterwards.
+const DISPATCH_END_STATUSES = new Set(["completed", "failed", "abandoned", "delivery_unknown"]);
+const EXECUTOR_END_STATES = new Set([
+  "task_completed",
+  "task_blocked",
+  "task_failed",
+  "session_exited",
+  "session_failed",
+  "launch_failed",
+]);
+
+function heartbeatOccurrenceEnded(context) {
+  const dispatch = context?.dispatch || {};
+  if (dispatch.success !== true) return false;
+  if (dispatch.managed === true) return DISPATCH_END_STATUSES.has(String(dispatch.status || "").toLowerCase());
+  if (dispatch.reason !== "dispatch_not_found") return false;
+  const event = context?.event || {};
+  return EXECUTOR_END_STATES.has(String(event.state || event.status || "").trim().toLowerCase());
+}
+
 class MailKeeperService {
   constructor(api) {
     this.api = api;
     this.host = hostFor(api);
     this.store = api.getStore();
     this.provisioningQueues = new Map();
+    this.runStateQueues = new Map();
   }
 
   // -------------------------------------------------------------------------
@@ -498,10 +524,40 @@ class MailKeeperService {
 
 
   /**
+   * Admission, lifecycle, receipts and status reads all touch the active run
+   * marker, the receipt store and the file guard, so they run one at a time
+   * per workspace. Public entry points queue here; the `...Locked` helpers
+   * assume the queue is held and never queue again.
+   */
+  withRunState(workspace, work) {
+    const key = String(workspace.id);
+    const prior = this.runStateQueues.get(key) || Promise.resolve();
+    const run = prior.then(work);
+    const settled = run.catch(() => {});
+    this.runStateQueues.set(key, settled);
+    settled.then(() => {
+      if (this.runStateQueues.get(key) === settled) this.runStateQueues.delete(key);
+    });
+    return run;
+  }
+
+  /** Clear the active run marker only if it is still `runId`'s. */
+  async clearActiveRun(workspace, runId) {
+    const active = await this.store.get(this.activeRunKey(workspace));
+    if (!runId || active?.runId !== runId) return false;
+    await this.store.set(this.activeRunKey(workspace), null);
+    return true;
+  }
+
+  /**
    * Pick up receipts the agent queued in `.mailkeeper/outbox/` and record them.
-   * Called on heartbeat lifecycle events and status reads; no watcher needed.
+   * Called on admission, heartbeat lifecycle events and status reads.
    */
   async ingestOutbox(workspace) {
+    return this.withRunState(workspace, () => this.ingestOutboxLocked(workspace));
+  }
+
+  async ingestOutboxLocked(workspace) {
     const dir = path.join(workspace.workingDirectory, ".mailkeeper", "outbox");
     if (!fs.existsSync(dir)) return { ingested: 0 };
     let ingested = 0;
@@ -516,7 +572,7 @@ class MailKeeperService {
         continue;
       }
       try {
-        await this.submitRun(workspace, body);
+        await this.submitRunLocked(workspace, body);
         fs.unlinkSync(full);
         ingested += 1;
       } catch (error) {
@@ -640,10 +696,18 @@ class MailKeeperService {
    * Idempotent on runId.
    */
   async submitRun(workspace, body) {
+    return this.withRunState(workspace, () => this.submitRunLocked(workspace, body));
+  }
+
+  async submitRunLocked(workspace, body) {
     const runId = text(body.runId, 80);
     if (!runId) throw codedError("runId is required", "MAILKEEPER_RUN_INVALID", 400);
     const existing = await this.store.get(this.runKey(workspace, runId));
-    if (existing) return { runId, reused: true };
+    if (existing) {
+      // A repeated receipt only reconciles its own run's stale marker.
+      await this.clearActiveRun(workspace, runId);
+      return { runId, reused: true };
+    }
 
     const outcome = text(body.outcome, 20);
     if (!["completed", "blocked", "failed"].includes(outcome)) {
@@ -705,7 +769,8 @@ class MailKeeperService {
       await this.store.set(this.rulesKey(workspace), rules);
     }
 
-    await this.store.set(this.activeRunKey(workspace), null);
+    // A receipt ends only its own run: an older one never clears a newer run.
+    await this.clearActiveRun(workspace, runId);
     return { runId, reused: false, actions: receipt.actions.length };
   }
 
@@ -814,17 +879,21 @@ class MailKeeperService {
     if (config.cadence === CADENCE_MANUAL && context.trigger !== "manual") {
       return { skipLaunch: true, skipReason: "schedule is manual" };
     }
-    const active = await this.store.get(this.activeRunKey(workspace));
-    if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {
-      return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
-    }
-    const runId = crypto.randomUUID();
-    await this.store.set(this.activeRunKey(workspace), {
-      runId,
-      heartbeatRunId: context.heartbeatRunId || null,
-      startedAt: new Date().toISOString(),
+    return this.withRunState(workspace, async () => {
+      // A run that submitted its receipt has ended, whatever the host reported.
+      await this.ingestOutboxLocked(workspace);
+      const active = await this.store.get(this.activeRunKey(workspace));
+      if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {
+        return { skipLaunch: true, skipReason: `run ${active.runId} still in flight` };
+      }
+      const runId = crypto.randomUUID();
+      await this.store.set(this.activeRunKey(workspace), {
+        runId,
+        heartbeatRunId: context.heartbeatRunId || null,
+        startedAt: new Date().toISOString(),
+      });
+      return { mailkeeperRunId: runId };
     });
-    return { mailkeeperRunId: runId };
   }
 
   async recordHeartbeatDispatch(context) {
@@ -835,21 +904,24 @@ class MailKeeperService {
   }
 
   /**
-   * `dispatch.dispatchStatus` is the host's classification of the executor
-   * event: anything other than `running` ends the occurrence. Ingest whatever
-   * the agent queued, then release both the scheduler marker and the
-   * workspace run guard — the guard only when that run recorded no move whose
-   * outcome is unknown.
+   * The end of one heartbeat occurrence: ingest its receipt, then release its
+   * run guard (unless a move is pending or uncertain, or its journal can't be
+   * read) and its active marker. Only the occurrence the marker was admitted
+   * for (`event.heartbeatRunId`) can end it; anything else does nothing.
    */
   async recordHeartbeatLifecycle(context) {
-    const status = String(context.dispatch?.dispatchStatus || "").toLowerCase();
-    if (!status || status === "running") return;
+    if (!heartbeatOccurrenceEnded(context)) return;
+    const occurrence = String(context.event?.heartbeatRunId || "").trim();
+    if (!occurrence) return;
     const workspace = await this.host.workspaces.get({ id: context.workspace?.id });
     if (!workspace) return;
-    const active = await this.store.get(this.activeRunKey(workspace));
-    await this.ingestOutbox(workspace); // submitRun clears the marker on success
-    if (active?.runId) this.releaseRunGuard(workspace, active.runId);
-    await this.store.set(this.activeRunKey(workspace), null);
+    await this.withRunState(workspace, async () => {
+      const active = await this.store.get(this.activeRunKey(workspace));
+      if (!active?.runId || active.heartbeatRunId !== occurrence) return;
+      await this.ingestOutboxLocked(workspace);
+      this.releaseRunGuard(workspace, active.runId);
+      await this.clearActiveRun(workspace, active.runId);
+    });
   }
 
   releaseRunGuard(workspace, runId) {
@@ -864,8 +936,10 @@ class MailKeeperService {
     let run = null;
     try {
       run = JSON.parse(fs.readFileSync(path.join(state, "runs", `${path.basename(runId)}.json`), "utf8"));
-    } catch {
-      /* no run record: nothing was attempted */
+    } catch (error) {
+      // No journal: the run ended before `begin` wrote one, so nothing was
+      // attempted. An unreadable journal could hide a pending move: keep it.
+      if (error?.code !== "ENOENT") return false;
     }
     if (run?.pending || (Array.isArray(run?.uncertain) && run.uncertain.length)) return false;
     fs.rmSync(path.join(state, "run.lock"), { force: true });
