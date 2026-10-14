@@ -17,8 +17,8 @@ Steps:
 2. **Reconcile any move in doubt.** Read `.mailkeeper/runs/<run ID>.json`. If `pending` is set or `uncertain` isn't empty, check the inbox with the person and reconcile that move first, using the skill's uncertain-move check. If the journal can't be read or isn't a MailKeeper journal, investigate; don't delete the guard blindly.
 3. **Keep the record.** Leave the journal and its confirmed moves in place: they are the run's audit and undo record.
 4. **Clear only that run's guard.** Remove `.mailkeeper/run.lock` only if its `runId` is that run. A chat run can then start straight away, with a fresh run ID. Run presses and scheduled runs can stay held by the admission marker until its 6-hour window ends; removing the file doesn't release that.
-5. **Tell the person what was cleared.** In this release only the run guard can be cleared, so send:
+5. **Tell the person what was cleared.** In this release only the run guard can be cleared, and there is no supported way to read or clear the admission marker. So don't promise when the Run button or scheduled checks will work again, and don't say MailKeeper is cleared. Send:
 
-   > MailKeeper is cleared for your workspace. To run it now, ask this workspace's chat to “run MailKeeper”. The Run button and scheduled checks start again after <time>.
+   > You can run MailKeeper now by asking this workspace's chat to ‘run MailKeeper’. The Run button and scheduled checks may still be on hold; we haven't confirmed when that hold will end.
 
-   For <time>, add 6 hours to the stuck run's `startedAt` in `.mailkeeper/run.lock`, and give it in the person's timezone. MailKeeper admits a run just before its guard is taken, so this time is never too early. If `startedAt` is missing or not trustworthy, say "within a few hours" instead.
+   Don't work out a time from `run.lock`. Its `startedAt` is when that run took the guard. The admission hold lasts 6 hours from MailKeeper's latest admission, which can belong to a newer run than the one in `run.lock`. A run started from chat has no admission at all. Even when the hold ends, a check still runs only on its schedule, and not while Schedule is Manual or the heartbeat is paused.
