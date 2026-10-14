@@ -123,11 +123,6 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 
 - If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. Support can clear it. A fix is tracked in realtimex-ai-app#2456.
 
-  **For support, clearing a stranded run** (the run ID the person quotes is in `.mailkeeper/run.lock`):
-  1. Establish that the run's executor has stopped and can't resume: the terminal sessions recorded in `run.lock` and `.mailkeeper/runs/<id>.owner.json` are gone. An app restart, elapsed time or `release --reconciled` alone doesn't establish this.
-  2. Read `.mailkeeper/runs/<id>.json`. If a move is `pending` or `uncertain`, check the inbox with the person and reconcile it first. If the journal can't be read, investigate; don't delete the guard blindly.
-  3. Keep the journal: its confirmed moves are the undo record. Remove only that run's `run.lock`; the next run starts with a new run ID.
-
 ### Upgrading from 0.1
 
 The first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
