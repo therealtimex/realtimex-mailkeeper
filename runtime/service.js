@@ -954,10 +954,11 @@ class MailKeeperService {
   }
 
   /**
-   * Add an executor identity to the active run's owners, on the marker and
-   * beside its journal (`runs/<runId>.owner.json`). A later event never
-   * erases a known field; a new session for the same occurrence (the host's
-   * fallback chain) is added, not substituted.
+   * Add an executor identity to the active run's owners, beside its journal
+   * (`runs/<runId>.owner.json`) first and then on the marker. A later event
+   * never erases a known field; a new session for the same occurrence (the
+   * host's fallback chain) is added, not substituted. Repeating an event
+   * rewrites a missing or stale owner file, so a failed write heals.
    */
   async recordRunOwner(workspace, active, owner) {
     const owners = Array.isArray(active.owners) ? active.owners.map((entry) => ({ ...entry })) : [];
@@ -969,19 +970,26 @@ class MailKeeperService {
     if (same) {
       if (same.runtimeSessionId && owner.runtimeSessionId && same.runtimeSessionId !== owner.runtimeSessionId) return;
       if (same.ptySessionId && owner.ptySessionId && same.ptySessionId !== owner.ptySessionId) return;
-      const before = JSON.stringify(same);
       same.runtimeSessionId ||= owner.runtimeSessionId;
       same.ptySessionId ||= owner.ptySessionId;
-      if (JSON.stringify(same) === before) return;
     } else {
       owners.push({ ...owner, firstSeenAt: new Date().toISOString() });
     }
-    await this.store.set(this.activeRunKey(workspace), { ...active, owners });
+    const record = { schemaVersion: 1, runId: active.runId, heartbeatRunId: active.heartbeatRunId, owners };
     const target = safeWorkspacePath(
       workspace.workingDirectory,
       path.join(".mailkeeper", "runs", `${path.basename(active.runId)}.owner.json`)
     );
-    writeJsonAtomic(target, { schemaVersion: 1, runId: active.runId, heartbeatRunId: active.heartbeatRunId, owners });
+    let written = null;
+    try {
+      written = fs.readFileSync(target, "utf8");
+    } catch {
+      written = null;
+    }
+    if (written !== `${JSON.stringify(record, null, 2)}\n`) writeJsonAtomic(target, record);
+    if (JSON.stringify(owners) !== JSON.stringify(active.owners || [])) {
+      await this.store.set(this.activeRunKey(workspace), { ...active, owners });
+    }
   }
 
   releaseRunGuard(workspace, runId) {

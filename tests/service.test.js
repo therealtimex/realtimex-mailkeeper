@@ -563,6 +563,28 @@ test("each matching lifecycle event records the executor's host identity, never 
   assert.equal(JSON.parse(fs.readFileSync(sidecar, "utf8")).runId, "r1", "the owner record stays with the run's journal");
 });
 
+test("a failed owner-file write is repaired when the same event repeats", async () => {
+  const f = runFixture();
+  f.start("r1", "hb-1");
+  const sidecar = path.join(path.dirname(f.lock), "runs", "r1.owner.json");
+  const event = () =>
+    f.service.recordHeartbeatLifecycle({
+      workspace: { id: 7 },
+      dispatch: { success: true, managed: false, reason: "dispatch_not_found" },
+      event: { state: "session_started", heartbeatRunId: "hb-1", runtimeSessionId: "cli-agent:p1", ptySessionId: "p1" },
+    });
+  fs.mkdirSync(path.join(sidecar, "blocked"), { recursive: true }); // the first write can't replace a directory
+  await assert.rejects(event());
+  assert.equal(f.active().owners, undefined, "the marker isn't updated ahead of the owner file");
+  fs.rmSync(sidecar, { recursive: true });
+  await event();
+  assert.deepEqual(JSON.parse(fs.readFileSync(sidecar, "utf8")).owners.map((owner) => owner.ptySessionId), ["p1"]);
+  assert.deepEqual(f.active().owners.map((owner) => owner.ptySessionId), ["p1"]);
+  fs.rmSync(sidecar);
+  await event();
+  assert.equal(fs.existsSync(sidecar), true, "an identical event restores a missing owner file");
+});
+
 test("concurrent admissions start at most one run", async () => {
   const f = runFixture();
   const results = await Promise.all(
