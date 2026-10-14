@@ -510,8 +510,12 @@ class MailKeeperService {
     return rules;
   }
 
-  async promoteRule(workspace, body, user) {
-    if (!user?.id)
+  /**
+   * `human` is the verified interactive person from the route gate
+   * ({ userId, source }); nothing here builds one from a bare user ID.
+   */
+  async promoteRule(workspace, body, human) {
+    if (!human?.userId)
       throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const { config, errors } = this.profileConfig(workspace);
     if (errors.length)
@@ -536,7 +540,7 @@ class MailKeeperService {
     rules.promoted.push({
       ...rule,
       promotedAt: new Date().toISOString(),
-      promotedBy: user.id,
+      promotedBy: human.userId,
     });
     rules.revision += 1;
     rules.updatedAt = new Date().toISOString();
@@ -545,8 +549,8 @@ class MailKeeperService {
     return { ruleId, revision: rules.revision };
   }
 
-  async demoteRule(workspace, body, user) {
-    if (!user?.id)
+  async demoteRule(workspace, body, human) {
+    if (!human?.userId)
       throw codedError("Authenticated human required", "MAILKEEPER_HUMAN_REQUIRED", 403);
     const rules = await this.store.get(this.rulesKey(workspace));
     const ruleId = text(body.ruleId, 120);
@@ -554,7 +558,7 @@ class MailKeeperService {
     if (!rule)
       throw codedError(`Unknown promoted rule ${ruleId}`, "MAILKEEPER_RULE_UNKNOWN", 404);
     rules.promoted = rules.promoted.filter((entry) => entry.id !== ruleId);
-    rules.proposed.push({ ...rule, demotedAt: new Date().toISOString() });
+    rules.proposed.push({ ...rule, demotedAt: new Date().toISOString(), demotedBy: human.userId });
     rules.revision += 1;
     rules.updatedAt = new Date().toISOString();
     await this.store.set(this.rulesKey(workspace), rules);

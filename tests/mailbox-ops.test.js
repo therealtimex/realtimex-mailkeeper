@@ -187,12 +187,19 @@ function assertNoSecrets(ws) {
     }
   };
   walk(ws.dir);
+  // Verbatim, encoded, or a recognisable fragment.
+  const forms = [SECRET_A, SECRET_B].flatMap((value) => [
+    value,
+    Buffer.from(value).toString("base64"),
+    Buffer.from(value).toString("hex"),
+    value.slice(-12),
+  ]);
   for (const file of files) {
     const text = fs.readFileSync(file, "utf8");
-    assert.equal(text.includes(SECRET_A) || text.includes(SECRET_B), false, `credential found in ${path.relative(ws.dir, file)}`);
+    assert.equal(forms.some((form) => text.includes(form)), false, `credential found in ${path.relative(ws.dir, file)}`);
   }
   const transcript = ws.transcript.join("\n");
-  assert.equal(transcript.includes(SECRET_A) || transcript.includes(SECRET_B), false, "credential in CLI output");
+  assert.equal(forms.some((form) => transcript.includes(form)), false, "credential in CLI output");
 }
 
 test("each inbox follows its own contract and only its own approved rules", () => {
@@ -499,6 +506,30 @@ test("contract-set changes only the settings block and never implies review cons
   assert.ok(text.startsWith(legacyText.trimEnd()));
   assert.equal((text.match(/```mailkeeper-policy/g) || []).length, 1);
   assert.equal(set("--age", "45").json.status, "valid");
+});
+
+test("clearing a review marker cannot exceed the workspace caps or approve a rule", () => {
+  const ws = makeWorkspace({
+    inboxes: {
+      legacy: {
+        password: SECRET_A,
+        policy: { mode: "archive-promoted", aggressiveness: "aggressive", archiveFolder: "Archive", reviewRequired: true, credential: secretA },
+        folders: { Archive: [], "Auto/Notifications": [] },
+      },
+    },
+    workspace: { mode: "label-only", modeCeiling: "label-only", aggressiveness: "conservative", promotablePasses: core.PASSES_BY_AGGRESSIVENESS.conservative },
+  });
+  const rulesBefore = fs.readFileSync(path.join(ws.dir, ".mailkeeper", "rules.json"), "utf8");
+  assert.equal(ws.run("contract-set", "--account", "legacy", "--confirm-review").json.status, "valid");
+  const checked = ws.run("contract-check", "--account", "legacy").json;
+  assert.equal(checked.settings.mode, "archive-promoted", "the contract still says what it asks for");
+  assert.equal(checked.effectiveMode, undefined);
+  assert.equal(checked.settings.effectiveMode, "label-only", "the workspace cap still applies");
+  assert.deepEqual(checked.promotablePasses, ["no-reply", "calendar-response", "sketchy-tld"]);
+  assert.equal(fs.readFileSync(path.join(ws.dir, ".mailkeeper", "rules.json"), "utf8"), rulesBefore, "no rule was approved");
+  const { steps } = maintenance(ws, "r1", ["legacy"]);
+  assert.deepEqual(steps.legacy[2].json.results, [], "with no approved rule, nothing runs");
+  assert.equal(ws.mailbox().accounts.legacy.folders.INBOX.length, 6);
 });
 
 test("status reports the four setup criteria per inbox and the schedule", () => {

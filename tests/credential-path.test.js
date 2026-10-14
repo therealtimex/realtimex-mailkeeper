@@ -57,9 +57,21 @@ async function runRunner(args, { kind = "realtimex-secret", credential = SENTINE
   }
 }
 
+/**
+ * Forms a leaked credential could take in a diagnostic: verbatim, encoded,
+ * or a recognisable fragment of it.
+ */
+function leakForms(value) {
+  const forms = [value, Buffer.from(value).toString("base64"), encodeURIComponent(value), Buffer.from(value).toString("hex")];
+  for (let i = 0; i + 12 <= value.length; i += 6) forms.push(value.slice(i, i + 12));
+  return forms;
+}
+
 function assertNoLeak(run, ...surfaces) {
   for (const surface of [run.stdout, run.stderr, ...surfaces]) {
-    assert.equal(String(surface).includes(SENTINEL), false, "credential reached a captured surface");
+    for (const form of leakForms(SENTINEL)) {
+      assert.equal(String(surface).includes(form), false, "credential (or an encoding or fragment of it) reached a captured surface");
+    }
   }
 }
 

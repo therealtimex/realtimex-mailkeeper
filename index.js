@@ -46,10 +46,46 @@ async function resolveWorkspace(service, request, response, { allowInactive = fa
     );
     if (!enabled) return { error: "MailKeeper is not active for this workspace", status: 403 };
   }
-  // The host's validatedRequest middleware attaches the session user to
-  // response.locals; app-id (agent) calls carry no user, which is what
-  // "Authenticated human required" checks for.
   return { workspace, user: response?.locals?.user || null };
+}
+
+/**
+ * The interactive person behind this request, or null. Only the host's own
+ * middleware output counts: response.locals.authActor, set by
+ * validatedRequest for a signed-in desktop or browser session. Terminal,
+ * app-id, SDK, CLI, device and Local App callers are never interactive,
+ * even when a user is attached, and nothing from the request body or
+ * headers is consulted.
+ */
+function interactiveHuman(response) {
+  const locals = response?.locals || {};
+  const user = locals.user;
+  const actor = locals.authActor;
+  const verified =
+    user &&
+    user.id !== undefined &&
+    user.id !== null &&
+    locals.localGuestMode !== true &&
+    actor &&
+    actor.kind === "human" &&
+    actor.interactiveHuman === true &&
+    String(actor.id) === String(user.id);
+  return verified ? Object.freeze({ userId: String(user.id), source: String(actor.source || "") }) : null;
+}
+
+/** Human-only routes: refuse before resolving scope or touching anything. */
+function humanOnly(service, handler, options) {
+  return (request, response) => {
+    const human = interactiveHuman(response);
+    if (!human) {
+      return response.status(403).json({
+        ok: false,
+        error: "A person signed in to RealTimeX must make this change.",
+        code: "MAILKEEPER_HUMAN_REQUIRED",
+      });
+    }
+    return withScope(service, request, response, (scope) => handler(request, response, { ...scope, human }), options);
+  };
 }
 
 async function withScope(service, request, response, handler, options = {}) {
@@ -147,22 +183,20 @@ module.exports = definePlugin({
     api.registerRoute(
       "POST",
       "/rules/promote",
-      (request, response) =>
-        withScope(service, request, response, async ({ workspace, user }) => {
-          const result = await service.promoteRule(workspace, request.body || {}, user);
-          return response.status(200).json({ ok: true, ...result });
-        }),
+      humanOnly(service, async (request, response, { workspace, human }) => {
+        const result = await service.promoteRule(workspace, request.body || {}, human);
+        return response.status(200).json({ ok: true, ...result });
+      }),
       routeOptions
     );
 
     api.registerRoute(
       "POST",
       "/rules/demote",
-      (request, response) =>
-        withScope(service, request, response, async ({ workspace, user }) => {
-          const result = await service.demoteRule(workspace, request.body || {}, user);
-          return response.status(200).json({ ok: true, ...result });
-        }),
+      humanOnly(service, async (request, response, { workspace, human }) => {
+        const result = await service.demoteRule(workspace, request.body || {}, human);
+        return response.status(200).json({ ok: true, ...result });
+      }),
       routeOptions
     );
 
@@ -180,16 +214,10 @@ module.exports = definePlugin({
     api.registerRoute(
       "POST",
       "/repair",
-      (request, response) =>
-        withScope(service, request, response, async ({ workspace, user }) => {
-          if (!user?.id) {
-            return response
-              .status(403)
-              .json({ ok: false, error: "Authenticated human required" });
-          }
-          const result = await service.provision(workspace);
-          return response.status(200).json({ ok: true, ...result });
-        }),
+      humanOnly(service, async (request, response, { workspace }) => {
+        const result = await service.provision(workspace);
+        return response.status(200).json({ ok: true, ...result });
+      }),
       routeOptions
     );
   },
