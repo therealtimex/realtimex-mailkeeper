@@ -2201,14 +2201,18 @@ const commands = {
         for (const group of groups.values()) {
           // The destination's most recent pages, unfiltered and within the read
           // budget; a message beyond them is reported unresolved, never guessed.
-          const present = listCapped(rules, inbox, group.from, readBudget()).envelopes;
+          // Not found in a listing that stopped early is only "not in the part
+          // checked", never "gone".
+          const listing = listCapped(rules, inbox, group.from, readBudget());
+          const present = listing.envelopes;
+          const missing = listing.complete ? "not-found" : "not-found-in-checked-part";
           const matches = [];
           for (const action of group.items) {
             const hits = present.filter(
               (e) => e.fromAddress === action.fromAddress && e.subject.slice(0, 200) === action.subject && e.date === action.date
             );
             if (hits.length === 1) matches.push(hits[0]);
-            else report.unresolved.push({ account, uid: action.uid, from: group.from, to: group.to, reason: hits.length ? "ambiguous" : "not-found" });
+            else report.unresolved.push({ account, uid: action.uid, from: group.from, to: group.to, reason: hits.length ? "ambiguous" : missing });
           }
           if (!dryRun && matches.length) {
             report.reversed += moveChunks(undoRun, rules, inbox, matches, group.from, group.to, { undoOf: runId });

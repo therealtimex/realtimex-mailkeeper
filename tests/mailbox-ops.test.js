@@ -960,16 +960,22 @@ test("undo looks for moved messages only within the capped, unfiltered read", ()
   const folders = ws.mailbox().accounts.b.folders;
   const moved = folders["Auto/Notifications"];
   assert.equal(moved.length, 2);
+  // A listing that reached its end can say a message wasn't found.
+  ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [moved[0]] } });
+  const ended = ws.run("undo", "--run-id", "r1", "--dry-run").json;
+  assert.deepEqual([ended.reversed, ended.unresolved.map((u) => u.reason)], [1, ["not-found"]]);
   // The destination now holds 1000 newer messages ahead of the moved ones.
   ws.setFake("b", { folders: { ...folders, "Auto/Notifications": [...bulkInbox(1000, 5001), ...moved] } });
   const before = listCalls(ws, "b", "Auto/Notifications").length;
   const undone = ws.run("undo", "--run-id", "r1").json;
   assert.equal(undone.reversed, 0);
-  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["not-found", "not-found"]);
+  assert.deepEqual(undone.unresolved.map((u) => u.reason), ["not-found-in-checked-part", "not-found-in-checked-part"]);
+  assert.ok(undone.unresolved.every((u) => u.from === "Auto/Notifications" && u.to === "INBOX"));
   const calls = listCalls(ws, "b", "Auto/Notifications").slice(before);
   assert.equal(calls.length, 5);
   assert.ok(calls.every((call) => call.query === ""));
   assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 1002, "nothing moved back");
+
 });
 
 // ---------------------------------------------------------------------------

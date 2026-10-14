@@ -198,6 +198,9 @@ mailbox-ops undo --run-id <id> [--account <name>]
 ```
 
 Preview the reversal per inbox, and get a yes before acting. Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date. Say plainly which ones it can't match (`unresolved`) before acting; they are left where they are. Undo checks every inbox before changing any.
+- `not-found`: say they can't be found, and that they stay where they are.
+- `not-found-in-checked-part` (the folder was larger than undo can check): "I couldn't find <n> of them in the part of <folder> I can check in this version, so they stay where they are." Take <folder> from `from`. Never suggest they were deleted.
+- `ambiguous`: say several messages look the same, so undo leaves them where they are.
 
 ## When something fails
 
