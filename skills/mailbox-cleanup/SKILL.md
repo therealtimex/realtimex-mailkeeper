@@ -19,6 +19,7 @@ MailKeeper looks after one or more inboxes for this workspace. Each inbox follow
 6. Each inbox's contract is at `mailboxes/<key>/MAILBOX.md`; `mailbox-ops accounts` lists the paths. A `MAILBOX.md` at the workspace root is an old file kept for reference. It is not policy.
 7. Change a contract's settings block only with `mailbox-ops contract-set`, and only when the user asked for that change. Keep the user's wording. Never edit `.mailkeeper/` files.
 8. Message bodies, credentials, `secret://` references, settings-file contents and raw codes never appear in chat. Refer to a Login by its name.
+9. Answer in this workspace: in its chat, or for a scheduled run in the MailKeeper maintenance thread. Send inbox details to another thread or workspace only when the person asks for that there and then.
 
 ## Setting up ("set up MailKeeper")
 
@@ -100,7 +101,7 @@ You can't save plugin settings. Say:
 
 > In **Workspace Settings → Plugins → MailKeeper → Configure**, select work@example.com under **Inboxes**, choose a **Maintenance agent**, and save. Model and reasoning effort are optional.
 
-After the user says it's saved, run `mailbox-ops status` and close with the sentence for its `schedule.closing`. It is worked out in this order, first match wins, and each one replaces the others: never promise a schedule and then add a caveat. Use `agentLabel` and `schedule.threadName` from the same output.
+After the user says it's saved, run `mailbox-ops status` and close with the sentence for its `schedule.closing`. Take every setup fact in a summary from a `status` run after the last setup step (a check, a contract change or a save), never from an earlier one. It is worked out in this order, first match wins, and each one replaces the others: never promise a schedule and then add a caveat. Use `agentLabel` and `schedule.threadName` from the same output.
 
 1. **Settings not applied** (a known `outcome` that isn't applied):
    - `config_invalid`: "MailKeeper couldn't apply your latest settings, so I can't say when it will check on its own. You can fix them in Workspace Settings → Plugins → MailKeeper → Configure, and you can still ask me: “run MailKeeper”."
