@@ -159,8 +159,10 @@ Describe these truthfully:
 One report per run. Give each inbox its own section, inbox name first, and say what happened and what changed, then one next action. Take every fact from the `submit` output: each inbox's `outcome` and `code`, `movedByDestination`, `suggestions`, `urgent`, and the run ID for undo:
 
 > **work@example.com:** checked. Moved 14 by your approved rules (Newsletters 9, Calendar 5). 3 suggestions. 1 urgent: "Final notice …" from billing@… (left in the inbox).
-> **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the "MailKeeper – personal@example.com" Login in Settings → Secrets, then ask me to run MailKeeper.
-> To undo this run, ask me: "undo MailKeeper run 7f3a".
+> **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the Login "MailKeeper – personal@example.com" in Settings → Secrets, then ask this workspace's chat to run MailKeeper.
+> To undo this run, ask this workspace's chat: "undo MailKeeper run 7f3a".
+
+Write only the per-inbox sections and, when something moved, the undo line. No error codes, no step names (snapshot, triage, apply, propose), and no notes about lessons, tools or this workspace's own instructions. A scheduled report is read in the maintenance thread, where no one may answer: wherever this skill says "ask me", say "ask this workspace's chat".
 
 When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked and nothing moved, nothing was suggested, nothing is urgent, nothing failed, and no explanation is owed.
 
@@ -177,7 +179,7 @@ Preview the reversal per inbox, and get a yes before acting. Moved messages get 
 
 ## When something fails
 
-Always answer in this order: the inbox name; what happened, without guessing the cause; what changed, from the receipt ("Nothing was changed", "N moved before the problem; you can undo them" (`movedBeforeProblem`), or "I can't confirm whether the last move finished"); one next action, in the place the user will act. You may add the code at the end as "(Details: MAILKEEPER_…)". Other inboxes continue when it is safe.
+Always answer in this order: the inbox name; what happened, without guessing the cause; what changed, from the receipt ("Nothing was changed", "N moved before the problem; you can undo them" (`movedBeforeProblem`), or "I can't confirm whether the last move finished"); one next action, in the place the user will act. Never show the code itself; it stays in the receipt. Name a Login by its name when you know it (from setup, or from Secrets metadata for the contract's reference), never by its `secret://` reference; otherwise say "the MailKeeper Login for work@example.com". Other inboxes continue when it is safe.
 
 | Code | Say (inbox-specific where it applies) |
 |---|---|
@@ -189,7 +191,7 @@ Always answer in this order: the inbox name; what happened, without guessing the
 | `CONTRACT_INVALID` | I can't read the MailKeeper settings in work@example.com's contract, so I'm only reporting for it. Ask me to fix it; I'll keep your wording. |
 | `CONTRACT_CHANGED` | work@example.com's contract changed after this preview. I'll preview again before changing anything. |
 | `CREDENTIAL_UNAVAILABLE` | I can't use the saved password for work@example.com. In Settings → Secrets, check that the Login "…" exists, is enabled, has a password and is available to this workspace. |
-| `IMAP_CHECK_FAILED`, `NETWORK_DENIED`, `TIMEOUT` | I couldn't connect or sign in to work@example.com. Nothing was changed. Check the password in Secrets (some providers need an app password) and that the maintenance agent may use the network. Name only the category the code supports. |
+| `IMAP_CHECK_FAILED`, `NETWORK_DENIED`, `TIMEOUT` | I couldn't connect or sign in to work@example.com. Nothing was changed. Check the password of the Login "…" in Settings → Secrets (some providers need an app password) and that the maintenance agent may use the network. Name only the category the code supports. |
 | `RTXEXEC_UNAVAILABLE`, `SESSION_UNAVAILABLE` | I can only reach your inboxes from a RealTimeX workspace chat or a scheduled run. Ask me here in the workspace chat. |
 | `RUN_BUSY` | MailKeeper is already running for this workspace. Ask again when it finishes. I won't start a second run. |
 | `MUTATION_UNCERTAIN` | The connection dropped while moving messages in work@example.com, so I can't confirm the last move. I've stopped changes for this inbox and won't repeat it. Ask me to check it. |

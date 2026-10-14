@@ -103,6 +103,9 @@ test("provision seeds one report-only contract per selected inbox and one task",
   assert.equal("runtimeOptionValues" in task, false);
   assert.match(task.prompt, /--account 'personal@example\.com'/);
   assert.match(task.prompt, /mailboxes\/work-[0-9a-f]{12}\/MAILBOX\.md/);
+  assert.doesNotMatch(task.prompt, /\(Details/, "reports never show error codes");
+  assert.match(task.prompt, /no error codes, no step names/);
+  assert.match(task.prompt, /point to this workspace's chat/);
 
   const rules = JSON.parse(fs.readFileSync(path.join(dir, ".mailkeeper", "rules.json"), "utf8"));
   assert.equal(rules.schemaVersion, 2);
