@@ -121,7 +121,7 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 
 ### Known limitations
 
-- If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. Support can clear it. A fix is tracked in realtimex-ai-app#2456.
+- If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. To clear it, ask for help through Community & support in the RealTimeX sidebar. A fix is tracked in realtimex-ai-app#2456.
 
 ### Upgrading from 0.1
 
