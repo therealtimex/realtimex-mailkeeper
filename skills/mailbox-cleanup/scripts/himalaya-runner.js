@@ -136,6 +136,13 @@ function classify(op, result) {
   if (/cannot find configuration at/i.test(stderr)) return "MAILKEEPER_HIMALAYA_CONFIG_MISSING";
   if (/cannot (parse|read) config/i.test(stderr)) return "MAILKEEPER_HIMALAYA_CONFIG_INVALID";
   if (/operation not permitted|os error 1\b/i.test(stderr)) return "MAILKEEPER_NETWORK_DENIED";
+  // Himalaya's own connect timeout (macOS os error 60, Linux 110). Failing to
+  // connect means nothing was sent; a timeout after connecting may not be.
+  if (/timed out|os error (60|110)\b/i.test(stderr)) {
+    return /cannot connect|cannot build imap client/i.test(stderr) || !MUTATING.has(op)
+      ? "MAILKEEPER_TIMEOUT"
+      : "MAILKEEPER_MUTATION_UNCERTAIN";
+  }
   if (/cannot (connect|authenticate|login|build imap)|connection refused|authentication failed|invalid credentials/i.test(stderr)) {
     return "MAILKEEPER_IMAP_CHECK_FAILED";
   }

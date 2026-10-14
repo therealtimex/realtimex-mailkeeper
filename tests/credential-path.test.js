@@ -101,6 +101,12 @@ test("runner classifies failures with fixed codes and treats unknown mutation fa
   assert.equal(classify("folder-list", { stderr: "cannot parse config file at /x" }), "MAILKEEPER_HIMALAYA_CONFIG_INVALID");
   assert.equal(classify("folder-list", { stderr: "cannot connect to TCP stream\nOperation not permitted (os error 1)" }), "MAILKEEPER_NETWORK_DENIED");
   assert.equal(classify("folder-list", { stderr: "cannot build IMAP client\nConnection refused (os error 61)" }), "MAILKEEPER_IMAP_CHECK_FAILED");
+  // Himalaya's own connect timeout, as observed live (macOS os error 60):
+  // nothing was sent, so even a move is a plain timeout, not uncertain.
+  const connectTimeout = "cannot build IMAP client\ncannot connect to TCP stream\nOperation timed out (os error 60)";
+  assert.equal(classify("folder-list", { stderr: connectTimeout }), "MAILKEEPER_TIMEOUT");
+  assert.equal(classify("message-move", { stderr: connectTimeout }), "MAILKEEPER_TIMEOUT");
+  assert.equal(classify("message-move", { stderr: "Connection timed out (os error 110)" }), "MAILKEEPER_MUTATION_UNCERTAIN");
   assert.equal(classify("folder-list", { stderr: "something new" }), "MAILKEEPER_OPERATION_FAILED");
   assert.equal(classify("message-move", { stderr: "something new" }), "MAILKEEPER_MUTATION_UNCERTAIN");
 });

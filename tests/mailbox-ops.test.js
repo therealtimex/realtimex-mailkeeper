@@ -310,6 +310,10 @@ test("session, wrapper and config problems map to fixed codes", () => {
   assert.equal(ws.run("snapshot", "--account", "a", "--run-id", "r1").json.code, "MAILKEEPER_HIMALAYA_CONFIG_MISSING");
   fs.rmSync(path.join(ws.dir, ".mailkeeper", "rules.json"));
   assert.equal(ws.run("begin", "--run-id", "r9").json.code, "MAILKEEPER_NOT_CONFIGURED");
+  // A crashing tool is not blamed on the user's settings (seen in the live C0 run).
+  ws.env = { MAILKEEPER_HIMALAYA_BIN: "/usr/bin/false" };
+  assert.equal(ws.run("check", "--account", "a", "--native").json.code, "MAILKEEPER_OPERATION_FAILED");
+  assert.equal(ws.run("accounts").json.code, "MAILKEEPER_OPERATION_FAILED");
 });
 
 test("an unknown move result is recorded, never replayed, and holds the run guard", () => {

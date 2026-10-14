@@ -786,18 +786,26 @@ function renderStanza({ account, email, host, port, encryption, login }) {
   ];
 }
 
-function himalayaParses(file) {
+/**
+ * Account names in one Himalaya config file, without signing in. Throws a
+ * fixed code: a config Himalaya cannot parse is invalid; any other failure of
+ * the tool itself is not blamed on the user's settings.
+ */
+function himalayaAccounts(file) {
   const result = spawnSync(HIMALAYA, ["account", "list", "-o", "json", "--quiet", "-c", file], {
     stdio: ["ignore", "pipe", "pipe"],
     encoding: "utf8",
     timeout: 30_000,
   });
   if (result.error?.code === "ENOENT") throw failure("MAILKEEPER_HIMALAYA_UNAVAILABLE");
-  if (result.status !== 0) return null;
+  if (result.status !== 0) {
+    throw failure(/cannot (parse|read) config/i.test(String(result.stderr || "")) ? "MAILKEEPER_HIMALAYA_CONFIG_INVALID" : "MAILKEEPER_OPERATION_FAILED");
+  }
   try {
-    return JSON.parse(result.stdout || "[]");
+    const rows = JSON.parse(result.stdout || "[]");
+    return Array.isArray(rows) ? rows : [];
   } catch {
-    return null;
+    throw failure("MAILKEEPER_OPERATION_FAILED");
   }
 }
 
@@ -853,8 +861,7 @@ function setupInbox(account) {
   const rules = readJson(statePath("rules.json"));
   const config = rules?.schemaVersion === 2 ? pinnedConfig(rules) : localHimalayaConfig();
   if (config.missing) throw failure("MAILKEEPER_HIMALAYA_CONFIG_MISSING", { file: config.target });
-  const listed = himalayaParses(config.paths[0]);
-  if (!listed) throw failure("MAILKEEPER_HIMALAYA_CONFIG_INVALID", { file: config.paths[0] });
+  const listed = himalayaAccounts(config.paths[0]);
   if (!listed.some((row) => row?.name === account)) throw failure("MAILKEEPER_ACCOUNT_NOT_FOUND", { account });
   const key = core.accountKey(account);
   const recorded = core.own(rules?.accounts, account);
@@ -956,9 +963,11 @@ const commands = {
     let code = null;
     if (config.missing) code = "MAILKEEPER_HIMALAYA_CONFIG_MISSING";
     else {
-      const listed = himalayaParses(config.paths[0]);
-      if (!listed) code = "MAILKEEPER_HIMALAYA_CONFIG_INVALID";
-      else available = listed.map((row) => String(row?.name || "")).filter(core.validAccountName);
+      try {
+        available = himalayaAccounts(config.paths[0]).map((row) => String(row?.name || "")).filter(core.validAccountName);
+      } catch (error) {
+        code = error.code;
+      }
     }
     const inboxes = [...new Set([...selected, ...available])].map((name) => {
       const key = core.accountKey(name);
@@ -1059,8 +1068,13 @@ const commands = {
     const temp = path.join(path.dirname(file), `.mailkeeper-${crypto.randomUUID()}.toml`);
     fs.writeFileSync(temp, content, { mode: 0o600, flag: "wx" });
     try {
-      const listed = himalayaParses(temp);
-      if (!listed || !listed.some((row) => row?.name === account)) {
+      let listed = [];
+      try {
+        listed = himalayaAccounts(temp);
+      } catch (error) {
+        if (error.code === "MAILKEEPER_HIMALAYA_UNAVAILABLE") throw error;
+      }
+      if (!listed.some((row) => row?.name === account)) {
         throw failure("MAILKEEPER_HIMALAYA_CONFIG_INVALID", { reason: "the updated settings did not validate" });
       }
       // Refuse to overwrite an edit made while we were working.
