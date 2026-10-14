@@ -624,6 +624,51 @@ test("a schedule is claimed only from the ready provisioning that wrote rules.js
   assert.deepEqual([pick().applied, pick().outcome], [false, "pending"]);
 });
 
+test("the setup closing is chosen in order; a current ready schedule reaches Manual or the scheduled closing", () => {
+  const ws = twoInboxes();
+  const taskId = "mailkeeper-maintenance-7";
+  const file = path.join(ws.dir, "HEARTBEAT.md");
+  const rules = (schedule) => ws.writeRules({ provisionAttempt: "a1", schedule: { taskId, ...schedule } });
+  const provisioning = (state, attempt = "a1") =>
+    fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, attempt, state }));
+  const heartbeat = (enabled, interval) =>
+    fs.writeFileSync(file, `heartbeat:\n  enabled: ${enabled}\ntasks:\n  - id: ${taskId}\n    name: MailKeeper maintenance\n    interval: ${interval}\n    executor: agent\n    prompt: |-\n      check\n`);
+  const closing = () => ws.run("status").json.schedule.closing;
+
+  rules({ cadence: "manual", cadenceLabel: "Manual", manual: true });
+  provisioning("ready");
+  heartbeat(true, "disabled");
+  assert.equal(closing(), "manual", "outcome ready, applied, Manual");
+  heartbeat(false, "disabled");
+  assert.equal(closing(), "manual", "Manual wins over a paused heartbeat");
+  fs.writeFileSync(file, "heartbeat:\n  enabled: [\n");
+  assert.equal(closing(), "manual", "Manual wins over an unknown pause");
+
+  rules({ cadence: "1d", cadenceLabel: "Daily", manual: false });
+  heartbeat(true, "1d");
+  assert.equal(closing(), "scheduled", "an active Daily schedule");
+  heartbeat(false, "1d");
+  assert.equal(closing(), "paused");
+  fs.writeFileSync(file, "heartbeat:\n  enabled: [\n");
+  assert.equal(closing(), "pause_unknown");
+  heartbeat(true, "disabled");
+  assert.equal(closing(), "task_inactive", "on, but the task isn't on the schedule");
+  fs.writeFileSync(file, "---\nx: 1\n---\nheartbeat:\n  enabled: true\n");
+  assert.equal(closing(), "unreadable", "task can't be read");
+
+  heartbeat(true, "1d");
+  for (const outcome of ["config_invalid", "pending", "disabled"]) {
+    provisioning(outcome);
+    assert.equal(closing(), outcome);
+  }
+  provisioning("something-new");
+  assert.equal(closing(), "unreadable", "an outcome this build doesn't know");
+  provisioning("ready", "a2");
+  assert.equal(closing(), "unreadable", "ready, but for another rules.json");
+  fs.rmSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"));
+  assert.equal(closing(), "unreadable", "no provisioning record");
+});
+
 test("the heartbeat readers agree with the host parser or say unknown", () => {
   // Each case records the host's answer at the pinned parser revision. Set
   // MAILKEEPER_HOST_TASKBLOCK to a host taskBlock.js to re-check them live.

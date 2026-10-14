@@ -260,6 +260,54 @@
       "text": "heartbeat:\n  enabled: |\n    false\n",
       "host": false,
       "expected": false
+    },
+    {
+      "name": "sequence-valued enabled",
+      "text": "heartbeat:\n  enabled:\n    - false\n",
+      "host": false,
+      "expected": null
+    },
+    {
+      "name": "unconsumed trailing text",
+      "text": "  heartbeat:\n    enabled: false\nignored: true\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "no-break-space indentation",
+      "text": "heartbeat:\n  enabled: false\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "block scalar with a deeper leading blank line",
+      "text": "heartbeat:\n  enabled: |-\n      \n    false\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "control character in a quoted value",
+      "text": "heartbeat:\n  enabled: false\n  timezone: \"UT\u0001C\"\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "tab after spaces in indentation",
+      "text": "heartbeat:\n  \tenabled: false\n",
+      "host": true,
+      "expected": null
+    },
+    {
+      "name": "lone CR line break",
+      "text": "heartbeat:\r  enabled: false\n",
+      "host": false,
+      "expected": null
+    },
+    {
+      "name": "wide all-space line inside a block scalar",
+      "text": "heartbeat:\n  enabled: |-\n    false\n        \n",
+      "host": false,
+      "expected": null
     }
   ]
 }

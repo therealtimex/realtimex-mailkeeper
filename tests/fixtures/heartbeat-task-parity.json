@@ -197,6 +197,40 @@
         "cron": null
       },
       "expected": null
+    },
+    {
+      "name": "prompt block with a deeper leading blank line",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n        \n      text\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "NUL inside a quoted prompt",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: \"a\u0000b\"\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": false
+      },
+      "expected": null
+    },
+    {
+      "name": "sequence-valued interval",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval:\n      - 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n",
+      "host": {
+        "found": true,
+        "interval": "1d",
+        "cron": null
+      },
+      "expected": null
+    },
+    {
+      "name": "no-break space after the list",
+      "text": "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    interval: 1d\n    executor: agent\n    agent: claude\n    runtime-options:\n      effort: high\n    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n \n",
+      "host": {
+        "found": false
+      },
+      "expected": null
     }
   ]
 }

@@ -100,17 +100,17 @@ You can't save plugin settings. Say:
 
 > In **Workspace Settings → Plugins → MailKeeper → Configure**, select work@example.com under **Inboxes**, choose a **Maintenance agent**, and save. Model and reasoning effort are optional.
 
-After the user says it's saved, run `mailbox-ops status` and close with the **first** of these that applies to its `schedule`. Each one replaces the others: never promise a schedule and then add a caveat. Use `agentLabel` and `schedule.threadName` from the same output.
+After the user says it's saved, run `mailbox-ops status` and close with the sentence for its `schedule.closing`. It is worked out in this order, first match wins, and each one replaces the others: never promise a schedule and then add a caveat. Use `agentLabel` and `schedule.threadName` from the same output.
 
-1. **Settings not applied** (`applied` is false, with one of these `outcome` values; any other outcome uses 2):
+1. **Settings not applied** (a known `outcome` that isn't applied):
    - `config_invalid`: "MailKeeper couldn't apply your latest settings, so I can't say when it will check on its own. You can fix them in Workspace Settings → Plugins → MailKeeper → Configure, and you can still ask me: “run MailKeeper”."
    - `pending`: "MailKeeper hasn't finished applying your latest settings yet, so I can't say when it will check on its own. If this doesn't clear in a minute, save them again in Workspace Settings → Plugins → MailKeeper → Configure. You can still ask me: “run MailKeeper”."
    - `disabled`: "MailKeeper is turned off for this workspace, so it won't check on its own. You can turn it on in Workspace Settings → Plugins → MailKeeper."
-2. **Schedule can't be read** (`applied` or `manual` is null, or an `outcome` not listed in 1): "I couldn't check MailKeeper's schedule just now, so I can't confirm when it will check on its own. You can always ask me: “run MailKeeper”."
-3. **Manual** (`manual` is true), whether or not the heartbeat is paused: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
-4. **Heartbeat paused** (`paused` is true): "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." If `paused` is null: "I couldn't check just now whether this workspace's heartbeat is paused, so I can't confirm MailKeeper will check on its own. You can always ask me: “run MailKeeper”." Setup never turns heartbeat on.
-5. **Task not scheduled** (`scheduled` is false: the heartbeat is on but MailKeeper's task is missing or not on that schedule): "MailKeeper's schedule isn't active in this workspace's heartbeat right now, so it won't check on its own. Save MailKeeper's settings again in Workspace Settings → Plugins → MailKeeper → Configure to reapply it, then tell me and I'll check again. You can still ask me: “run MailKeeper”." When the user says it's saved, run `mailbox-ops status` again and close with whichever case applies. If `scheduled` is null, use the wording in 2.
-6. **Scheduled** (`scheduled` is true), with `cadenceLabel`:
+2. `unreadable` (anything that isn't a current, applied `ready`, or a task that can't be read): "I couldn't check MailKeeper's schedule just now, so I can't confirm when it will check on its own. You can always ask me: “run MailKeeper”."
+3. `manual`, whether or not the heartbeat is paused: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
+4. `paused`: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." `pause_unknown`: "I couldn't check just now whether this workspace's heartbeat is paused, so I can't confirm MailKeeper will check on its own. You can always ask me: “run MailKeeper”." Setup never turns heartbeat on.
+5. `task_inactive` (the heartbeat is on but MailKeeper's task is missing or not on that schedule): "MailKeeper's schedule isn't active in this workspace's heartbeat right now, so it won't check on its own. Save MailKeeper's settings again in Workspace Settings → Plugins → MailKeeper → Configure to reapply it, then tell me and I'll check again. You can still ask me: “run MailKeeper”." When the user says it's saved, run `mailbox-ops status` again and close with whichever case applies.
+6. `scheduled`, with `cadenceLabel`:
 
    > **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
 

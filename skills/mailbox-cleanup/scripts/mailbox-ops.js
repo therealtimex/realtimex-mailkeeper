@@ -380,22 +380,30 @@ function yamlFlowMap(raw) {
   return map;
 }
 
+// Characters YAML rejects (C0/C1 controls, non-characters, lone surrogates,
+// a lone CR) and whitespace JavaScript trims but YAML doesn't treat as space.
+const YAML_REJECTED_CHARS =
+  /[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F\uFFFE\uFFFF\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]|\r(?!\n)|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+
 /**
  * Parse a strict YAML subset: block mappings (Map), block sequences (Array),
- * one-line scalars, literal/folded block scalars and flat flow mappings.
- * Returns UNSUPPORTED for anything else: duplicate or typed keys, anchors,
- * aliases, tags, tabs, directives, continuation lines, nested flow, explicit
- * block indentation and compact sequences at a mapping's own indent.
+ * one-line scalars, literal/folded block scalars and flat flow mappings,
+ * indented with spaces only, consuming the whole text. Returns UNSUPPORTED
+ * for anything else: duplicate or typed keys, anchors, aliases, tags, tabs,
+ * directives, continuation lines, nested flow, explicit or ambiguous block
+ * indentation, compact sequences at a mapping's own indent, trailing text
+ * outside the document, and characters YAML rejects.
  */
 function yamlDocument(text) {
+  if (YAML_REJECTED_CHARS.test(text)) return UNSUPPORTED;
   const lines = text.split(/\r?\n/);
   let i = 0;
-  const indentOf = (line) => line.length - line.trimStart().length;
+  const indentOf = (line) => /^ */.exec(line)[0].length;
   const next = () => {
-    while (i < lines.length && /^\s*(#.*)?$/.test(lines[i])) i += 1;
+    while (i < lines.length && /^ *(#.*)?$/.test(lines[i])) i += 1;
     if (i >= lines.length) return null;
     const line = lines[i];
-    if (line.slice(0, indentOf(line)).includes("\t") || /^(---|\.\.\.|%)/.test(line)) throw UNSUPPORTED;
+    if (/^ *\t/.test(line) || /^(---|\.\.\.|%)/.test(line)) throw UNSUPPORTED;
     return line;
   };
   const isItem = (body) => body === "-" || body.startsWith("- ");
@@ -472,31 +480,42 @@ function yamlDocument(text) {
   function blockScalar(indent, chomp) {
     const content = [];
     let column = null;
+    let blankWidth = 0; // widest all-space line before the first content line
     while (i < lines.length) {
       const line = lines[i];
-      if (!line.trim()) {
+      if (/^ *$/.test(line)) {
+        // An all-space line wider than the content indent is content in YAML,
+        // and before the first content line it can be an indentation error.
+        if (column === null) blankWidth = Math.max(blankWidth, line.length);
+        else if (line.length > column) throw UNSUPPORTED;
         content.push("");
         i += 1;
         continue;
       }
+      if (/^ *\t/.test(line)) throw UNSUPPORTED;
       const n = indentOf(line);
       if (n <= indent) break;
-      if (line.slice(0, n).includes("\t")) throw UNSUPPORTED;
-      column ??= n;
+      if (column === null) {
+        if (blankWidth > n) throw UNSUPPORTED;
+        column = n;
+      }
       if (n < column) throw UNSUPPORTED;
       content.push(line.slice(column));
       i += 1;
     }
     while (content.length && content[content.length - 1] === "") content.pop();
     if (!content.length) {
-      if (chomp === "+") throw UNSUPPORTED;
+      if (chomp === "+" || blankWidth > indent) throw UNSUPPORTED;
       return "";
     }
     return content.join("\n") + (chomp === "-" ? "" : "\n");
   }
 
   try {
-    return next() === null ? null : node(indentOf(next()));
+    if (next() === null) return null;
+    const root = node(indentOf(next()));
+    if (next() !== null) throw UNSUPPORTED; // text the document didn't consume
+    return root;
   } catch (error) {
     if (error === UNSUPPORTED) return UNSUPPORTED;
     throw error;
@@ -537,6 +556,8 @@ function heartbeatEnabledNow() {
   const settings = doc instanceof Map ? doc.get("heartbeat") : null;
   if (!(settings instanceof Map)) return true;
   const enabled = settings.get("enabled");
+  // The host stringifies collections (["false"] reads as "false"); not followed here.
+  if (enabled instanceof Map || Array.isArray(enabled)) return null;
   if (enabled && typeof enabled === "object" && "typed" in enabled) {
     return enabled.typed.toLowerCase() !== "false";
   }
@@ -615,7 +636,7 @@ function scheduleNow(rules) {
       scheduled = enabled && String(found.interval || "").toLowerCase() === String(saved.cadence).toLowerCase();
     }
   }
-  return {
+  const schedule = {
     applied: outcome === null || (outcome === "ready" && !current) ? null : outcome === "ready",
     outcome,
     cadence: current ? saved.cadence ?? null : null,
@@ -628,6 +649,26 @@ function scheduleNow(rules) {
     task,
     scheduled,
   };
+  return { ...schedule, closing: scheduleClosing(schedule) };
+}
+
+/**
+ * Which setup closing applies, first match wins (SKILL.md, "Settings and
+ * schedule"): a known unapplied outcome; anything that isn't a current
+ * applied `ready`; Manual; paused or pause unknown; task not active or
+ * unknown; scheduled.
+ */
+function scheduleClosing(schedule) {
+  if (schedule.applied === false && ["config_invalid", "pending", "disabled"].includes(schedule.outcome)) {
+    return schedule.outcome;
+  }
+  if (schedule.outcome !== "ready" || schedule.applied !== true || schedule.manual === null) return "unreadable";
+  if (schedule.manual) return "manual";
+  if (schedule.paused === true) return "paused";
+  if (schedule.paused === null) return "pause_unknown";
+  if (schedule.scheduled === false) return "task_inactive";
+  if (schedule.scheduled === null) return "unreadable";
+  return "scheduled";
 }
 
 function contractFile(key) {
