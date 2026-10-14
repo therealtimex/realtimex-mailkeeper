@@ -36,6 +36,29 @@ function text(value, max = 500) {
     .slice(0, max);
 }
 
+const INBOX_OUTCOMES = ["completed", "partial", "skipped", "blocked", "failed"];
+const READ_STOP_REASONS = ["budget", "deadline", "no_progress", "invalid_response", "transport"];
+
+/**
+ * Each inbox's outcome for the run list, from fixed values only: whether its
+ * read reached a clear end, why it stopped when it didn't, and how many
+ * messages it read. A partial inbox is never shown as checked in full.
+ */
+function inboxSummary(accounts) {
+  const out = Object.create(null);
+  for (const [account, entry] of Object.entries(accounts).slice(0, 50)) {
+    if (!entry || typeof entry !== "object") continue;
+    const coverage = entry.coverage && typeof entry.coverage === "object" ? entry.coverage : null;
+    out[text(account, 320)] = {
+      outcome: INBOX_OUTCOMES.includes(entry.outcome) ? entry.outcome : null,
+      readComplete: coverage ? coverage.complete === true : null,
+      stopReason: READ_STOP_REASONS.includes(coverage?.stopReason) ? coverage.stopReason : null,
+      inboxRead: Number.isInteger(coverage?.inboxRead) && coverage.inboxRead >= 0 ? coverage.inboxRead : null,
+    };
+  }
+  return out;
+}
+
 function taskIdentity(workspaceId) {
   return `mailkeeper-maintenance-${workspaceId}`;
 }
@@ -843,7 +866,13 @@ class MailKeeperService {
     await this.store.set(this.runKey(workspace, runId), receipt);
 
     const index = (await this.store.get(this.runIndexKey(workspace))) || [];
-    index.unshift({ runId, outcome, finishedAt: receipt.finishedAt, actions: receipt.actions.length });
+    index.unshift({
+      runId,
+      outcome,
+      finishedAt: receipt.finishedAt,
+      actions: receipt.actions.length,
+      inboxes: inboxSummary(accounts),
+    });
     await this.store.set(this.runIndexKey(workspace), index.slice(0, 500));
 
     // Fold account-scoped suggestions into the rules ledger so a human can

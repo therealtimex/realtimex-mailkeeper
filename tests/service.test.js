@@ -398,6 +398,27 @@ test("receipts keep only account-scoped suggestions, idempotently", async () => 
   assert.equal(store.get("ws-7-run-run-1").accounts.work.code, "MAILKEEPER_IMAP_CHECK_FAILED");
 });
 
+test("the run list carries each inbox's read coverage, from fixed values only", async () => {
+  setMailbox(["work", "home"]);
+  const { service, workspace } = harness({ config: { EMAIL_ACCOUNTS: ["work", "home"] } });
+  await service.submitRun(workspace, {
+    runId: "run-1",
+    outcome: "blocked",
+    accounts: {
+      work: { outcome: "completed", coverage: { complete: true, stopReason: null, inboxRead: 42 } },
+      home: { outcome: "partial", coverage: { complete: false, stopReason: "budget", inboxRead: 1000, code: "x" } },
+      odd: { outcome: "all good", coverage: { complete: "yes", stopReason: "<b>", inboxRead: -1 } },
+    },
+  });
+  const [run] = (await service.status(workspace)).recentRuns;
+  assert.equal(run.outcome, "blocked");
+  assert.deepEqual(run.inboxes, {
+    work: { outcome: "completed", readComplete: true, stopReason: null, inboxRead: 42 },
+    home: { outcome: "partial", readComplete: false, stopReason: "budget", inboxRead: 1000 },
+    odd: { outcome: null, readComplete: false, stopReason: null, inboxRead: null },
+  });
+});
+
 test("server undo points to the workspace chat", async () => {
   setMailbox(["work"]);
   const { service, workspace } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
