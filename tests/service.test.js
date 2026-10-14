@@ -624,10 +624,25 @@ test("the admission projection follows the store through admission, end, stale e
   await f.end("hb-a");
   assert.deepEqual([read().state, read().runId], ["held", b.mailkeeperRunId]);
 
-  // A failed projection write leaves a stale copy; the next change repairs it.
+  // A stale clear copy can outlive a new admission whose write failed: the
+  // helper reads it as last observed and unconfirmed, never as a promise.
+  await f.end("hb-b");
   fs.rmSync(projection);
   fs.mkdirSync(path.join(projection, "blocked"), { recursive: true });
-  await f.end("hb-b");
+  const c = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual", heartbeatRunId: "hb-c" });
+  assert.ok(c.mailkeeperRunId, "the admission still stands when its projection write fails");
+  fs.rmSync(projection, { recursive: true });
+  fs.writeFileSync(projection, JSON.stringify({ schemaVersion: 1, state: "clear", observedAt: new Date().toISOString() }));
+  await f.service.status(f.workspace);
+  assert.deepEqual([read().state, read().runId], ["held", c.mailkeeperRunId], "the next change rebuilds it from the store");
+  await f.end("hb-c");
+
+  // A failed projection write leaves a stale copy; the next change repairs it.
+  const d = await f.service.admitHeartbeat({ workspace: { id: 7 }, trigger: "scheduled", heartbeatRunId: "hb-d" });
+  assert.equal(read().runId, d.mailkeeperRunId);
+  fs.rmSync(projection);
+  fs.mkdirSync(path.join(projection, "blocked"), { recursive: true });
+  await f.end("hb-d");
   assert.equal(f.active(), null, "the end still ends the run");
   fs.rmSync(projection, { recursive: true });
   await f.service.status(f.workspace);

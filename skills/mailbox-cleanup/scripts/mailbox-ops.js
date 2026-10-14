@@ -62,6 +62,10 @@ const env = process.env;
 const HIMALAYA = env.MAILKEEPER_HIMALAYA_BIN || "himalaya";
 const RTXEXEC = env.MAILKEEPER_RTXEXEC_BIN || "rtxexec";
 const BATCH = 200;
+// Containment until bounded reading lands (realtimex-mailkeeper#6): each inbox
+// reads at most this many pages, within this time, per snapshot or undo.
+const READ_PAGE_BUDGET = 5;
+const READ_DEADLINE_MS = 60_000;
 const RUNNER_TIMEOUT_MS = 120_000;
 
 const MESSAGES = {
@@ -612,48 +616,51 @@ function managedTaskNow(taskId) {
 
 /**
  * The Run admission as the plugin last wrote it (`.mailkeeper/admission.json`).
- * It is a last-observed copy this helper can't confirm is current, so a hold
- * is only ever "may be held". Unknown when the file is missing, unreadable or
- * unsupported; a held copy past the shared admission window no longer holds.
- * `begin` says whether that run was seen to begin here: its journal or guard
- * exists (`observed`), neither does (`not_observed`), or they can't be read.
+ * This helper can't confirm the copy is current, so `current` is always
+ * "unconfirmed" and the copy is reported as `lastObserved`: "held" (a valid
+ * hold within the shared admission window), "none" (a valid clear), or
+ * "unknown" (missing, malformed, unsupported, or a hold past its window, which
+ * a newer unwritten admission could have replaced). Nothing here means the
+ * Run button or schedule will work. `begin` is whether that run was seen to
+ * begin here (its own journal or guard names it); it never proves it is running.
  */
 function admissionNow() {
+  const unknown = { lastObserved: "unknown", current: "unconfirmed" };
   let projection;
   try {
     projection = JSON.parse(fs.readFileSync(statePath("admission.json"), "utf8"));
   } catch {
-    return { state: "unknown" };
+    return unknown;
   }
-  if (!projection || typeof projection !== "object" || projection.schemaVersion !== 1) return { state: "unknown" };
-  const observedAt = typeof projection.observedAt === "string" ? projection.observedAt : null;
-  if (projection.state === "clear") return { state: "clear", observedAt };
-  if (projection.state !== "held" || typeof projection.runId !== "string" || !projection.runId) return { state: "unknown" };
-  if (!core.admissionHeld({ runId: projection.runId, startedAt: projection.admittedAt })) return { state: "clear", observedAt };
-  const read = (file) => {
+  const time = (value) => (typeof value === "string" && Number.isFinite(Date.parse(value)) ? value : null);
+  if (!projection || typeof projection !== "object" || Array.isArray(projection) || projection.schemaVersion !== 1) return unknown;
+  const observedAt = time(projection.observedAt);
+  if (!observedAt) return unknown;
+  if (projection.state === "clear") return { lastObserved: "none", current: "unconfirmed", observedAt };
+  if (projection.state !== "held" || typeof projection.runId !== "string" || !projection.runId || !time(projection.admittedAt)) return unknown;
+  if (!core.admissionHeld({ runId: projection.runId, startedAt: projection.admittedAt })) return { ...unknown, observedAt };
+  const names = (file) => {
+    let text;
     try {
-      return fs.readFileSync(file, "utf8");
+      text = fs.readFileSync(file, "utf8");
     } catch (error) {
-      return error?.code === "ENOENT" ? null : undefined;
+      return error?.code === "ENOENT" ? false : null;
+    }
+    try {
+      return JSON.parse(text)?.runId === projection.runId ? true : null;
+    } catch {
+      return null;
     }
   };
-  const journal = read(runFile(projection.runId));
-  const lock = read(lockFile());
-  let begin = "not_observed";
-  if (journal === undefined || lock === undefined) begin = "unknown";
-  else if (journal !== null) begin = "observed";
-  else if (lock !== null) {
-    try {
-      begin = JSON.parse(lock).runId === projection.runId ? "observed" : "not_observed";
-    } catch {
-      begin = "unknown";
-    }
-  }
+  const journal = names(runFile(projection.runId));
+  const lock = names(lockFile());
+  const begin = journal === true || lock === true ? "observed" : journal === false && lock !== null ? "not_observed" : "unknown";
   return {
-    state: "held",
+    lastObserved: "held",
+    current: "unconfirmed",
     runId: projection.runId,
     trigger: typeof projection.trigger === "string" ? projection.trigger : null,
-    since: Number.isFinite(Date.parse(projection.admittedAt)) ? projection.admittedAt : null,
+    since: projection.admittedAt,
     begin,
     observedAt,
   };
@@ -851,18 +858,48 @@ function normalize(row, folder, now) {
   };
 }
 
-function listAll(rules, inbox, folder, query) {
+function readBudget() {
+  return { pagesLeft: READ_PAGE_BUDGET, deadline: Date.now() + READ_DEADLINE_MS };
+}
+
+/**
+ * List a folder's envelopes, unfiltered, within a shared page and time budget.
+ * Himalaya's filtered queries repeat pages (pimalaya/himalaya#668), so none is
+ * used. The result says whether the listing reached its natural end
+ * (an empty or short page: `complete`) or why it stopped: `budget` (a full
+ * page at the cap proves nothing), `deadline`, `no_progress` (a page with
+ * nothing new), `invalid_response`, or `transport` (a failure after earlier
+ * pages, whose rows are kept). A failure before any row is thrown as before. Even a complete
+ * listing is unverified: page numbers can shift while the mailbox changes.
+ */
+function listCapped(rules, inbox, folder, budget) {
   const out = [];
+  const seen = new Set();
   const now = Date.now();
-  for (let page = 1; page <= 2000; page += 1) {
-    const rows = mailboxOp(rules, inbox, "envelope-list", [
-      "--folder", folder, "--page", String(page), "--size", String(BATCH), ...(query ? ["--query", query] : []),
-    ]);
-    if (!Array.isArray(rows) || !rows.length) break;
-    for (const row of rows) out.push(normalize(row, folder, now));
-    if (rows.length < BATCH) break;
+  let pages = 0;
+  const stop = (stopReason, extra = {}) => ({ envelopes: out, complete: false, stopReason, pages, ...extra });
+  for (let page = 1; ; page += 1) {
+    if (budget.pagesLeft <= 0) return stop("budget");
+    if (Date.now() >= budget.deadline) return stop("deadline");
+    budget.pagesLeft -= 1;
+    let rows;
+    try {
+      rows = mailboxOp(rules, inbox, "envelope-list", ["--folder", folder, "--page", String(page), "--size", String(BATCH)]);
+    } catch (error) {
+      if (!out.length) throw error;
+      return stop("transport", { code: error.code || null });
+    }
+    pages += 1;
+    if (!Array.isArray(rows)) return stop("invalid_response");
+    if (!rows.length) return { envelopes: out, complete: true, stopReason: null, pages };
+    const fresh = rows.filter((row) => !seen.has(String(row.id)));
+    if (!fresh.length) return stop("no_progress");
+    for (const row of fresh) {
+      seen.add(String(row.id));
+      out.push(normalize(row, folder, now));
+    }
+    if (rows.length < BATCH) return { envelopes: out, complete: true, stopReason: null, pages };
   }
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -1083,9 +1120,29 @@ function urgentHits(snapshot) {
   return snapshot.envelopes.filter((e) => URGENT_RE.test(e.subject) || URGENT_DOMAIN_RE.test(e.fromDomain));
 }
 
+/**
+ * What this version can check for a pass: passes that need reply history are
+ * off (it can't read who the person has written to), and No-reply runs on its
+ * sender check alone because unsubscribe links aren't looked for. Reasons are
+ * fixed strings for results; a missing check never counts as "no match".
+ */
+function passAvailability(passName) {
+  if (core.PASSES_NEEDING_SENT.includes(passName)) return { available: false, skipReason: "reply-history-unavailable", uncheckedSignals: [] };
+  if (passName === "no-reply") return { available: true, skipReason: null, uncheckedSignals: ["unsubscribe-link"] };
+  return { available: true, skipReason: null, uncheckedSignals: [] };
+}
+
+/** Whether this run's own snapshot read the inbox to a clear end. */
+function coverageComplete(entry, snapshot) {
+  return entry.steps.includes("snapshot") && snapshot.coverage?.complete === true;
+}
+
 function candidates(passName, ctx, snapshot, urgent) {
   const pass = PASSES[passName];
   if (!pass) throw failure("MAILKEEPER_OPERATION_FAILED", { procedural: true, reason: `unknown pass; one of ${Object.keys(PASSES).join(", ")}` });
+  // Without a complete read of this inbox's Sent folder, "never replied" is
+  // unknown, so the passes that rely on it find nothing.
+  if (core.PASSES_NEEDING_SENT.includes(passName) && snapshot.replyHistory !== true) return [];
   const urgentUids = new Set(urgent.map((e) => e.uid));
   return snapshot.envelopes.filter(
     (e) => !urgentUids.has(e.uid) && !ctx.isProtected(e) && !ctx.isConfirmFirst(e) && pass.match(e, ctx)
@@ -1759,36 +1816,37 @@ const commands = {
   snapshot(args) {
     perInbox(args, ({ rules, run, account, inbox, entry }) => {
       const folder = typeof args.folder === "string" ? args.folder : "INBOX";
-      const previous = readJson(snapshotFile(inbox));
-      const usable = previous?.account === account && previous?.key === inbox.key ? previous : null;
-      const query = args["since-last-run"] && usable?.takenAt ? `after ${usable.takenAt.slice(0, 10)}` : "";
-      const fresh = listAll(rules, inbox, folder, query);
-      let envelopes = fresh;
-      if (query && usable?.envelopes) {
-        const seen = new Set(fresh.map((e) => e.uid));
-        envelopes = [...fresh, ...usable.envelopes.filter((e) => !seen.has(e.uid) && e.folder === folder)];
-      }
-      // Body signal enrichment: one server-side search instead of N fetches.
-      let bodyUnsubscribe = new Set();
-      try {
-        bodyUnsubscribe = new Set(listAll(rules, inbox, folder, "body unsubscribe").map((e) => e.uid));
-      } catch (error) {
-        if (error.code !== "MAILKEEPER_OPERATION_FAILED") throw error;
-      }
-      for (const e of envelopes) e.bodyUnsubscribe = bodyUnsubscribe.has(e.uid);
-      // Reply history needs this inbox's own Sent folder; without one the
-      // passes that depend on it stay off.
-      let sentTo = [];
-      if (inbox.policy.sentFolder) sentTo = listAll(rules, inbox, inbox.policy.sentFolder, "").map((e) => e.fromAddress);
+      // `--since-last-run` is accepted but no longer narrows the read: date
+      // filters can't be paged reliably, so every snapshot lists the folder
+      // from the top within the read budget.
+      const budget = readBudget();
+      const listing = listCapped(rules, inbox, folder, budget);
+      const envelopes = listing.envelopes;
+      // The body unsubscribe signal needs a filtered search; it is not looked
+      // for in this version, so it is unknown (null), never false.
+      for (const e of envelopes) e.bodyUnsubscribe = null;
+      // Reply history would need the recipients of this inbox's sent mail,
+      // which this version can't read (its listing gives senders only), so it
+      // isn't read and the passes that depend on it stay off (#6).
+      const coverage = {
+        complete: listing.complete,
+        verified: false,
+        stopReason: listing.stopReason,
+        code: listing.code || null,
+        inboxRead: envelopes.length,
+        replyHistory: "unavailable",
+        unsubscribeSignal: "not-checked",
+      };
       const snapshot = {
         account,
         key: inbox.key,
         folder,
         takenAt: new Date().toISOString(),
         envelopes,
-        repliedTo: [...new Set(sentTo)],
-        sentDomains: [...new Set(sentTo.map((a) => a.split("@").pop()).filter(Boolean))],
-        replyHistory: Boolean(inbox.policy.sentFolder),
+        coverage,
+        repliedTo: [],
+        sentDomains: [],
+        replyHistory: false,
       };
       writeJson(snapshotFile(inbox), snapshot);
       // A successful read clears an earlier blocked attempt in this run.
@@ -1797,7 +1855,8 @@ const commands = {
         entry.code = inbox.contract.code;
       }
       entry.steps.push("snapshot");
-      return { account, envelopes: envelopes.length, replyHistory: snapshot.replyHistory, takenAt: snapshot.takenAt };
+      entry.coverage = coverage;
+      return { account, envelopes: envelopes.length, coverage, replyHistory: snapshot.replyHistory, takenAt: snapshot.takenAt };
     });
   },
 
@@ -1828,6 +1887,8 @@ const commands = {
           (e) => !urgentUids.has(e.uid) && ctx.isConfirmFirst(e) && PASSES[passName].match(e, ctx)
         ).length;
         const target = targetFolder(passName, ctx, inbox.policy.mode);
+        const availability = passAvailability(passName);
+        const complete = coverageComplete(entry, snapshot);
         core.setOwn(run.previews, account, {
           ...(core.own(run.previews, account) || {}),
           [passName]: { contractDigest: entry.contractDigest, rulesRevision: run.rulesRevision, count: list.length, at: new Date().toISOString() },
@@ -1838,9 +1899,14 @@ const commands = {
           pass: passName,
           rule: PASSES[passName].describe(ctx),
           mode: inbox.policy.mode,
-          wouldMove: inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName),
+          wouldMove:
+            inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete,
           target,
           excluded: inbox.policy.excludedPasses.includes(passName),
+          ...(availability.skipReason ? { skipped: availability.skipReason } : {}),
+          ...(availability.uncheckedSignals.length ? { uncheckedSignals: availability.uncheckedSignals } : {}),
+          coverage: snapshot.coverage || null,
+          ...(complete ? {} : { reportOnly: "partial-coverage" }),
           confirmFirstLeftInPlace: confirmFirst,
           ...summarize(list),
         };
@@ -1863,7 +1929,10 @@ const commands = {
         const snapshot = loadSnapshot(inbox);
         const ctx = buildContext(rules, inbox, snapshot);
         const mode = inbox.policy.mode;
-        const dryRun = args["dry-run"] === true || mode === "report-only";
+        // Only this run's own complete read supports a move: an inbox read in
+        // part, or a snapshot from an earlier run or version, is report-only.
+        const partial = !coverageComplete(entry, snapshot);
+        const dryRun = args["dry-run"] === true || mode === "report-only" || partial;
         const urgent = urgentHits(snapshot);
 
         let plan;
@@ -1874,6 +1943,8 @@ const commands = {
             .filter((rule) => rule.account === account)
             .map((rule) => {
               if (!PASSES[rule.pass]) return { pass: rule.pass, ruleId: rule.id, skip: "unsupported" };
+              const availability = passAvailability(rule.pass);
+              if (!availability.available) return { pass: rule.pass, ruleId: rule.id, skip: availability.skipReason };
               if (!inbox.policy.promotablePasses.includes(rule.pass)) return { pass: rule.pass, ruleId: rule.id, skip: "not-allowed-by-contract" };
               if (rule.query !== PASSES[rule.pass].describe(ctx)) return { pass: rule.pass, ruleId: rule.id, skip: "predicate-changed" };
               return { pass: rule.pass, ruleId: rule.id };
@@ -1881,6 +1952,8 @@ const commands = {
         } else if (typeof args.pass === "string" && PASSES[args.pass]) {
           if (inbox.policy.excludedPasses.includes(args.pass)) {
             plan = [{ pass: args.pass, ruleId: null, skip: "excluded-by-contract" }];
+          } else if (!passAvailability(args.pass).available) {
+            plan = [{ pass: args.pass, ruleId: null, skip: passAvailability(args.pass).skipReason }];
           } else {
             const preview = core.own(core.own(run.previews, account), args.pass);
             if (!dryRun && (!preview || preview.contractDigest !== entry.contractDigest || preview.rulesRevision !== run.rulesRevision)) {
@@ -1915,11 +1988,12 @@ const commands = {
             snapshot.envelopes = snapshot.envelopes.filter((e) => !(e.folder === snapshot.folder && movedUids.has(e.uid)));
             writeJson(snapshotFile(inbox), snapshot);
           }
-          run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved, previewed: list.length, to, dryRun });
-          results.push({ account, pass: step.pass, ruleId: step.ruleId, to, dryRun, moved, ...summarize(list) });
+          const unchecked = passAvailability(step.pass).uncheckedSignals;
+          run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved, previewed: list.length, to, dryRun, ...(unchecked.length ? { uncheckedSignals: unchecked } : {}) });
+          results.push({ account, pass: step.pass, ruleId: step.ruleId, to, dryRun, moved, ...(unchecked.length ? { uncheckedSignals: unchecked } : {}), ...summarize(list) });
         }
         entry.steps.push("apply");
-        return { account, mode, dryRun, results };
+        return { account, mode, dryRun, ...(partial ? { reportOnly: "partial-coverage" } : {}), results };
       },
       { requestedMode: args.mode }
     );
@@ -1934,7 +2008,13 @@ const commands = {
         (rules.promoted || []).filter((rule) => rule.account === account).map((rule) => `${rule.pass}\n${rule.query}`)
       );
       const proposals = [];
+      const unavailable = [];
       for (const passName of inbox.policy.promotablePasses) {
+        const availability = passAvailability(passName);
+        if (!availability.available) {
+          unavailable.push({ pass: passName, skipped: availability.skipReason });
+          continue;
+        }
         const query = PASSES[passName].describe(ctx);
         if (approved.has(`${passName}\n${query}`)) continue;
         const list = candidates(passName, ctx, snapshot, urgent);
@@ -1948,7 +2028,7 @@ const commands = {
       }
       run.proposals = [...run.proposals.filter((p) => p.account !== account), ...proposals];
       entry.steps.push("propose");
-      return { account, proposals: proposals.length, passes: proposals.map((p) => `${p.pass}: ${p.count}`) };
+      return { account, proposals: proposals.length, passes: proposals.map((p) => `${p.pass}: ${p.count}`), ...(unavailable.length ? { unavailable } : {}) };
     });
   },
 
@@ -1974,7 +2054,8 @@ const commands = {
         outcome = "failed";
         code = "MAILKEEPER_MUTATION_UNCERTAIN";
       } else if (!outcome) {
-        outcome = entry.steps.includes("snapshot") ? "completed" : "skipped";
+        // A run that read the inbox only in part is partial, never completed.
+        outcome = !entry.steps.includes("snapshot") ? "skipped" : entry.coverage?.complete === true ? "completed" : "partial";
       }
       core.setOwn(accounts, account, {
         outcome,
@@ -1982,6 +2063,7 @@ const commands = {
         contract: entry.contract || null,
         contractDigest: entry.contractDigest || null,
         mode: entry.mode || null,
+        coverage: entry.coverage || null,
         moved: run.actions.filter((a) => a.account === account).length,
         // Report material: what moved where, what was suggested, what is urgent.
         movedByDestination: run.actions
@@ -2081,9 +2163,9 @@ const commands = {
           groups.get(key).items.push(action);
         }
         for (const group of groups.values()) {
-          const dates = group.items.map((a) => Date.parse(a.date)).filter(Number.isFinite);
-          const since = dates.length ? new Date(Math.min(...dates) - 86_400_000).toISOString().slice(0, 10) : "";
-          const present = listAll(rules, inbox, group.from, since ? `after ${since}` : "");
+          // The destination's most recent pages, unfiltered and within the read
+          // budget; a message beyond them is reported unresolved, never guessed.
+          const present = listCapped(rules, inbox, group.from, readBudget()).envelopes;
           const matches = [];
           for (const action of group.items) {
             const hits = present.filter(

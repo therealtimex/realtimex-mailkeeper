@@ -565,29 +565,35 @@ test("status reads the admission projection as last observed, never as a confirm
   const file = path.join(ws.dir, ".mailkeeper", "admission.json");
   const admission = () => ws.run("status").json.schedule.admission;
   const now = new Date().toISOString();
+  const held = (extra = {}) => JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", trigger: "manual", admittedAt: now, observedAt: now, ...extra });
+  const unknown = { lastObserved: "unknown", current: "unconfirmed" };
 
-  assert.deepEqual(admission(), { state: "unknown" }, "no projection");
+  assert.deepEqual(admission(), unknown, "no projection");
   fs.writeFileSync(file, "{");
-  assert.deepEqual(admission(), { state: "unknown" }, "corrupt");
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, state: "clear" }));
-  assert.deepEqual(admission(), { state: "unknown" }, "unsupported version");
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "clear", observedAt: now }));
-  assert.equal(admission().state, "clear");
+  assert.deepEqual(admission(), unknown, "corrupt");
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 2, state: "clear", observedAt: now }));
+  assert.deepEqual(admission(), unknown, "unsupported version");
+  fs.writeFileSync(file, held({ admittedAt: "not a time" }));
+  assert.deepEqual(admission(), unknown, "a malformed admission time is unknown, never clear");
+  fs.writeFileSync(file, held({ observedAt: undefined }));
+  assert.deepEqual(admission(), unknown, "no observation time");
+  const old = new Date(Date.now() - 7 * 3600 * 1000).toISOString();
+  fs.writeFileSync(file, held({ admittedAt: old }));
+  assert.equal(admission().lastObserved, "unknown", "a hold past its window may have been replaced by an unwritten admission");
 
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", trigger: "manual", admittedAt: now, observedAt: now }));
+  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "clear", observedAt: now }));
+  assert.deepEqual(admission(), { lastObserved: "none", current: "unconfirmed", observedAt: now }, "a clear copy is never a promise");
+
+  fs.writeFileSync(file, held());
   assert.deepEqual(
-    [admission().state, admission().runId, admission().trigger, admission().since, admission().begin],
-    ["held", "r1", "manual", now, "not_observed"]
+    [admission().lastObserved, admission().current, admission().runId, admission().trigger, admission().since, admission().begin],
+    ["held", "unconfirmed", "r1", "manual", now, "not_observed"]
   );
   fs.mkdirSync(path.join(ws.dir, ".mailkeeper", "runs"), { recursive: true });
-  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "runs", "r1.json"), "{}");
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "runs", "r1.json"), JSON.stringify({ runId: "someone-else" }));
+  assert.equal(admission().begin, "unknown", "a journal naming another run is not begin evidence");
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "runs", "r1.json"), JSON.stringify({ runId: "r1" }));
   assert.equal(admission().begin, "observed");
-
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", admittedAt: "not a time", observedAt: now }));
-  assert.equal(admission().state, "clear", "no trustworthy admission time: the shared rule doesn't hold it");
-  const old = new Date(Date.now() - 7 * 3600 * 1000).toISOString();
-  fs.writeFileSync(file, JSON.stringify({ schemaVersion: 1, state: "held", runId: "r1", admittedAt: old, observedAt: old }));
-  assert.equal(admission().state, "clear", "past the shared admission window");
 });
 
 test("status reports the four setup criteria per inbox and the schedule", () => {
