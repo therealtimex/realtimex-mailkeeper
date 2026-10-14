@@ -323,3 +323,23 @@ test("heartbeat end releases the run guard unless a move is uncertain", async ()
   assert.equal(await finish("r-ok", { runId: "r-ok", uncertain: [] }), false);
   assert.equal(await finish("r-bad", { runId: "r-bad", uncertain: [{ account: "work" }] }), true);
 });
+
+test("a Manual schedule keeps the task disabled and refuses scheduled launches only", async () => {
+  setMailbox(["work"]);
+  const { service, workspace, calls, state, dir } = harness({ config: { EMAIL_ACCOUNTS: ["work"], CADENCE: "manual" } });
+  await service.provision(workspace);
+  assert.equal(calls.upsert.length, 1);
+  assert.equal(calls.upsert[0].interval, "disabled");
+  assert.equal(calls.remove.length, 0, "Manual never removes the task");
+  const rules = JSON.parse(fs.readFileSync(path.join(dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([rules.schedule.manual, rules.schedule.cadenceLabel], [true, "Manual"]);
+
+  const scheduled = await service.admitHeartbeat({ workspace: { id: 7 }, trigger: "scheduled" });
+  assert.deepEqual(scheduled, { skipLaunch: true, skipReason: "schedule is manual" });
+  const manual = await service.admitHeartbeat({ workspace: { id: 7 }, trigger: "manual" });
+  assert.ok(manual.mailkeeperRunId, "a person's row Run is admitted");
+
+  state.config = { ...state.config, CADENCE: "1d" };
+  await service.provision(workspace);
+  assert.equal(calls.upsert[1].interval, "1d", "switching back schedules daily again");
+});

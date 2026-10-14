@@ -57,10 +57,13 @@ test("empty cadence falls back to the daily default", () => {
   assert.equal(config.cadence, "1d");
 });
 
-test("cadence must be a positive duration", () => {
+test("schedule must be manual or a positive duration", () => {
   for (const bad of ["0d", "daily", "1w"]) {
     const { errors } = resolveProfileConfig({ ...valid, CADENCE: bad });
-    assert.ok(errors.some((e) => /Cadence/.test(e)), `expected cadence error for ${JSON.stringify(bad)}`);
+    assert.ok(errors.some((e) => /Schedule/.test(e)), `expected schedule error for ${JSON.stringify(bad)}`);
+  }
+  for (const good of ["manual", "1h", "8h", "1d", "7d"]) {
+    assert.deepEqual(resolveProfileConfig({ ...valid, CADENCE: good }).errors, [], good);
   }
 });
 

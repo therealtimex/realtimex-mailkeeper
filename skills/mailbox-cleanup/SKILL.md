@@ -104,6 +104,8 @@ After the user says it's saved, run `mailbox-ops status` and close with the effe
 
 > **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
 
+If `schedule.manual` is true, say instead: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
+
 If `schedule.paused` is true (the heartbeat is off or paused), add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
 
 Then say once: "When you ask me here, the agent selected for this chat does the work under the same contracts." Don't ask the user to change chat controls, and don't claim chat and schedule use the same agent unless you verified it. If the scheduled agent is Codex, add one line: Codex needs network access for scheduled checks (see the MailKeeper README).

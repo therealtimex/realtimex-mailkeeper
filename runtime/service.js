@@ -5,7 +5,7 @@ const path = require("path");
 const crypto = require("crypto");
 
 const { hostFor } = require("./host");
-const { resolveProfileConfig } = require("./config");
+const { CADENCE_MANUAL, resolveProfileConfig } = require("./config");
 const mailbox = require("./mailbox");
 const core = require("../skills/mailbox-cleanup/scripts/mailkeeper-core");
 
@@ -178,7 +178,8 @@ class MailKeeperService {
     const heartbeat = await this.host.heartbeat.upsertManagedTask(workspace, {
       id: taskIdentity(workspace.id),
       name: "MailKeeper maintenance",
-      interval: config.cadence,
+      // Manual keeps the task (a row Run still works) but never schedules it.
+      interval: config.cadence === CADENCE_MANUAL ? "disabled" : config.cadence,
       executor: "agent",
       agent: config.agent,
       ...(config.model ? { model: config.model } : {}),
@@ -199,6 +200,7 @@ class MailKeeperService {
     this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
       cadence: config.cadence,
       cadenceLabel: cadenceLabel(config.cadence),
+      manual: config.cadence === CADENCE_MANUAL,
       heartbeatEnabled: settings?.enabled !== false,
       paused: heartbeat.explicitlyPaused === true || settings?.enabled === false,
       activeHours: settings?.activeHours || null,
@@ -740,9 +742,14 @@ class MailKeeperService {
     if (!workspace) {
       return { skipLaunch: true, skipReason: "workspace missing" };
     }
-    const { errors } = this.profileConfig(workspace);
+    const { config, errors } = this.profileConfig(workspace);
     if (errors.length) {
       return { skipLaunch: true, skipReason: `config_invalid: ${errors.join(" ")}` };
+    }
+    // Re-read the schedule: an occurrence queued before Manual was chosen
+    // must not run. A person's row Run (trigger "manual") still does.
+    if (config.cadence === CADENCE_MANUAL && context.trigger !== "manual") {
+      return { skipLaunch: true, skipReason: "schedule is manual" };
     }
     const active = await this.store.get(this.activeRunKey(workspace));
     if (active && Date.now() - Date.parse(active.startedAt) < 6 * 60 * 60 * 1000) {

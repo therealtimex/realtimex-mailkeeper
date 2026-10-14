@@ -10,6 +10,8 @@ const {
 } = require("../skills/mailbox-cleanup/scripts/mailkeeper-core");
 
 const CADENCE_RE = /^(?:\d+d)?(?:\d+h)?(?:\d+m)?$/;
+/** Schedule "Manual": the managed task stays, with `interval: disabled`. */
+const CADENCE_MANUAL = "manual";
 
 /**
  * Runtime option key that carries reasoning effort for each verified
@@ -122,8 +124,11 @@ function resolveProfileConfig(raw = {}) {
   }
   if (!MODES.includes(config.modeCeiling)) errors.push("Mode ceiling is invalid.");
   if (!MODES.includes(config.requestedMode)) errors.push("Mode is invalid.");
-  if (!CADENCE_RE.test(config.cadence) || !/[1-9]/.test(config.cadence)) {
-    errors.push("Cadence must be a positive duration using m, h, or d.");
+  if (
+    config.cadence !== CADENCE_MANUAL &&
+    (!CADENCE_RE.test(config.cadence) || !/[1-9]/.test(config.cadence))
+  ) {
+    errors.push("Schedule must be manual or a positive duration using m, h, or d.");
   }
   if (!AGGRESSIVENESS.includes(config.aggressiveness)) {
     errors.push("Aggressiveness is invalid.");
@@ -137,6 +142,7 @@ function resolveProfileConfig(raw = {}) {
 }
 
 module.exports = {
+  CADENCE_MANUAL,
   MODES,
   AGGRESSIVENESS,
   PASSES_BY_AGGRESSIVENESS,

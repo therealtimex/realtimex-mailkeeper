@@ -121,7 +121,7 @@
       "label": "Inboxes",
       "type": "multi-select",
       "default": [],
-      "description": "Inboxes this workspace looks after. Each has its own contract in `mailboxes/`. None listed? Ask the agent in this workspace's chat to “set up MailKeeper.”",
+      "description": "Inboxes this workspace looks after, each with its own contract in mailboxes/. To add one, ask the agent in this workspace's chat to “add an inbox to MailKeeper,” then reopen this dialog and tick it.",
       "optionsRoutePath": "/accounts",
       "required": true
     },
@@ -153,15 +153,28 @@
     {
       "key": "CADENCE",
       "scope": "workspace",
-      "label": "Heartbeat cadence",
+      "label": "Schedule",
       "type": "select",
       "required": true,
       "default": "1d",
-      "description": "How often MailKeeper checks your inboxes on its own. Follows this workspace's heartbeat schedule and pause.",
+      "description": "Scheduled runs follow this workspace's heartbeat: its timezone, active hours and pause.",
       "options": [
+        {
+          "value": "manual",
+          "label": "Manual",
+          "description": "Runs only when you ask in this workspace's chat."
+        },
+        {
+          "value": "1h",
+          "label": "Every hour"
+        },
         {
           "value": "4h",
           "label": "Every 4 hours"
+        },
+        {
+          "value": "8h",
+          "label": "Every 8 hours"
         },
         {
           "value": "12h",
