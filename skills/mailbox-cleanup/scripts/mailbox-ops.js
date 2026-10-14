@@ -292,58 +292,286 @@ function pinnedConfig(rules) {
   return localHimalayaConfig();
 }
 
-/**
- * Whether this workspace's heartbeat is on, read as the host reads it: the
- * `enabled` key of the `heartbeat:` block in HEARTBEAT.md (front matter or
- * plain YAML). No file, no block or no readable value means on; only an
- * explicit `false` pauses. Null when the file exists but can't be read.
- */
-function heartbeatEnabledNow() {
-  const file = path.join(ROOT, "HEARTBEAT.md");
-  if (!isFile(file)) return true;
-  let text;
-  try {
-    text = fs.readFileSync(file, "utf8");
-  } catch {
-    return null;
-  }
-  const isBlock = (line) => /^heartbeat\s*:/.test(line.trim());
-  let lines = text.split("\n");
+// The host's readSettings derives "heartbeat on" from HEARTBEAT.md with
+// parseHeartbeatSettingsBlock (server/utils/heartbeat/taskBlock.js, tested at
+// sha256 6968d4725a15546ed4e925c3562c54bc8d26a3f0ca906f3303c15872621532ec).
+// This reader picks the same text and reads a strict YAML subset; anything
+// outside it is unknown rather than a guess.
+
+/** Front-matter `heartbeat:`/`main-task:` blocks, as the host extracts them. */
+function heartbeatFrontMatter(text) {
   const trimmed = text.trimStart();
-  const close = trimmed.startsWith("---") ? trimmed.slice(3).indexOf("\n---") : -1;
-  if (close !== -1 && trimmed.slice(3, close + 3).split("\n").some(isBlock)) lines = trimmed.slice(3, close + 3).split("\n");
-  const start = lines.findIndex(isBlock);
-  if (start === -1) return true;
-  const indent = (line) => line.length - line.trimStart().length;
-  const flow = /^heartbeat\s*:\s*\{(.*)\}\s*(#.*)?$/.exec(lines[start].trim());
-  let value = null;
-  if (flow) {
-    value = /(?:^|,)\s*enabled\s*:\s*([^,]*)/.exec(flow[1])?.[1] ?? null;
-  } else {
-    let child = null;
-    for (const line of lines.slice(start + 1)) {
-      if (!line.trim() || line.trim().startsWith("#")) continue;
-      if (indent(line) <= indent(lines[start])) break;
-      child ??= indent(line);
-      const match = indent(line) === child && /^enabled\s*:\s*(.*?)\s*(#.*)?$/.exec(line.trim());
-      if (match) {
-        value = match[1];
+  if (!trimmed.startsWith("---")) return null;
+  const after = trimmed.slice(3);
+  const close = after.indexOf("\n---");
+  if (close === -1) return null;
+  const lines = after.slice(0, close).split("\n");
+  const blocks = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!/^(heartbeat|main-task)\s*:/.test(lines[i].trim())) continue;
+    let end = lines.length;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      if (lines[j].trim() && !/^\s/.test(lines[j]) && /^[\w-]+\s*:/.test(lines[j].trim())) {
+        end = j;
         break;
       }
     }
+    blocks.push(...lines.slice(i, end));
+    i = end - 1;
   }
-  return String(value ?? "").trim().replace(/^(["'])(.*)\1$/, "$2").toLowerCase() !== "false";
+  return blocks.length ? blocks.join("\n") : null;
+}
+
+/** The first body block from `heartbeat:`/`main-task:` to a heading or `tasks:`. */
+function heartbeatBodyBlock(text) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((line) => /^(heartbeat|main-task)\s*:/.test(line.trim()));
+  if (start === -1) return null;
+  const block = [lines[start]];
+  for (const line of lines.slice(start + 1)) {
+    if (/^#{1,6}\s/.test(line) || /^tasks\s*:/.test(line.trim())) break;
+    block.push(line);
+  }
+  return block.join("\n");
+}
+
+const YAML_KEY = String.raw`(?:([A-Za-z0-9_][A-Za-z0-9_.-]*)|"([^"\\]*)"|'((?:[^']|'')*)')`;
+const yamlKey = (m) => m[1] ?? m[2] ?? m[3].replace(/''/g, "'");
+
+/** A one-line scalar: its text, null when empty, undefined outside the subset. */
+function yamlScalar(raw) {
+  const text = raw.replace(/^\s*#.*$/, "").trim();
+  if (!text) return null;
+  let match = /^"([^"\\]*)"\s*(?:#.*)?$/.exec(text);
+  if (match) return match[1];
+  match = /^'((?:[^']|'')*)'\s*(?:#.*)?$/.exec(text);
+  if (match) return match[1].replace(/''/g, "'");
+  const plain = text.replace(/\s+#.*$/, "");
+  if (/^[-?:,[\]{}#&*!|>'"%@`]/.test(plain) || /:(\s|$)|\s#/.test(plain)) return undefined;
+  return plain;
+}
+
+/** A flat flow mapping `{ key: scalar, ... }`, or undefined outside the subset. */
+function yamlFlowMap(raw) {
+  const match = /^\{([^{}[\]]*)\}\s*(?:#.*)?$/.exec(raw.trim());
+  if (!match) return undefined;
+  const map = new Map();
+  if (!match[1].trim()) return map;
+  for (const part of match[1].split(",")) {
+    const entry = new RegExp(String.raw`^\s*${YAML_KEY}\s*:(?:\s+(.*?))?\s*$`).exec(part);
+    if (!entry) return undefined;
+    const value = entry[4] === undefined ? null : yamlScalar(entry[4]);
+    if (value === undefined || map.has(yamlKey(entry))) return undefined;
+    map.set(yamlKey(entry), { scalar: value });
+  }
+  return map;
 }
 
 /**
- * The saved schedule, with the heartbeat's on/off state as it is now. When
- * that can't be read, it is unknown (null): the value saved at setup is not
- * reported as current.
+ * Nested block mappings of one-line scalars or flat flow mappings. Returns
+ * the top-level Map (key → {scalar} or {map}), null for an empty text, or
+ * undefined for anything else (sequences, block scalars, anchors, tags, tabs,
+ * duplicate keys, continuation lines), which the host's YAML parser may read
+ * differently or reject.
  */
-function scheduleNow(saved) {
-  if (!saved) return null;
+function yamlSubset(text) {
+  const keyLine = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+(.*))?$`);
+  const root = new Map();
+  const stack = [];
+  let last = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    const indent = line.length - line.trimStart().length;
+    if (line.slice(0, indent).includes("\t") || /^(---|\.\.\.)(\s|$)/.test(line)) return undefined;
+    const match = keyLine.exec(line.trim());
+    if (!match) return undefined;
+    if (!stack.length) stack.push({ indent, map: root });
+    if (last && indent > last.indent) {
+      if (last.entry.scalar !== null) return undefined;
+      last.entry = { map: new Map() };
+      last.parent.set(last.key, last.entry);
+      stack.push({ indent, map: last.entry.map });
+    } else {
+      while (stack.length && stack[stack.length - 1].indent > indent) stack.pop();
+      if (!stack.length || stack[stack.length - 1].indent !== indent) return undefined;
+    }
+    const parent = stack[stack.length - 1].map;
+    const key = yamlKey(match);
+    if (parent.has(key)) return undefined;
+    const rest = match[4] ?? "";
+    let entry;
+    if (rest.trim().startsWith("{")) {
+      const map = yamlFlowMap(rest);
+      if (map === undefined) return undefined;
+      entry = { map };
+    } else {
+      const scalar = yamlScalar(rest);
+      if (scalar === undefined) return undefined;
+      entry = { scalar };
+    }
+    parent.set(key, entry);
+    last = { indent, key, parent, entry };
+  }
+  return stack.length ? root : null;
+}
+
+/**
+ * Whether this workspace's heartbeat is on now, as the host reads it. A
+ * missing file, block or `enabled` value means on (the host's default), and
+ * only false (any case, quoted or not) pauses. Null (unknown) for a read
+ * error, a path that isn't a file, or YAML outside the subset above.
+ */
+function heartbeatEnabledNow() {
+  const file = path.join(ROOT, "HEARTBEAT.md");
+  let text;
+  try {
+    if (!fs.statSync(file).isFile()) return null;
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT" ? true : null;
+  }
+  const front = heartbeatFrontMatter(text);
+  let doc = front === null ? null : yamlSubset(front);
+  if (doc === null) {
+    const body = heartbeatBodyBlock(text);
+    doc = body === null ? null : yamlSubset(body);
+  }
+  if (doc === undefined) return null;
+  const enabled = doc?.get("heartbeat")?.map?.get("enabled");
+  if (!enabled || enabled.map) return true;
+  return String(enabled.scalar ?? "").trim().toLowerCase() !== "false";
+}
+
+/**
+ * This workspace's heartbeat task `taskId` as the host would read it from
+ * HEARTBEAT.md: `{ interval, cron }`, null when the tasks list has no such
+ * task, or undefined when this reader can't tell. It follows the layout the
+ * host writes for managed tasks (block list items of `key: value` lines whose
+ * multi-line values are block scalars) and gives up on anything else,
+ * including front matter.
+ */
+function managedTaskNow(taskId) {
+  const file = path.join(ROOT, "HEARTBEAT.md");
+  let text;
+  try {
+    if (!fs.statSync(file).isFile()) return undefined;
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    return error?.code === "ENOENT" ? null : undefined;
+  }
+  if (text.trimStart().startsWith("---")) return undefined;
+  const lines = text.split(/\r?\n/);
+  const first = lines.findIndex((line) => /^(heartbeat|main-task|tasks)\s*:/.test(line));
+  if (first === -1) return null;
+  const keyLine = new RegExp(String.raw`^${YAML_KEY}\s*:(?:\s+(.*))?$`);
+  const items = [];
+  let inTasks = false;
+  let item = null;
+  let listIndent = null;
+  let deeper = null; // the key whose block-scalar or nested value may continue below
+  for (const line of lines.slice(first)) {
+    if (/^#{1,6}\s/.test(line)) break;
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    const indent = line.length - line.trimStart().length;
+    if (line.slice(0, indent).includes("\t")) return undefined;
+    const body = line.trim();
+    if (indent === 0) {
+      const top = keyLine.exec(body);
+      if (!top) return undefined;
+      inTasks = yamlKey(top) === "tasks";
+      if (inTasks && top[4] !== undefined && !/^\[\]\s*(#.*)?$/.test(top[4].trim())) return undefined;
+      item = null;
+      deeper = { indent: 0 };
+      continue;
+    }
+    if (!inTasks) {
+      if (!deeper) return undefined;
+      continue; // heartbeat/main-task settings: read by heartbeatEnabledNow
+    }
+    const isItem = body === "-" || body.startsWith("- ");
+    if (isItem && (listIndent === null || indent === listIndent)) {
+      listIndent = indent;
+      item = { keys: new Map(), indent: indent + 2 };
+      items.push(item);
+      const rest = body.slice(1).trim();
+      if (!rest) continue;
+      const entry = keyLine.exec(rest);
+      if (!entry) return undefined;
+      deeper = taskKey(item, entry);
+      if (deeper === undefined) return undefined;
+      continue;
+    }
+    if (!item) return undefined;
+    if (indent === item.indent) {
+      const entry = keyLine.exec(body);
+      if (!entry) return undefined;
+      deeper = taskKey(item, entry);
+      if (deeper === undefined) return undefined;
+    } else if (indent > item.indent && deeper?.indent === item.indent) {
+      // content of a block scalar or nested mapping under the last key
+    } else {
+      return undefined;
+    }
+  }
+  const matches = items.filter((entry) => entry.keys.get("id") === taskId);
+  if (matches.length > 1) return undefined;
+  const task = matches[0];
+  if (!task || !String(task.keys.get("name") ?? "").trim()) return null;
+  return { interval: task.keys.get("interval") ?? null, cron: task.keys.get("cron") ?? null };
+}
+
+/** Record one `key: value` line of a task item; undefined if outside the layout. */
+function taskKey(item, entry) {
+  const key = yamlKey(entry);
+  if (item.keys.has(key)) return undefined;
+  const rest = (entry[4] ?? "").trim();
+  if (/^[|>][-+0-9]*\s*(#.*)?$/.test(rest) || /^(#.*)?$/.test(rest)) {
+    item.keys.set(key, null);
+    return { indent: item.indent };
+  }
+  const value = rest.startsWith("{") ? yamlFlowMap(rest) : yamlScalar(rest);
+  if (value === undefined) return undefined;
+  item.keys.set(key, typeof value === "string" ? value : null);
+  return null;
+}
+
+/**
+ * The schedule as it is now. rules.json's schedule counts only while the
+ * latest provisioning attempt is the ready one that wrote it; then a schedule
+ * is claimed only when the heartbeat is on and the managed task exists with
+ * that interval. Each value is null when it can't be established.
+ */
+function scheduleNow(rules) {
+  const saved = rules.schedule || {};
+  const provisioning = readJson(statePath("provisioning.json"));
+  const outcome = typeof provisioning?.state === "string" ? provisioning.state : null;
+  const current = outcome === "ready" && provisioning.rulesWrittenAt === rules.writtenAt;
   const enabled = heartbeatEnabledNow();
-  return { ...saved, heartbeatEnabled: enabled, paused: enabled === null ? null : !enabled };
+  let task = null;
+  let scheduled = null;
+  if (current && saved.manual === true) {
+    scheduled = false;
+  } else if (current) {
+    const found = typeof saved.taskId === "string" ? managedTaskNow(saved.taskId) : undefined;
+    task = found === undefined ? null : { found: Boolean(found), interval: found?.interval ?? null };
+    if (found === null) scheduled = false;
+    else if (found && !found.cron && enabled !== null) {
+      scheduled = enabled && String(found.interval || "").toLowerCase() === String(saved.cadence).toLowerCase();
+    }
+  }
+  return {
+    applied: outcome === null || (outcome === "ready" && !current) ? null : outcome === "ready",
+    outcome,
+    cadence: current ? saved.cadence ?? null : null,
+    cadenceLabel: current ? saved.cadenceLabel ?? null : null,
+    manual: current ? saved.manual === true : null,
+    threadSlug: saved.threadSlug ?? null,
+    threadName: saved.threadName ?? null,
+    heartbeatEnabled: enabled,
+    paused: enabled === null ? null : !enabled,
+    task,
+    scheduled,
+  };
 }
 
 function contractFile(key) {
@@ -1304,7 +1532,7 @@ const commands = {
       agentLabel: configured && rules.config.agent ? core.own(AGENT_LABELS, rules.config.agent) || rules.config.agent : null,
       model: configured ? rules.config.model || null : null,
       effort: configured ? rules.config.effort || null : null,
-      schedule: configured ? scheduleNow(rules.schedule) : null,
+      schedule: configured ? scheduleNow(rules) : null,
       legacyContract: configured ? rules.legacyContract || null : null,
       inboxes,
     });

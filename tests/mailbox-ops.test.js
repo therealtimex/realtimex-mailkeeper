@@ -552,47 +552,93 @@ test("status reports the four setup criteria per inbox and the schedule", () => 
 
 test("status reads whether the heartbeat is on now, not as of the last settings save", () => {
   const ws = twoInboxes();
-  const saved = { cadence: "manual", manual: true, heartbeatEnabled: true, paused: false, threadSlug: "t" };
-  ws.writeRules({ schedule: saved });
+  const writtenAt = "2026-10-14T10:00:00.000Z";
+  ws.writeRules({ writtenAt, schedule: { taskId: "mailkeeper-maintenance-7", cadence: "manual", cadenceLabel: "Manual", manual: true, heartbeatEnabled: true, paused: false } });
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, state: "ready", rulesWrittenAt: writtenAt }));
   const heartbeat = path.join(ws.dir, "HEARTBEAT.md");
   const schedule = () => ws.run("status").json.schedule;
+  const state = () => [schedule().heartbeatEnabled, schedule().paused];
 
-  assert.deepEqual(schedule(), saved, "no HEARTBEAT.md: the heartbeat is on, as the host reads it");
+  assert.deepEqual(state(), [true, false], "no HEARTBEAT.md: the heartbeat is on, the host's default");
+  assert.deepEqual([schedule().applied, schedule().manual, schedule().scheduled], [true, true, false]);
 
-  const task = "tasks:\n  - id: mailkeeper-maintenance-7\n    enabled: false\n";
-  fs.writeFileSync(heartbeat, `heartbeat:\n  enabled: false\n  timezone: UTC\n${task}`);
-  assert.deepEqual(
-    [schedule().heartbeatEnabled, schedule().paused, schedule().manual, schedule().cadence],
-    [false, true, true, "manual"],
-    "paused after the save; Manual is kept for the wording to take precedence"
-  );
+  // Pause and resume in heartbeat settings, with no MailKeeper settings save.
+  fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: false\n  timezone: UTC\ntasks:\n  - id: mailkeeper-maintenance-7\n    name: MailKeeper maintenance\n    prompt: |-\n      a: b\n");
+  assert.deepEqual(state(), [false, true], "paused after the save");
+  assert.deepEqual([schedule().manual, schedule().cadence], [true, "manual"], "Manual is kept beside the pause");
+  fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: true\n  timezone: UTC\ntasks: []\n");
+  assert.deepEqual(state(), [true, false], "resumed");
 
-  fs.writeFileSync(heartbeat, `heartbeat:\n  timezone: UTC\n${task}`);
-  assert.equal(schedule().paused, false, "a task's own key never pauses the workspace");
-  fs.writeFileSync(heartbeat, `heartbeat:\n  enabled: "False" # paused for the test\n${task}`);
-  assert.equal(schedule().paused, true, "quoted and any-case false, as the host normalizes it");
-  fs.writeFileSync(heartbeat, "heartbeat: { timezone: UTC, enabled: false }\n");
-  assert.equal(schedule().paused, true, "flow mapping");
-  fs.writeFileSync(heartbeat, "---\nheartbeat:\n  enabled: false\n---\n# Notes\nheartbeat: yes\n");
-  assert.equal(schedule().paused, true, "front matter wins over the body");
-  fs.writeFileSync(heartbeat, "---\ntitle: notes\n---\nheartbeat:\n  enabled: false\n");
-  assert.equal(schedule().paused, true, "without a front-matter block the body is read, as the host does");
-  fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: maybe\n");
-  assert.equal(schedule().paused, false, "an unreadable value means on, as the host reads it");
-
-  if (process.getuid?.() !== 0) {
-    fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: false\n");
-    fs.chmodSync(heartbeat, 0o000);
-    assert.deepEqual(
-      [schedule().heartbeatEnabled, schedule().paused, schedule().manual],
-      [null, null, true],
-      "a file this terminal can't read is unknown, never the state from the last save"
-    );
-    fs.chmodSync(heartbeat, 0o600);
-  }
   fs.rmSync(heartbeat);
   fs.mkdirSync(heartbeat);
-  assert.deepEqual(schedule(), saved, "not a file: on");
+  assert.deepEqual(state(), [null, null], "a path that isn't a file is unknown, not absent");
+  fs.rmdirSync(heartbeat);
+  if (process.getuid?.() !== 0) {
+    fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: true\n");
+    fs.chmodSync(heartbeat, 0o000);
+    assert.deepEqual(state(), [null, null], "a file this terminal can't read is unknown, never the saved state");
+    fs.chmodSync(heartbeat, 0o600);
+  }
+});
+
+test("a schedule is claimed only from the ready provisioning that wrote rules.json, with its task in place", () => {
+  const ws = twoInboxes();
+  const writtenAt = "2026-10-14T10:00:00.000Z";
+  const taskId = "mailkeeper-maintenance-7";
+  ws.writeRules({ writtenAt, schedule: { taskId, cadence: "1d", cadenceLabel: "Daily", manual: false, heartbeatEnabled: true, paused: false } });
+  const provisioning = (state, rulesWrittenAt = null) =>
+    fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "provisioning.json"), JSON.stringify({ schemaVersion: 1, state, rulesWrittenAt }));
+  const heartbeat = (enabled, tasks) =>
+    fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), `heartbeat:\n  enabled: ${enabled}\n  timezone: UTC\ntasks:\n${tasks}`);
+  const managed = (interval) =>
+    `  - id: ${taskId}\n    name: MailKeeper maintenance\n    interval: ${interval}\n    agent: codex\n    runtime-options:\n      effort: high\n` +
+    "    prompt: |-\n      Inbox 1 of 1 — a: b\n        - not: a task\n    owner:\n      pluginId: p\n      workspaceId: 7\n";
+  const pick = () => {
+    const { applied, outcome, cadence, manual, scheduled, task } = ws.run("status").json.schedule;
+    return { applied, outcome, cadence, manual, scheduled, task };
+  };
+
+  heartbeat(true, managed("1d"));
+  assert.deepEqual(pick(), { applied: null, outcome: null, cadence: null, manual: null, scheduled: null, task: null }, "no provisioning record: nothing is claimed");
+
+  provisioning("ready", writtenAt);
+  assert.deepEqual(pick(), { applied: true, outcome: "ready", cadence: "1d", manual: false, scheduled: true, task: { found: true, interval: "1d" } });
+
+  heartbeat(false, managed("disabled"));
+  assert.equal(pick().scheduled, false, "provisioned while paused: the host keeps the task off");
+  heartbeat(true, managed("disabled"));
+  assert.deepEqual([pick().scheduled, pick().task], [false, { found: true, interval: "disabled" }], "resuming alone doesn't schedule it");
+  heartbeat(true, "  - id: someone-else\n    name: Other\n    interval: 1d\n");
+  assert.deepEqual([pick().scheduled, pick().task], [false, { found: false, interval: null }], "task missing");
+  heartbeat(true, managed("1d") + managed("1d"));
+  assert.deepEqual([pick().scheduled, pick().task], [null, null], "a duplicated task id can't be read");
+  fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), `---\ntitle: x\n---\nheartbeat:\n  enabled: true\ntasks:\n${managed("1d")}`);
+  assert.equal(pick().scheduled, null, "front matter is outside what this reader follows");
+
+  heartbeat(true, managed("1d"));
+  provisioning("ready", "2026-10-14T09:00:00.000Z");
+  assert.deepEqual([pick().applied, pick().cadence, pick().scheduled], [null, null, null], "ready, but for another rules.json");
+  provisioning("config_invalid");
+  assert.deepEqual([pick().applied, pick().outcome, pick().cadence, pick().manual], [false, "config_invalid", null, null]);
+  provisioning("pending");
+  assert.deepEqual([pick().applied, pick().outcome], [false, "pending"]);
+});
+
+test("the heartbeat reader agrees with the host parser or says unknown", () => {
+  // Each case records the host's answer at the pinned parser revision. Set
+  // MAILKEEPER_HOST_TASKBLOCK to a host taskBlock.js to re-check it live.
+  const parity = require("./fixtures/heartbeat-settings-parity.json");
+  const hostFile = process.env.MAILKEEPER_HOST_TASKBLOCK;
+  const host = hostFile ? require(hostFile) : null;
+  const ws = twoInboxes();
+  ws.writeRules({ schedule: { cadence: "1d", manual: false, heartbeatEnabled: true, paused: false } });
+  for (const { name, text, host: recorded, expected } of parity.cases) {
+    if (host) assert.equal(host.parseHeartbeatSettingsBlock(text)?.enabled !== false, recorded, `host changed: ${name}`);
+    fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), text);
+    const enabled = ws.run("status").json.schedule.heartbeatEnabled;
+    assert.equal(enabled, expected, name);
+    assert.ok(enabled === recorded || enabled === null, `never the opposite of the host: ${name}`);
+  }
 });
 
 test("the migration notice is owed once; the review status stays until confirmed", () => {

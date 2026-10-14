@@ -213,6 +213,32 @@ test("genuinely invalid config removes only this plugin's task", async () => {
   assert.equal(calls.upsert.length, 0);
 });
 
+test("each provisioning attempt records its outcome; only a ready one vouches for rules.json", async () => {
+  setMailbox(["work"]);
+  const { service, workspace, state } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  const read = (name) => JSON.parse(fs.readFileSync(path.join(workspace.workingDirectory, ".mailkeeper", name), "utf8"));
+
+  await service.provision(workspace);
+  const rules = read("rules.json");
+  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").rulesWrittenAt], ["ready", rules.writtenAt]);
+  assert.equal(rules.schedule.taskId, taskIdentity(7));
+
+  state.config = { ...state.config, AGENT: "" };
+  await service.provision(workspace);
+  assert.deepEqual([read("provisioning.json").state, read("provisioning.json").rulesWrittenAt], ["config_invalid", null]);
+  assert.equal(read("rules.json").writtenAt, rules.writtenAt, "the older schedule stays on disk, no longer vouched for");
+
+  state.config = { ...state.config, AGENT: "codex" };
+  service.discover = async () => {
+    throw new Error("discovery failed");
+  };
+  await assert.rejects(service.provision(workspace));
+  assert.equal(read("provisioning.json").state, "pending", "an attempt that threw never reads as ready");
+
+  await service.disable(workspace);
+  assert.equal(read("provisioning.json").state, "disabled");
+});
+
 test("a paused workspace stays paused after repair", async () => {
   setMailbox(["work"]);
   const { service, workspace, calls } = harness({ paused: true, config: { EMAIL_ACCOUNTS: ["work"] } });

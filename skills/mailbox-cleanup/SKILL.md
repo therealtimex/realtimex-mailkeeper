@@ -100,15 +100,21 @@ You can't save plugin settings. Say:
 
 > In **Workspace Settings → Plugins → MailKeeper → Configure**, select work@example.com under **Inboxes**, choose a **Maintenance agent**, and save. Model and reasoning effort are optional.
 
-After the user says it's saved, run `mailbox-ops status` and close with the effective state. Use `schedule.cadenceLabel`, `agentLabel` and `schedule.threadName` from its output:
+After the user says it's saved, run `mailbox-ops status` and close with the **first** of these that applies to its `schedule`. Each one replaces the others: never promise a schedule and then add a caveat. Use `agentLabel` and `schedule.threadName` from the same output.
 
-> **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
+1. **Settings not applied** (`outcome` isn't `ready`):
+   - `config_invalid`: "MailKeeper couldn't apply your latest settings, so I can't say when it will check on its own. You can fix them in Workspace Settings → Plugins → MailKeeper → Configure, and you can still ask me: “run MailKeeper”."
+   - `pending`: "MailKeeper didn't finish applying your latest settings, so I can't say when it will check on its own. Saving them again in Workspace Settings → Plugins → MailKeeper → Configure usually fixes this, and you can still ask me: “run MailKeeper”."
+   - `disabled`: "MailKeeper is switched off for this workspace, so it won't check on its own. You can switch it on in Workspace Settings → Plugins → MailKeeper."
+2. **Schedule can't be read** (`applied` or `manual` is null): "I couldn't check MailKeeper's schedule just now, so I can't confirm when it will check on its own. You can always ask me: “run MailKeeper”."
+3. **Manual** (`manual` is true), whether or not the heartbeat is paused: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
+4. **Heartbeat paused** (`paused` is true): "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." If `paused` is null: "I couldn't check just now whether this workspace's heartbeat is paused, so I can't confirm MailKeeper will check on its own. You can always ask me: “run MailKeeper”." Setup never turns heartbeat on.
+5. **Task not scheduled** (`scheduled` is false: the heartbeat is on but MailKeeper's task is missing or not on that schedule): "MailKeeper's schedule isn't active in this workspace's heartbeat right now, so it won't check on its own. Saving MailKeeper's settings again turns it back on, and you can still ask me: “run MailKeeper”." If `scheduled` is null, use the wording in 2.
+6. **Scheduled** (`scheduled` is true), with `cadenceLabel`:
 
-If `schedule.manual` is true, say instead: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
+   > **work@example.com is set up.** MailKeeper checks it **daily** using **Codex** and posts each report in the **MailKeeper maintenance** thread. You can also ask me any time: "run MailKeeper" or "clean up my work inbox."
 
-If `schedule.paused` is true (the heartbeat is off or paused, as it is now) and `schedule.manual` is false, add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
-
-If `schedule.paused` is null and `schedule.manual` is false, the heartbeat state couldn't be read just now. Add: "I couldn't check just now whether this workspace's heartbeat is paused, so I can't confirm MailKeeper will check on its own. You can always ask me: “run MailKeeper”." Never describe an older saved value as current.
+Never describe an older saved value as current.
 
 Then say once: "When you ask me here, the agent selected for this chat does the work under the same contracts." Don't ask the user to change chat controls, and don't claim chat and schedule use the same agent unless you verified it. If the scheduled agent is Codex, add one line: Codex needs network access for scheduled checks (see the MailKeeper README).
 
@@ -135,7 +141,7 @@ A failure in one inbox is recorded for that inbox. Skip its remaining steps and 
 
 **Scheduled runs** follow the generated prompt. They apply only rules the user has already approved, within each contract. Everything else is listed as a suggestion. They never ask questions, open wizards, change Secrets or retry sign-in. A blocked inbox becomes a blocked receipt and a clear report.
 
-**In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved and how to undo it. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
+**In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Run it here, in this chat; never start the heartbeat task instead (with Schedule Manual, MailKeeper skips a task started that way). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved and how to undo it. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
 
 **Passes:** `age` (archive in `archive-promoted`, otherwise `Auto/Aged`), `personalized-outreach`, `generic-outreach`, `no-reply`, `calendar-response`, `receipt`, `sketchy-tld`, `repeat-sender` (moves go to `Auto/<category>`). Passes that need reply history stay off until the inbox's Sent folder is set.
 

@@ -162,11 +162,14 @@ class MailKeeperService {
         workspace: workspace.slug,
         errors,
       });
+      this.recordProvisioning(workspace, "config_invalid");
       return { state: "config_invalid", errors };
     }
 
     // Provisioned means scheduled and configured, not "IMAP verified": the
-    // terminal checks each inbox when a run starts.
+    // terminal checks each inbox when a run starts. Until this attempt
+    // finishes, the schedule in rules.json is not current.
+    this.recordProvisioning(workspace, "pending");
     const discovery = await this.discover();
     const thread = await this.host.workspaces.ensureThread(workspace, {
       key: threadKey(workspace.id),
@@ -197,7 +200,8 @@ class MailKeeperService {
       promptArtifactRetention: "durable",
     });
     const settings = await this.host.heartbeat.readSettings(workspace);
-    this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
+    const rulesWrittenAt = this.syncRulesFile(workspace, config, rules, discovery, inboxes, {
+      taskId: taskIdentity(workspace.id),
       cadence: config.cadence,
       cadenceLabel: cadenceLabel(config.cadence),
       manual: config.cadence === CADENCE_MANUAL,
@@ -227,6 +231,7 @@ class MailKeeperService {
       updatedAt: new Date().toISOString(),
     };
     await this.store.set(this.profileKey(workspace), next);
+    this.recordProvisioning(workspace, "ready", rulesWrittenAt);
     return next;
   }
 
@@ -240,6 +245,7 @@ class MailKeeperService {
       state: "disabled",
       updatedAt: new Date().toISOString(),
     });
+    this.recordProvisioning(workspace, "disabled");
     // Thread, contracts, rules and run receipts are intentionally kept:
     // they are the user's audit trail and survive re-enable.
   }
@@ -397,10 +403,11 @@ class MailKeeperService {
    */
   syncRulesFile(workspace, config, rules, discovery, inboxes, schedule) {
     const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "rules.json"));
+    const writtenAt = new Date().toISOString();
     writeJsonAtomic(target, {
       schemaVersion: 2,
       revision: rules.revision,
-      writtenAt: new Date().toISOString(),
+      writtenAt,
       himalayaConfig: {
         paths: discovery.himalayaConfig.paths,
         target: discovery.himalayaConfig.target,
@@ -432,6 +439,19 @@ class MailKeeperService {
       legacyContract: fs.existsSync(path.join(workspace.workingDirectory, LEGACY_CONTRACT)) ? LEGACY_CONTRACT : null,
       promoted: rules.promoted.filter((rule) => typeof rule.account === "string"),
     });
+    return writtenAt;
+  }
+
+  /**
+   * The latest provisioning attempt's outcome, for the workspace CLI:
+   * `pending` while an attempt runs (or after one threw), `config_invalid`,
+   * `disabled`, or `ready` with the `writtenAt` of the rules.json it wrote.
+   * The CLI reads the schedule in rules.json as current only when it is that
+   * file, so a failed attempt never leaves an older schedule looking current.
+   */
+  recordProvisioning(workspace, state, rulesWrittenAt = null) {
+    const target = safeWorkspacePath(workspace.workingDirectory, path.join(".mailkeeper", "provisioning.json"));
+    writeJsonAtomic(target, { schemaVersion: 1, state, rulesWrittenAt, at: new Date().toISOString() });
   }
 
   /**
