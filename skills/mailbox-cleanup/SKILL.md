@@ -106,7 +106,9 @@ After the user says it's saved, run `mailbox-ops status` and close with the effe
 
 If `schedule.manual` is true, say instead: "MailKeeper's Schedule is Manual, so it won't check on its own. You can ask me any time: “run MailKeeper”. To check on a schedule, change Schedule in MailKeeper settings."
 
-If `schedule.paused` is true (the heartbeat is off or paused), add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
+If `schedule.paused` is true (the heartbeat is off or paused, as it is now) and `schedule.manual` is false, add: "Scheduled checks are paused for this workspace, so MailKeeper won't run on its own until heartbeat is turned back on in this workspace's heartbeat settings. You can still ask me to run it now." Setup never turns heartbeat on.
+
+If `schedule.paused` is null and `schedule.manual` is false, the heartbeat state couldn't be read just now. Add: "I couldn't check just now whether this workspace's heartbeat is paused, so I can't confirm MailKeeper will check on its own. You can always ask me: “run MailKeeper”." Never describe an older saved value as current.
 
 Then say once: "When you ask me here, the agent selected for this chat does the work under the same contracts." Don't ask the user to change chat controls, and don't claim chat and schedule use the same agent unless you verified it. If the scheduled agent is Codex, add one line: Codex needs network access for scheduled checks (see the MailKeeper README).
 

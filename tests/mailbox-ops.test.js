@@ -539,6 +539,7 @@ test("clearing a review marker cannot exceed the workspace caps or approve a rul
 test("status reports the four setup criteria per inbox and the schedule", () => {
   const ws = twoInboxes();
   ws.writeRules({ schedule: { cadence: "1d", paused: true, threadSlug: "mailkeeper-maintenance-7" } });
+  fs.writeFileSync(path.join(ws.dir, "HEARTBEAT.md"), "heartbeat:\n  enabled: false\ntasks: []\n");
   let status = ws.run("status").json;
   assert.deepEqual(status.inboxes.map((i) => i.setupComplete), [false, false], "no connection check yet");
   ws.run("check", "--account", "a");
@@ -547,6 +548,51 @@ test("status reports the four setup criteria per inbox and the schedule", () => 
   assert.equal(status.schedule.paused, true);
   assert.equal(status.agent, "codex");
   assert.equal(status.agentLabel, "Codex CLI");
+});
+
+test("status reads whether the heartbeat is on now, not as of the last settings save", () => {
+  const ws = twoInboxes();
+  const saved = { cadence: "manual", manual: true, heartbeatEnabled: true, paused: false, threadSlug: "t" };
+  ws.writeRules({ schedule: saved });
+  const heartbeat = path.join(ws.dir, "HEARTBEAT.md");
+  const schedule = () => ws.run("status").json.schedule;
+
+  assert.deepEqual(schedule(), saved, "no HEARTBEAT.md: the heartbeat is on, as the host reads it");
+
+  const task = "tasks:\n  - id: mailkeeper-maintenance-7\n    enabled: false\n";
+  fs.writeFileSync(heartbeat, `heartbeat:\n  enabled: false\n  timezone: UTC\n${task}`);
+  assert.deepEqual(
+    [schedule().heartbeatEnabled, schedule().paused, schedule().manual, schedule().cadence],
+    [false, true, true, "manual"],
+    "paused after the save; Manual is kept for the wording to take precedence"
+  );
+
+  fs.writeFileSync(heartbeat, `heartbeat:\n  timezone: UTC\n${task}`);
+  assert.equal(schedule().paused, false, "a task's own key never pauses the workspace");
+  fs.writeFileSync(heartbeat, `heartbeat:\n  enabled: "False" # paused for the test\n${task}`);
+  assert.equal(schedule().paused, true, "quoted and any-case false, as the host normalizes it");
+  fs.writeFileSync(heartbeat, "heartbeat: { timezone: UTC, enabled: false }\n");
+  assert.equal(schedule().paused, true, "flow mapping");
+  fs.writeFileSync(heartbeat, "---\nheartbeat:\n  enabled: false\n---\n# Notes\nheartbeat: yes\n");
+  assert.equal(schedule().paused, true, "front matter wins over the body");
+  fs.writeFileSync(heartbeat, "---\ntitle: notes\n---\nheartbeat:\n  enabled: false\n");
+  assert.equal(schedule().paused, true, "without a front-matter block the body is read, as the host does");
+  fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: maybe\n");
+  assert.equal(schedule().paused, false, "an unreadable value means on, as the host reads it");
+
+  if (process.getuid?.() !== 0) {
+    fs.writeFileSync(heartbeat, "heartbeat:\n  enabled: false\n");
+    fs.chmodSync(heartbeat, 0o000);
+    assert.deepEqual(
+      [schedule().heartbeatEnabled, schedule().paused, schedule().manual],
+      [null, null, true],
+      "a file this terminal can't read is unknown, never the state from the last save"
+    );
+    fs.chmodSync(heartbeat, 0o600);
+  }
+  fs.rmSync(heartbeat);
+  fs.mkdirSync(heartbeat);
+  assert.deepEqual(schedule(), saved, "not a file: on");
 });
 
 test("the migration notice is owed once; the review status stays until confirmed", () => {

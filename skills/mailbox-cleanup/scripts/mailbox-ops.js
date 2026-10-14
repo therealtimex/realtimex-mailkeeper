@@ -292,6 +292,60 @@ function pinnedConfig(rules) {
   return localHimalayaConfig();
 }
 
+/**
+ * Whether this workspace's heartbeat is on, read as the host reads it: the
+ * `enabled` key of the `heartbeat:` block in HEARTBEAT.md (front matter or
+ * plain YAML). No file, no block or no readable value means on; only an
+ * explicit `false` pauses. Null when the file exists but can't be read.
+ */
+function heartbeatEnabledNow() {
+  const file = path.join(ROOT, "HEARTBEAT.md");
+  if (!isFile(file)) return true;
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch {
+    return null;
+  }
+  const isBlock = (line) => /^heartbeat\s*:/.test(line.trim());
+  let lines = text.split("\n");
+  const trimmed = text.trimStart();
+  const close = trimmed.startsWith("---") ? trimmed.slice(3).indexOf("\n---") : -1;
+  if (close !== -1 && trimmed.slice(3, close + 3).split("\n").some(isBlock)) lines = trimmed.slice(3, close + 3).split("\n");
+  const start = lines.findIndex(isBlock);
+  if (start === -1) return true;
+  const indent = (line) => line.length - line.trimStart().length;
+  const flow = /^heartbeat\s*:\s*\{(.*)\}\s*(#.*)?$/.exec(lines[start].trim());
+  let value = null;
+  if (flow) {
+    value = /(?:^|,)\s*enabled\s*:\s*([^,]*)/.exec(flow[1])?.[1] ?? null;
+  } else {
+    let child = null;
+    for (const line of lines.slice(start + 1)) {
+      if (!line.trim() || line.trim().startsWith("#")) continue;
+      if (indent(line) <= indent(lines[start])) break;
+      child ??= indent(line);
+      const match = indent(line) === child && /^enabled\s*:\s*(.*?)\s*(#.*)?$/.exec(line.trim());
+      if (match) {
+        value = match[1];
+        break;
+      }
+    }
+  }
+  return String(value ?? "").trim().replace(/^(["'])(.*)\1$/, "$2").toLowerCase() !== "false";
+}
+
+/**
+ * The saved schedule, with the heartbeat's on/off state as it is now. When
+ * that can't be read, it is unknown (null): the value saved at setup is not
+ * reported as current.
+ */
+function scheduleNow(saved) {
+  if (!saved) return null;
+  const enabled = heartbeatEnabledNow();
+  return { ...saved, heartbeatEnabled: enabled, paused: enabled === null ? null : !enabled };
+}
+
 function contractFile(key) {
   const relative = core.contractRelativePath(key);
   const target = path.join(ROOT, relative);
@@ -1221,7 +1275,8 @@ const commands = {
   /**
    * Where setup stands for each inbox, by the four completion criteria:
    * selected here, a maintenance agent chosen, a valid contract, and a
-   * successful read-only check. Schedule state is as of the last settings save.
+   * successful read-only check. Cadence is as of the last settings save; whether
+   * the heartbeat is on is read now, so a pause made since then shows.
    */
   status() {
     const rules = readJson(statePath("rules.json"));
@@ -1249,7 +1304,7 @@ const commands = {
       agentLabel: configured && rules.config.agent ? core.own(AGENT_LABELS, rules.config.agent) || rules.config.agent : null,
       model: configured ? rules.config.model || null : null,
       effort: configured ? rules.config.effort || null : null,
-      schedule: configured ? rules.schedule || null : null,
+      schedule: configured ? scheduleNow(rules.schedule) : null,
       legacyContract: configured ? rules.legacyContract || null : null,
       inboxes,
     });
