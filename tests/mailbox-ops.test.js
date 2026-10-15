@@ -1234,6 +1234,163 @@ test("only Himalaya's own page-past-the-end answer ends a listing; other failure
 });
 
 // ---------------------------------------------------------------------------
+// Release: urgent items in every plan, and undo advice before a move
+// ---------------------------------------------------------------------------
+
+const snapshotHash = (ws, account) =>
+  crypto.createHash("sha256").update(fs.readFileSync(path.join(ws.dir, ".mailkeeper", "accounts", core.accountKey(account), "snapshot.json"))).digest("hex");
+const tenNoReply = () => Array.from({ length: 10 }, (_, i) => msg(300 + i, `noreply@n${i}.example`, `Digest ${i}`));
+
+test("a chat preview shows urgent items from the read itself, and the receipt keeps them, without a separate triage", () => {
+  const ws = twoInboxes();
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual(preview.urgentLeftInPlace, { total: 1, items: [{ from: "noreply@billing.example", subject: "Final notice: payment overdue" }], more: 0 });
+  const applied = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.equal(applied.results[0].moved, 2);
+  assert.ok(ws.mailbox().accounts.b.folders.INBOX.some((m) => m.subject === "Final notice: payment overdue"), "urgent mail stays");
+  const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+  assert.deepEqual([submit.accounts.b.urgentChecked, submit.accounts.b.urgentCount], [true, 1]);
+  assert.deepEqual(ws.receipt("r1").urgent.map((u) => [u.account, u.subject, u.folder]), [["b", "Final notice: payment overdue", "INBOX"]]);
+});
+
+test("a newer read replaces earlier urgent results, a failed read is never nothing urgent, and inboxes stay separate", () => {
+  const ws = twoInboxes({ b: { folders: { "Auto/Notifications": [], Quiet: [msg(700, "friend@people.example", "Lunch?")] } } });
+  ws.run("begin", "--run-id", "r1");
+  ws.run("snapshot", "--account", "a", "--run-id", "r1");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.deepEqual(ws.run_("r1").urgent.map((u) => u.account).sort(), ["a", "b"]);
+  ws.run("snapshot", "--account", "b", "--run-id", "r1", "--folder", "Quiet");
+  const run = ws.run_("r1");
+  assert.deepEqual(run.urgent.map((u) => u.account), ["a"], "b's INBOX results are replaced by its Quiet read; a's stay");
+  assert.deepEqual([run.urgentChecks.b.ok, run.urgentChecks.b.folder, run.urgentChecks.b.total], [true, "Quiet", 0]);
+  ws.setFake("b", { listFailPage: 1 });
+  assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+  const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+  assert.deepEqual([submit.accounts.b.urgentChecked, submit.accounts.b.urgentCount], [false, 0]);
+  assert.deepEqual([submit.accounts.a.urgentChecked, submit.accounts.a.urgentCount], [true, 1]);
+});
+
+test("a preview lists at most ten urgent items and gives the total", () => {
+  const urgentMail = Array.from({ length: 12 }, (_, i) => msg(800 + i, `billing${i}@shop.example`, `Final notice ${i}`));
+  const ws = twoInboxes({ b: { messages: [...standardInbox().slice(0, 2), ...urgentMail] } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([preview.urgentLeftInPlace.total, preview.urgentLeftInPlace.items.length, preview.urgentLeftInPlace.more], [12, 10, 2]);
+});
+
+test("undo advice: an absent destination is found by the folder list, a report-only plan gets none, and the source snapshot is untouched", () => {
+  const ws = twoInboxes({ b: { folders: {} } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const before = snapshotHash(ws, "b");
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([preview.from, preview.target, preview.targetExists], ["INBOX", "Auto/Notifications", false]);
+  assert.deepEqual([preview.undoAdvisory.state, preview.undoAdvisory.reason, preview.undoAdvisory.plannedCount], ["no-obstacle", null, 2]);
+  assert.equal(snapshotHash(ws, "b"), before, "the source snapshot is unchanged");
+  assert.equal(listCalls(ws, "b", "Auto/Notifications").length, 0, "an absent folder isn't listed");
+
+  const reportOnly = twoInboxes({ b: { policy: { mode: "report-only", credential: secretB } } });
+  reportOnly.run("begin", "--run-id", "r1", "--account", "b");
+  reportOnly.run("snapshot", "--account", "b", "--run-id", "r1");
+  const calls = reportOnly.mailbox().calls.length;
+  const plain = reportOnly.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([plain.wouldMove, plain.undoAdvisory, plain.targetExists], [false, null, null]);
+  assert.equal(reportOnly.mailbox().calls.length, calls, "no destination check for a plan that moves nothing");
+});
+
+test("undo advice at the size boundary: 989 + 10 can still be checked, 990 + 10 can't", () => {
+  for (const [existing, state, reason] of [
+    [989, "no-obstacle", null],
+    [990, "limit", "size"],
+  ]) {
+    const ws = twoInboxes({ b: { messages: tenNoReply(), folders: { "Auto/Notifications": bulkInbox(existing, 5001) } } });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    ws.run("snapshot", "--account", "b", "--run-id", "r1");
+    const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+    assert.deepEqual([preview.targetExists, preview.undoAdvisory.state, preview.undoAdvisory.reason], [true, state, reason], `${existing}`);
+  }
+});
+
+test("undo advice failures stay local: the inbox isn't failed and its snapshot is untouched", () => {
+  const ws = twoInboxes();
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const before = snapshotHash(ws, "b");
+  ws.setFake("b", { failFolderList: true });
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.equal(preview.ok, true);
+  assert.deepEqual([preview.targetExists, preview.undoAdvisory.state, preview.undoAdvisory.reason], [null, "unknown", "check-failed"]);
+  assert.equal(ws.run_("r1").accounts.b.outcome, null, "the inbox isn't failed");
+  assert.equal(snapshotHash(ws, "b"), before);
+});
+
+test("undo advice flags look-alikes among the moves and in the destination", () => {
+  const twin = msg(1, "noreply@twin.example", "Same");
+  const twin2 = { ...twin, id: "2" };
+  const ws = twoInboxes({ b: { messages: [twin, twin2], folders: { "Auto/Notifications": [] } } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const among = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([among.undoAdvisory.state, among.undoAdvisory.reason, among.undoAdvisory.lookAlikeCount], ["limit", "look-alike", 2]);
+
+  const ws2 = twoInboxes({ b: { messages: [twin], folders: { "Auto/Notifications": [{ ...twin, id: "900" }] } } });
+  ws2.run("begin", "--run-id", "r1", "--account", "b");
+  ws2.run("snapshot", "--account", "b", "--run-id", "r1");
+  const present = ws2.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([present.undoAdvisory.state, present.undoAdvisory.reason, present.undoAdvisory.lookAlikeCount], ["limit", "look-alike", 1]);
+});
+
+test("undo advice shares one allowance per inbox: two folders that only overflow together, and an allowance used up", () => {
+  const calendar = () => Array.from({ length: 10 }, (_, i) => msg(400 + i, `p${i}@people.example`, `Accepted: Meeting ${i}`));
+  const ws = twoInboxes({
+    b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
+  });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const first = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([first.undoAdvisory.state, first.undoAdvisory.reason], ["no-obstacle", null]);
+  const second = ws.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
+  assert.deepEqual([second.undoAdvisory.state, second.undoAdvisory.reason], ["limit", "combined-size"]);
+
+  const used = twoInboxes({
+    b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(900, 5001), "Auto/Calendar": [] } },
+  });
+  used.run("begin", "--run-id", "r1", "--account", "b");
+  used.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.equal(used.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory.state, "no-obstacle");
+  const after = used.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
+  assert.deepEqual([after.undoAdvisory.state, after.undoAdvisory.reason], ["unknown", "allowance-used"]);
+});
+
+test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {
+  const ws = twoInboxes();
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", state: "no-obstacle", reason: null }]);
+
+  const scheduled = twoInboxes();
+  maintenance(scheduled, "r1");
+  assert.deepEqual(scheduled.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", state: "unassessed", reason: null }]);
+
+  const changed = twoInboxes();
+  changed.run("begin", "--run-id", "r1", "--account", "b");
+  changed.run("snapshot", "--account", "b", "--run-id", "r1");
+  changed.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  const box = changed.mailbox().accounts.b.folders;
+  changed.setFake("b", { folders: { ...box, INBOX: [...box.INBOX, msg(77, "noreply@late.example", "Late arrival")] } });
+  changed.run("snapshot", "--account", "b", "--run-id", "r1");
+  changed.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  changed.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(changed.receipt("r1").accounts.b.undoAdvisories.map((u) => u.state), ["unassessed"], "the advice was for a different plan");
+});
+
+// ---------------------------------------------------------------------------
 // With the real Himalaya binary
 // ---------------------------------------------------------------------------
 

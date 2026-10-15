@@ -144,9 +144,18 @@ A failure in one inbox is recorded for that inbox. Skip its remaining steps and 
 
 **Scheduled runs** follow the generated prompt. They apply only rules the user has already approved, within each contract. Everything else is listed as a suggestion. They never ask questions, open wizards, change Secrets or retry sign-in. A blocked inbox becomes a blocked receipt and a clear report.
 
-**In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Run it here, in this chat; never start the heartbeat task instead (with Schedule Manual, MailKeeper skips a task started that way). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved and how to undo it. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
+**In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Run it here, in this chat; never start the heartbeat task instead (with Schedule Manual, MailKeeper skips a task started that way). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Before each apply, ask, naming the inbox, the destination and the count. After moving, say what moved, then the undo line from Reports. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
 
-In a chat plan:
+In a chat plan, from `preview`:
+- **Destination:** when `targetExists` is `false`, say "Auto/Notifications doesn't exist yet; I'll create it when moving." When it is `null`, say "I'll create Auto/Notifications if it doesn't exist." When it is `true`, say nothing.
+- **Move scope**, always for a plan that moves: "I'll move only these <n> messages, from <source folder> to <folder>." Use `from`, `target` and `count`. State these facts; never add guesses about how the move works.
+- **Urgent mail left in place:** "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. Without a successful read there's no plan, so never say "nothing urgent".
+- **Undo advice:** when `undoAdvisory.state` isn't `no-obstacle`, put the matching line in the question you ask before applying:
+  - `limit` with `size` or `combined-size`: "MailKeeper may not be able to undo moves into <folder>: after these moves it would hold more messages than MailKeeper can check."
+  - `limit` with `look-alike`: "MailKeeper may not be able to undo <lookAlikeCount> of these moves: some messages in <folder> or in this plan look the same."
+  - `unknown`: "MailKeeper may not be able to undo moves into <folder>: it couldn't fully check that folder just now."
+
+  Never say a move "can" or "can't" be undone as a certainty.
 - **Inbox read only in part** (`preview` shows `reportOnly: "partial-coverage"`): "I've only checked part of work@example.com (<n> messages), so this plan covers those, and I won't move anything in it." Don't offer Move all for that inbox.
 - **Unsubscribe check off:** say once per plan, when the contract uses No-reply: "This version doesn't check for unsubscribe links. This plan uses the other available checks."
 - **Reply-history cleanups off:** say once per plan, when the contract uses them: "“Repeat senders” and “Personalized outreach” are off in this version, because MailKeeper can't yet read who you've written to. This plan uses the other available checks."
@@ -170,7 +179,7 @@ One report per run. Give each inbox its own section, inbox name first, and say w
 
 > **work@example.com:** checked. Moved 14 by your approved rules (Newsletters 9, Calendar 5). 3 suggestions. 1 urgent: "Final notice …" from billing@… (left in the inbox).
 > **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the Login "MailKeeper – personal@example.com" in Settings → Secrets, then ask this workspace's chat to run MailKeeper.
-> To undo this run, ask this workspace's chat: "undo MailKeeper run 7f3a".
+> To undo, ask this workspace's chat: “undo MailKeeper run 7f3a”. It will check first what can be undone.
 
 When `coverage.folder` is present, not empty and isn't `INBOX`, the run read only that folder: name it in every coverage line, chat plan included, as "work@example.com, folder “Receipts”: checked in full (<n> messages)", and never present it as the whole inbox. A missing or empty `folder` is unknown: don't name a folder, and don't claim the whole inbox was checked either.
 
@@ -186,7 +195,13 @@ For each entry in an inbox's `ruleNotices`, add its line once:
 
 Never say every rule ran when an approved rule was skipped.
 
-Write only the per-inbox sections and, when something moved, the undo line. No error codes, no step names (snapshot, triage, apply, propose), and no notes about lessons, tools or this workspace's own instructions. A scheduled report is read in the maintenance thread, where no one may answer: wherever this skill says "ask me", say "ask this workspace's chat".
+When something moved, take the undo line from each inbox's `undoAdvisories`, one line per inbox and destination:
+- `no-obstacle` or `unassessed`: "To undo, ask this workspace's chat: “undo MailKeeper run <id>”. It will check first what can be undone."
+- `limit` or `unknown`: "MailKeeper may not be able to undo the moves into <folder>: <the reason from Chat>." Add the undo line too when other destinations had no obstacle.
+
+Never promise that moves can be undone.
+
+Write only the per-inbox sections and, when something moved, the undo lines. No error codes, no step names (snapshot, triage, apply, propose), and no notes about lessons, tools or this workspace's own instructions. A scheduled report is read in the maintenance thread, where no one may answer: wherever this skill says "ask me", say "ask this workspace's chat".
 
 When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good".
 

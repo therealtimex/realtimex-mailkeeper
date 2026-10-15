@@ -849,8 +849,8 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, deadlineAt
   return parsed.data;
 }
 
-function folderNames(rules, inbox) {
-  const folders = mailboxOp(rules, inbox, "folder-list");
+function folderNames(rules, inbox, { deadlineAt = null } = {}) {
+  const folders = mailboxOp(rules, inbox, "folder-list", [], { deadlineAt });
   return Array.isArray(folders) ? folders.map((folder) => String(folder?.name || "")).filter(Boolean) : [];
 }
 
@@ -1179,6 +1179,143 @@ function buildContext(rules, inbox, snapshot) {
 
 function urgentHits(snapshot) {
   return snapshot.envelopes.filter((e) => URGENT_RE.test(e.subject) || URGENT_DOMAIN_RE.test(e.fromDomain));
+}
+
+// How many urgent items a preview lists; the total is always given.
+const URGENT_SHOWN = 10;
+
+/**
+ * Record an inbox's urgent messages from the snapshot just accepted: the one
+ * calculation (urgentHits) that triage, preview and apply share. A newer
+ * snapshot replaces the inbox's earlier results, folder included.
+ */
+function recordUrgent(run, account, snapshot) {
+  const hits = urgentHits(snapshot);
+  run.urgent = [
+    ...run.urgent.filter((e) => e.account !== account),
+    ...hits.map((e) => ({ account, uid: e.uid, from: e.fromAddress, subject: e.subject.slice(0, 200), date: e.date, folder: snapshot.folder })),
+  ];
+  run.urgentChecks = run.urgentChecks || {};
+  core.setOwn(run.urgentChecks, account, { ok: true, folder: snapshot.folder, total: hits.length, at: new Date().toISOString() });
+  return hits;
+}
+
+/** A snapshot that is starting (or failed) leaves the urgent check not done, never "nothing urgent". */
+function clearUrgent(run, account, folder) {
+  run.urgent = run.urgent.filter((e) => e.account !== account);
+  run.urgentChecks = run.urgentChecks || {};
+  core.setOwn(run.urgentChecks, account, { ok: false, folder, total: null, at: new Date().toISOString() });
+}
+
+const fingerprint = (e) => `${e.fromAddress}\n${String(e.subject).slice(0, 200)}\n${e.date}`;
+
+/**
+ * Whether moves into `target` could later be undone, as far as one bounded
+ * check can tell now. It is advice for the person before they confirm, never
+ * a promise and never a block. One allowance per inbox per run (five listing
+ * pages, the same as undo's, and one minute from the first check, which also
+ * bounds the folder list) covers every destination checked; it is never
+ * renewed. Failures stay local: they make the advice unknown and never
+ * fail the inbox or touch the source snapshot.
+ */
+function destinationAdvisory(rules, run, inbox, { pass, from, target, list }) {
+  run.destinationChecks = run.destinationChecks || {};
+  let allowance = core.own(run.destinationChecks, inbox.account);
+  if (!allowance) {
+    allowance = { pagesLeft: READ_PAGE_BUDGET, deadline: null, advisories: {} };
+    core.setOwn(run.destinationChecks, inbox.account, allowance);
+  }
+  const planKey = crypto
+    .createHash("sha256")
+    .update([pass, from, target, ...list.map((e) => e.uid).sort()].join("\n"))
+    .digest("hex")
+    .slice(0, 32);
+  const cached = core.own(allowance.advisories, target);
+  if (cached && cached.planKey === planKey) return cached;
+
+  const advisory = {
+    destination: target,
+    plannedCount: list.length,
+    checkedAt: new Date().toISOString(),
+    targetExists: null,
+    state: "unknown",
+    reason: null,
+    lookAlikeCount: 0,
+    pagesNeeded: null,
+    planKey,
+  };
+  const incoming = list.map(fingerprint);
+  if (allowance.deadline === null) allowance.deadline = Date.now() + READ_DEADLINE_MS;
+  const budget = { pagesLeft: allowance.pagesLeft, deadline: allowance.deadline };
+  try {
+    if (budget.pagesLeft <= 0 || budget.deadline - Date.now() < READ_MIN_PAGE_MS) {
+      advisory.reason = "allowance-used";
+    } else {
+      let names = null;
+      try {
+        names = folderNames(rules, inbox, { deadlineAt: budget.deadline });
+      } catch {
+        advisory.reason = "check-failed";
+      }
+      if (names) {
+        advisory.targetExists = names.includes(target);
+        let existing = [];
+        let listing = { complete: true, stopReason: null };
+        // Whether this listing had the whole allowance: only then does a full
+        // read limit say the folder itself is too large.
+        const wholeAllowance = budget.pagesLeft === READ_PAGE_BUDGET;
+        if (advisory.targetExists) {
+          try {
+            listing = listCapped(rules, inbox, target, budget);
+            existing = listing.envelopes;
+          } catch {
+            listing = { complete: false, stopReason: "check-failed" };
+          }
+        }
+        if (!listing.complete) {
+          // A full read limit means the folder is already too large to check.
+          if (listing.stopReason === "budget" && wholeAllowance) Object.assign(advisory, { state: "limit", reason: "size" });
+          else advisory.reason = listing.stopReason === "budget" ? "allowance-used" : listing.stopReason || "check-failed";
+        } else {
+          advisory.pagesNeeded = Math.floor((existing.length + list.length) / BATCH) + 1;
+          const others = Object.entries(allowance.advisories)
+            .filter(([destination, other]) => destination !== target && Number.isInteger(other.pagesNeeded))
+            .reduce((n, [, other]) => n + other.pagesNeeded, 0);
+          const present = new Set(existing.map(fingerprint));
+          const counts = new Map();
+          for (const f of incoming) counts.set(f, (counts.get(f) || 0) + 1);
+          advisory.lookAlikeCount = incoming.filter((f) => present.has(f) || counts.get(f) > 1).length;
+          if (advisory.lookAlikeCount) {
+            Object.assign(advisory, { state: "limit", reason: "look-alike" });
+          } else if (advisory.pagesNeeded > READ_PAGE_BUDGET) {
+            Object.assign(advisory, { state: "limit", reason: "size" });
+          } else if (advisory.pagesNeeded + others > READ_PAGE_BUDGET) {
+            Object.assign(advisory, { state: "limit", reason: "combined-size" });
+          } else {
+            Object.assign(advisory, { state: "no-obstacle", reason: null });
+          }
+        }
+      }
+    }
+  } catch {
+    advisory.reason = "check-failed";
+  }
+  allowance.pagesLeft = budget.pagesLeft;
+  core.setOwn(allowance.advisories, target, advisory);
+  return advisory;
+}
+
+/** The advisory to carry into a receipt for moves actually made, or "unassessed". */
+function advisoryFor(run, account, { pass, from, target, list }) {
+  const allowance = core.own(run.destinationChecks || {}, account);
+  const advisory = allowance && core.own(allowance.advisories, target);
+  if (!advisory) return { state: "unassessed", reason: null };
+  const planKey = crypto
+    .createHash("sha256")
+    .update([pass, from, target, ...list.map((e) => e.uid).sort()].join("\n"))
+    .digest("hex")
+    .slice(0, 32);
+  return advisory.planKey === planKey ? { state: advisory.state, reason: advisory.reason } : { state: "unassessed", reason: null };
 }
 
 /**
@@ -1907,6 +2044,7 @@ const commands = {
       // `--since-last-run` is accepted but no longer narrows the read: date
       // filters can't be paged reliably, so every snapshot lists the folder
       // from the top within the read budget.
+      clearUrgent(run, account, folder);
       const budget = readBudget();
       const listing = listCapped(rules, inbox, folder, budget);
       const envelopes = listing.envelopes;
@@ -1946,17 +2084,14 @@ const commands = {
       }
       entry.steps.push("snapshot");
       entry.coverage = coverage;
+      recordUrgent(run, account, snapshot);
       return { account, envelopes: envelopes.length, coverage, replyHistory: snapshot.replyHistory, takenAt: snapshot.takenAt };
     });
   },
 
   triage(args) {
     perInbox(args, ({ run, account, inbox, entry }) => {
-      const hits = urgentHits(loadSnapshot(inbox));
-      run.urgent = [
-        ...run.urgent.filter((e) => e.account !== account),
-        ...hits.map((e) => ({ account, uid: e.uid, from: e.fromAddress, subject: e.subject.slice(0, 200), date: e.date })),
-      ];
+      const hits = recordUrgent(run, account, loadSnapshot(inbox));
       entry.steps.push("triage");
       return { account, urgent: hits.length, items: hits.slice(0, 50).map((e) => `${e.fromAddress} — ${e.subject.slice(0, 90)}`) };
     });
@@ -1979,6 +2114,11 @@ const commands = {
         const target = targetFolder(passName, ctx, inbox.policy.mode);
         const availability = passAvailability(passName);
         const complete = coverageComplete(entry, snapshot);
+        const wouldMove =
+          inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete;
+        // Undo advice only for a plan that would move something.
+        const advisory =
+          wouldMove && list.length ? destinationAdvisory(rules, run, inbox, { pass: passName, from: snapshot.folder, target, list }) : null;
         core.setOwn(run.previews, account, {
           ...(core.own(run.previews, account) || {}),
           [passName]: { contractDigest: entry.contractDigest, rulesRevision: run.rulesRevision, count: list.length, at: new Date().toISOString() },
@@ -1989,9 +2129,24 @@ const commands = {
           pass: passName,
           rule: PASSES[passName].describe(ctx),
           mode: inbox.policy.mode,
-          wouldMove:
-            inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete,
+          wouldMove,
+          from: snapshot.folder,
           target,
+          targetExists: advisory ? advisory.targetExists : null,
+          undoAdvisory: advisory
+            ? {
+                state: advisory.state,
+                reason: advisory.reason,
+                plannedCount: advisory.plannedCount,
+                ...(advisory.reason === "look-alike" ? { lookAlikeCount: advisory.lookAlikeCount } : {}),
+                checkedAt: advisory.checkedAt,
+              }
+            : null,
+          urgentLeftInPlace: {
+            total: urgent.length,
+            items: urgent.slice(0, URGENT_SHOWN).map((e) => ({ from: e.fromAddress, subject: e.subject.slice(0, 90) })),
+            more: Math.max(0, urgent.length - URGENT_SHOWN),
+          },
           excluded: inbox.policy.excludedPasses.includes(passName),
           ...(availability.skipReason ? { skipped: availability.skipReason } : {}),
           ...(availability.uncheckedSignals.length ? { uncheckedSignals: availability.uncheckedSignals } : {}),
@@ -2068,6 +2223,7 @@ const commands = {
             continue;
           }
           let moved = 0;
+          const undoAdvisory = advisoryFor(run, account, { pass: step.pass, from: snapshot.folder, target: to, list });
           if (!dryRun && list.length) {
             revalidate(run, rules, account);
             ensureFolder(rules, inbox, to);
@@ -2079,7 +2235,17 @@ const commands = {
             writeJson(snapshotFile(inbox), snapshot);
           }
           const unchecked = passAvailability(step.pass).uncheckedSignals;
-          run.passes.push({ account, pass: step.pass, ruleId: step.ruleId, moved, previewed: list.length, to, dryRun, ...(unchecked.length ? { uncheckedSignals: unchecked } : {}) });
+          run.passes.push({
+            account,
+            pass: step.pass,
+            ruleId: step.ruleId,
+            moved,
+            previewed: list.length,
+            to,
+            dryRun,
+            ...(moved ? { undoAdvisory } : {}),
+            ...(unchecked.length ? { uncheckedSignals: unchecked } : {}),
+          });
           results.push({ account, pass: step.pass, ruleId: step.ruleId, to, dryRun, moved, ...(unchecked.length ? { uncheckedSignals: unchecked } : {}), ...summarize(list) });
         }
         entry.steps.push("apply");
@@ -2165,6 +2331,12 @@ const commands = {
         suggestions: run.proposals.filter((p) => p.account === account).length,
         urgent: run.urgent.filter((u) => u.account === account).slice(0, 5).map((u) => ({ from: u.from, subject: u.subject })),
         urgentCount: run.urgent.filter((u) => u.account === account).length,
+        // A failed or missing read is never "nothing urgent".
+        urgentChecked: core.own(run.urgentChecks || {}, account)?.ok === true,
+        // Per destination moved into: what was known about undoing it before the move.
+        undoAdvisories: run.passes
+          .filter((p) => p.account === account && p.moved > 0)
+          .map((p) => ({ destination: p.to, state: p.undoAdvisory?.state || "unassessed", reason: p.undoAdvisory?.reason || null })),
       });
     }
     const outcomes = Object.values(accounts).map((a) => a.outcome);

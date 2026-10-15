@@ -13,6 +13,7 @@
  *                           listPipeHolderPage (that page answers, exits, and leaves a child
  *                           holding its stdout/stderr open for listSlowMs),
  *                           listStderrPage + listStderr (a custom failure),
+ *                           failFolderList (folder list fails, for destination checks),
  *                           listPages: { <page>: [rows as returned, valid or not] } } },
  *     calls: [ { op, account } ] }
  *
@@ -78,6 +79,7 @@ if (account.credential.kind === "secret") {
 
 const folders = account.folders;
 if (group === "folder" && action === "list") {
+  if (account.failFolderList) die("connection reset by peer");
   process.stdout.write(JSON.stringify(Object.keys(folders).map((name) => ({ name, desc: "" }))));
 } else if (group === "folder" && action === "add") {
   folders[rest[0]] = folders[rest[0]] || [];
