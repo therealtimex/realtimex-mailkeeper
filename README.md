@@ -31,7 +31,7 @@ Setup needs no other screen.
 
 - Scheduled runs apply only rules you have already approved, within each contract.
 - Everything else is listed as a suggestion. To act on a suggestion now, ask in chat.
-- Approving new automatic rules isn't available from chat or settings in this release.
+- Approving new automatic rules isn't available from chat or settings in this release. Approving or removing a rule, and Repair, must come from you in the RealTimeX app, not from an agent, and RealTimeX can't confirm that yet (realtimex-ai-app#2485). They'll arrive with the settings update (#7). Until then, MailKeeper refuses them from chat, terminals and other apps.
 
 ## Safety model
 
