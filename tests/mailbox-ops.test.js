@@ -1246,7 +1246,12 @@ test("a chat preview shows urgent items from the read itself, and the receipt ke
   ws.run("begin", "--run-id", "r1", "--account", "b");
   ws.run("snapshot", "--account", "b", "--run-id", "r1");
   const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
-  assert.deepEqual(preview.urgentLeftInPlace, { total: 1, items: [{ from: "noreply@billing.example", subject: "Final notice: payment overdue" }], more: 0 });
+  assert.deepEqual(preview.urgentLeftInPlace, {
+    checked: true,
+    total: 1,
+    items: [{ from: "noreply@billing.example", subject: "Final notice: payment overdue" }],
+    more: 0,
+  });
   const applied = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
   assert.equal(applied.results[0].moved, 2);
   assert.ok(ws.mailbox().accounts.b.folders.INBOX.some((m) => m.subject === "Final notice: payment overdue"), "urgent mail stays");
@@ -1270,6 +1275,39 @@ test("a newer read replaces earlier urgent results, a failed read is never nothi
   const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
   assert.deepEqual([submit.accounts.b.urgentChecked, submit.accounts.b.urgentCount], [false, 0]);
   assert.deepEqual([submit.accounts.a.urgentChecked, submit.accounts.a.urgentCount], [true, 1]);
+});
+
+test("a failed read stays not checked for urgent mail: triage, preview and a later run never fall back to an older read", () => {
+  const ws = twoInboxes();
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  ws.setFake("b", { listFailPage: 1 });
+  assert.equal(ws.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+  const triage = ws.run("triage", "--account", "b", "--run-id", "r1").json;
+  assert.deepEqual([triage.urgentChecked, triage.urgent], [false, null], "the older snapshot on disk isn't a current check");
+  assert.equal(ws.run_("r1").urgentChecks.b.ok, false, "triage doesn't promote the older read");
+  const preview = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual(preview.urgentLeftInPlace, { checked: false, total: null, items: [], more: 0 });
+  const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+  assert.deepEqual([submit.accounts.b.urgentChecked, submit.accounts.b.urgentCount], [false, 0]);
+
+  // A new run with only an older run's snapshot hasn't checked anything yet.
+  const later = twoInboxes();
+  later.run("begin", "--run-id", "r1", "--account", "b");
+  later.run("snapshot", "--account", "b", "--run-id", "r1");
+  later.run("submit", "--run-id", "r1", "--summary", "t");
+  later.run("begin", "--run-id", "r2", "--account", "b");
+  assert.deepEqual(later.run("triage", "--account", "b", "--run-id", "r2").json.urgentChecked, false);
+  assert.equal(later.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r2").json.urgentLeftInPlace.checked, false);
+  const r2 = later.run("submit", "--run-id", "r2", "--summary", "t").json;
+  assert.deepEqual([r2.accounts.b.urgentChecked, r2.accounts.b.urgentCount], [false, 0]);
+
+  // Triage after this run's own read reports that read's result.
+  const ok = twoInboxes();
+  ok.run("begin", "--run-id", "r1", "--account", "b");
+  ok.run("snapshot", "--account", "b", "--run-id", "r1");
+  const current = ok.run("triage", "--account", "b", "--run-id", "r1").json;
+  assert.deepEqual([current.urgentChecked, current.urgent, current.items], [true, 1, ["noreply@billing.example — Final notice: payment overdue"]]);
 });
 
 test("a preview lists at most ten urgent items and gives the total", () => {
@@ -1352,12 +1390,74 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   ws.run("snapshot", "--account", "b", "--run-id", "r1");
   const first = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
   assert.deepEqual([first.undoAdvisory.state, first.undoAdvisory.reason], ["no-obstacle", null]);
+  ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  // 399 + 10 in each folder: three pages each, six together, more than one undo reads.
   const second = ws.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
   assert.deepEqual([second.undoAdvisory.state, second.undoAdvisory.reason, second.undoAdvisory.combinedWith], ["limit", "combined-size", ["Auto/Notifications"]]);
   ws.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
   ws.run("submit", "--run-id", "r1", "--summary", "t");
   assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [
-    { destination: "Auto/Calendar", state: "limit", reason: "combined-size", combinedWith: ["Auto/Notifications"] },
+    { destination: "Auto/Notifications", confirmed: 10, state: "no-obstacle", reason: null },
+    { destination: "Auto/Calendar", confirmed: 10, state: "limit", reason: "combined-size", combinedWith: ["Auto/Notifications"] },
+  ]);
+
+  // A plan only previewed never counts: only Calendar received mail, and 409 fit.
+  const abandoned = twoInboxes({
+    b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
+  });
+  abandoned.run("begin", "--run-id", "r1", "--account", "b");
+  abandoned.run("snapshot", "--account", "b", "--run-id", "r1");
+  abandoned.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  const alone = abandoned.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
+  assert.deepEqual([alone.undoAdvisory.state, alone.undoAdvisory.reason, alone.undoAdvisory.combinedWith], ["no-obstacle", null, undefined]);
+  abandoned.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  abandoned.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(abandoned.receipt("r1").accounts.b.movedByDestination, { "Auto/Calendar": 10 });
+  assert.deepEqual(abandoned.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Calendar", confirmed: 10, state: "no-obstacle", reason: null }]);
+
+  // Both previewed first, then applied in turn: the second apply is weighed
+  // with the moves the first one confirmed, not with the earlier preview alone.
+  const both = twoInboxes({
+    b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
+  });
+  both.run("begin", "--run-id", "r1", "--account", "b");
+  both.run("snapshot", "--account", "b", "--run-id", "r1");
+  both.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  assert.equal(both.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.undoAdvisory.state, "no-obstacle");
+  const listed = both.mailbox().calls.length;
+  both.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  both.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  both.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(
+    both.receipt("r1").accounts.b.undoAdvisories.map((u) => [u.destination, u.state, u.reason]),
+    [
+      ["Auto/Notifications", "no-obstacle", null],
+      ["Auto/Calendar", "limit", "combined-size"],
+    ]
+  );
+  assert.equal(
+    both.mailbox().calls.slice(listed).filter((call) => call.op === "envelope list").length,
+    0,
+    "weighing at apply lists no folder again"
+  );
+
+  // A folder that received moves but was never sized leaves the next plan unknown, naming it.
+  const unsized = twoInboxes({
+    b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
+  });
+  unsized.run("begin", "--run-id", "r1", "--account", "b");
+  unsized.run("snapshot", "--account", "b", "--run-id", "r1");
+  unsized.setFake("b", { failFolderList: true });
+  assert.equal(unsized.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory.reason, "check-failed");
+  unsized.setFake("b", { failFolderList: false });
+  unsized.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  const named = unsized.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.undoAdvisory;
+  assert.deepEqual([named.state, named.reason, named.uncheckedWith], ["unknown", "combined-unknown", ["Auto/Notifications"]]);
+  unsized.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  unsized.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(unsized.receipt("r1").accounts.b.undoAdvisories, [
+    { destination: "Auto/Notifications", confirmed: 10, state: "unknown", reason: "check-failed" },
+    { destination: "Auto/Calendar", confirmed: 10, state: "unknown", reason: "combined-unknown", uncheckedWith: ["Auto/Notifications"] },
   ]);
 
   const used = twoInboxes({
@@ -1377,11 +1477,13 @@ test("the receipt carries the undo advice for moves made, and unassessed for sch
   ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
   ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
   ws.run("submit", "--run-id", "r1", "--summary", "t");
-  assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", state: "no-obstacle", reason: null }]);
+  assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", confirmed: 2, state: "no-obstacle", reason: null }]);
 
   const scheduled = twoInboxes();
   maintenance(scheduled, "r1");
-  assert.deepEqual(scheduled.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", state: "unassessed", reason: null }]);
+  assert.deepEqual(scheduled.receipt("r1").accounts.b.undoAdvisories.map((u) => [u.destination, u.state, u.reason]), [
+    ["Auto/Notifications", "unassessed", null],
+  ]);
 
   const changed = twoInboxes();
   changed.run("begin", "--run-id", "r1", "--account", "b");
@@ -1393,6 +1495,54 @@ test("the receipt carries the undo advice for moves made, and unassessed for sch
   changed.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
   changed.run("submit", "--run-id", "r1", "--summary", "t");
   assert.deepEqual(changed.receipt("r1").accounts.b.undoAdvisories.map((u) => u.state), ["unassessed"], "the advice was for a different plan");
+});
+
+test("a move stopped partway keeps the undo advice for the folder that received mail, and the skill asks for the check first", () => {
+  const many = Array.from({ length: 250 }, (_, i) => msg(100 + i, `noreply${i}@bulk.example`, `Promo ${i}`));
+  const ws = twoInboxes({ b: { messages: many, fake: { failMove: "unknown", failMoveAfter: 1 } } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.equal(ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory.state, "no-obstacle");
+  const applied = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([applied.code, applied.movedBeforeProblem], ["MAILKEEPER_MUTATION_UNCERTAIN", 200]);
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  const receipt = ws.receipt("r1").accounts.b;
+  assert.deepEqual([receipt.code, receipt.movedByDestination], ["MAILKEEPER_MUTATION_UNCERTAIN", { "Auto/Notifications": 200 }]);
+  assert.deepEqual(receipt.undoAdvisories, [{ destination: "Auto/Notifications", confirmed: 200, state: "no-obstacle", reason: null }]);
+
+  // Without advice, a folder that received mail still has its line.
+  const unadvised = twoInboxes({ b: { messages: many, fake: { failMove: "unknown", failMoveAfter: 1 } } });
+  maintenance(unadvised, "r1", ["b"]);
+  assert.deepEqual(unadvised.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Notifications", confirmed: 200, state: "unassessed", reason: null }]);
+
+  const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
+  assert.ok(
+    skill.includes(
+      "\"<n> moves into <folder> are confirmed. The server didn't confirm the rest, so I stopped. Ask me to check them; after that, you can ask this workspace's chat: “undo MailKeeper run <id>”.\""
+    )
+  );
+  assert.ok(skill.includes("never give the plain undo line for this inbox"));
+});
+
+test("undo advice is checked again when the plan's messages change, without a fresh allowance", () => {
+  const ws = twoInboxes({ b: { messages: [msg(1, "noreply@one.example", "First"), msg(2, "noreply@two.example", "Second")] } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const first = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory;
+  assert.equal(first.state, "no-obstacle");
+  assert.equal(ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory.checkedAt, first.checkedAt, "same read and plan: kept");
+  const allowance = ws.run_("r1").destinationChecks.b;
+
+  // Same UIDs, now two messages that look the same.
+  const twin = msg(1, "noreply@twin.example", "Same");
+  ws.setFake("b", { folders: { ...ws.mailbox().accounts.b.folders, INBOX: [twin, { ...twin, id: "2" }] } });
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const again = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory;
+  assert.deepEqual([again.state, again.reason, again.lookAlikeCount], ["limit", "look-alike", 2]);
+  assert.notEqual(again.checkedAt, first.checkedAt);
+  const after = ws.run_("r1").destinationChecks.b;
+  assert.equal(after.deadline, allowance.deadline, "the allowance isn't renewed");
+  assert.ok(after.pagesLeft < allowance.pagesLeft, "the new check spends the same allowance");
 });
 
 // ---------------------------------------------------------------------------

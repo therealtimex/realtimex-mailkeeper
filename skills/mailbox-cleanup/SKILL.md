@@ -149,12 +149,13 @@ A failure in one inbox is recorded for that inbox. Skip its remaining steps and 
 In a chat plan, from `preview`:
 - **Destination:** when `targetExists` is `false`, say "Auto/Notifications doesn't exist yet; I'll create it when moving." When it is `null`, say "I'll create Auto/Notifications if it doesn't exist." When it is `true`, say nothing.
 - **Move scope**, always for a plan that moves: "I'll move only these <n> messages, from <source folder> to <folder>." Use `from`, `target` and `count`. State these facts; never add guesses about how the move works.
-- **Urgent mail left in place:** "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. Without a successful read there's no plan, so never say "nothing urgent".
+- **Urgent mail left in place:** "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. When `urgentLeftInPlace.checked` is `false`, this read wasn't checked for urgent mail: say "I couldn't check work@example.com for urgent messages this time." Never say "nothing urgent" without a check.
 - **Undo advice:** when `undoAdvisory.state` isn't `no-obstacle`, put the matching line in the question you ask before applying:
   - `limit` with `size`: "MailKeeper may not be able to undo moves into <folder>: after these moves it would hold more messages than MailKeeper can check."
   - `limit` with `combined-size`: "MailKeeper may not be able to undo all of these moves: together, <folder> and <each of combinedWith> would hold more messages than MailKeeper can check in one undo."
   - `limit` with `look-alike`: "MailKeeper may not be able to undo <lookAlikeCount> of these moves: some messages in <folder> or in this plan look the same."
   - `unknown`: "MailKeeper may not be able to undo moves into <folder>: it couldn't fully check that folder just now."
+  - `unknown` with `combined-unknown`: "MailKeeper may not be able to undo all of these moves: it couldn't fully check <each of uncheckedWith>, which already received moves in this run."
 
   Never say a move "can" or "can't" be undone as a certainty.
 - **Inbox read only in part** (`preview` shows `reportOnly: "partial-coverage"`): "I've only checked part of work@example.com (<n> messages), so this plan covers those, and I won't move anything in it." Don't offer Move all for that inbox.
@@ -196,9 +197,10 @@ For each entry in an inbox's `ruleNotices`, add its line once:
 
 Never say every rule ran when an approved rule was skipped.
 
-When something moved, take the undo line from each inbox's `undoAdvisories`, one line per inbox and destination:
+When something moved, take the undo line from each inbox's `undoAdvisories`, one line per inbox and destination that received confirmed moves:
 - `no-obstacle` or `unassessed`: "To undo, ask this workspace's chat: “undo MailKeeper run <id>”. It will check first what can be undone."
 - `limit` or `unknown`: "MailKeeper may not be able to undo the moves into <folder>: <the reason from Chat>." For `combined-size`, name the folders together: "MailKeeper may not be able to undo all the moves into <folder> and <each of combinedWith>: together they would hold more messages than MailKeeper can check in one undo." Add the undo line too when other destinations had no obstacle.
+- **Stopped partway** (the inbox's `code` is `MAILKEEPER_MUTATION_UNCERTAIN`): each destination still gets its line, but undo comes after the check, never before. Use `confirmed` for <n>: "<n> moves into <folder> are confirmed. The server didn't confirm the rest, so I stopped. Ask me to check them; after that, you can ask this workspace's chat: “undo MailKeeper run <id>”." Keep any `limit` or `unknown` line for that folder, and never give the plain undo line for this inbox.
 
 Never promise that moves can be undone.
 
