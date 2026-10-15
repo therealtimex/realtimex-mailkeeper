@@ -151,7 +151,8 @@ In a chat plan, from `preview`:
 - **Move scope**, always for a plan that moves: "I'll move only these <n> messages, from <source folder> to <folder>." Use `from`, `target` and `count`. State these facts; never add guesses about how the move works.
 - **Urgent mail left in place:** "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. Without a successful read there's no plan, so never say "nothing urgent".
 - **Undo advice:** when `undoAdvisory.state` isn't `no-obstacle`, put the matching line in the question you ask before applying:
-  - `limit` with `size` or `combined-size`: "MailKeeper may not be able to undo moves into <folder>: after these moves it would hold more messages than MailKeeper can check."
+  - `limit` with `size`: "MailKeeper may not be able to undo moves into <folder>: after these moves it would hold more messages than MailKeeper can check."
+  - `limit` with `combined-size`: "MailKeeper may not be able to undo all of these moves: together, <folder> and <each of combinedWith> would hold more messages than MailKeeper can check in one undo."
   - `limit` with `look-alike`: "MailKeeper may not be able to undo <lookAlikeCount> of these moves: some messages in <folder> or in this plan look the same."
   - `unknown`: "MailKeeper may not be able to undo moves into <folder>: it couldn't fully check that folder just now."
 
@@ -197,7 +198,7 @@ Never say every rule ran when an approved rule was skipped.
 
 When something moved, take the undo line from each inbox's `undoAdvisories`, one line per inbox and destination:
 - `no-obstacle` or `unassessed`: "To undo, ask this workspace's chat: “undo MailKeeper run <id>”. It will check first what can be undone."
-- `limit` or `unknown`: "MailKeeper may not be able to undo the moves into <folder>: <the reason from Chat>." Add the undo line too when other destinations had no obstacle.
+- `limit` or `unknown`: "MailKeeper may not be able to undo the moves into <folder>: <the reason from Chat>." For `combined-size`, name the folders together: "MailKeeper may not be able to undo all the moves into <folder> and <each of combinedWith>: together they would hold more messages than MailKeeper can check in one undo." Add the undo line too when other destinations had no obstacle.
 
 Never promise that moves can be undone.
 

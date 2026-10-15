@@ -1353,7 +1353,12 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   const first = ws.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
   assert.deepEqual([first.undoAdvisory.state, first.undoAdvisory.reason], ["no-obstacle", null]);
   const second = ws.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
-  assert.deepEqual([second.undoAdvisory.state, second.undoAdvisory.reason], ["limit", "combined-size"]);
+  assert.deepEqual([second.undoAdvisory.state, second.undoAdvisory.reason, second.undoAdvisory.combinedWith], ["limit", "combined-size", ["Auto/Notifications"]]);
+  ws.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [
+    { destination: "Auto/Calendar", state: "limit", reason: "combined-size", combinedWith: ["Auto/Notifications"] },
+  ]);
 
   const used = twoInboxes({
     b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(900, 5001), "Auto/Calendar": [] } },

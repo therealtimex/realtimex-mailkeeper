@@ -1278,9 +1278,10 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list }) {
           else advisory.reason = listing.stopReason === "budget" ? "allowance-used" : listing.stopReason || "check-failed";
         } else {
           advisory.pagesNeeded = Math.floor((existing.length + list.length) / BATCH) + 1;
-          const others = Object.entries(allowance.advisories)
-            .filter(([destination, other]) => destination !== target && Number.isInteger(other.pagesNeeded))
-            .reduce((n, [, other]) => n + other.pagesNeeded, 0);
+          const otherFolders = Object.entries(allowance.advisories).filter(
+            ([destination, other]) => destination !== target && Number.isInteger(other.pagesNeeded)
+          );
+          const others = otherFolders.reduce((n, [, other]) => n + other.pagesNeeded, 0);
           const present = new Set(existing.map(fingerprint));
           const counts = new Map();
           for (const f of incoming) counts.set(f, (counts.get(f) || 0) + 1);
@@ -1290,7 +1291,8 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list }) {
           } else if (advisory.pagesNeeded > READ_PAGE_BUDGET) {
             Object.assign(advisory, { state: "limit", reason: "size" });
           } else if (advisory.pagesNeeded + others > READ_PAGE_BUDGET) {
-            Object.assign(advisory, { state: "limit", reason: "combined-size" });
+            // Together with this run's other destinations, one undo couldn't check them all.
+            Object.assign(advisory, { state: "limit", reason: "combined-size", combinedWith: otherFolders.map(([destination]) => destination) });
           } else {
             Object.assign(advisory, { state: "no-obstacle", reason: null });
           }
@@ -1315,7 +1317,12 @@ function advisoryFor(run, account, { pass, from, target, list }) {
     .update([pass, from, target, ...list.map((e) => e.uid).sort()].join("\n"))
     .digest("hex")
     .slice(0, 32);
-  return advisory.planKey === planKey ? { state: advisory.state, reason: advisory.reason } : { state: "unassessed", reason: null };
+  if (advisory.planKey !== planKey) return { state: "unassessed", reason: null };
+  return {
+    state: advisory.state,
+    reason: advisory.reason,
+    ...(advisory.reason === "combined-size" ? { combinedWith: advisory.combinedWith } : {}),
+  };
 }
 
 /**
@@ -2139,6 +2146,7 @@ const commands = {
                 reason: advisory.reason,
                 plannedCount: advisory.plannedCount,
                 ...(advisory.reason === "look-alike" ? { lookAlikeCount: advisory.lookAlikeCount } : {}),
+                ...(advisory.reason === "combined-size" ? { combinedWith: advisory.combinedWith } : {}),
                 checkedAt: advisory.checkedAt,
               }
             : null,
@@ -2336,7 +2344,12 @@ const commands = {
         // Per destination moved into: what was known about undoing it before the move.
         undoAdvisories: run.passes
           .filter((p) => p.account === account && p.moved > 0)
-          .map((p) => ({ destination: p.to, state: p.undoAdvisory?.state || "unassessed", reason: p.undoAdvisory?.reason || null })),
+          .map((p) => ({
+            destination: p.to,
+            state: p.undoAdvisory?.state || "unassessed",
+            reason: p.undoAdvisory?.reason || null,
+            ...(p.undoAdvisory?.combinedWith ? { combinedWith: p.undoAdvisory.combinedWith } : {}),
+          })),
       });
     }
     const outcomes = Object.values(accounts).map((a) => a.outcome);
