@@ -186,7 +186,9 @@ Never say every rule ran when an approved rule was skipped.
 
 Write only the per-inbox sections and, when something moved, the undo line. No error codes, no step names (snapshot, triage, apply, propose), and no notes about lessons, tools or this workspace's own instructions. A scheduled report is read in the maintenance thread, where no one may answer: wherever this skill says "ask me", say "ask this workspace's chat".
 
-When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good". Reply exactly `HEARTBEAT_OK` only when every inbox was checked in full (no `partial` outcome), nothing moved, nothing was suggested, nothing is urgent, nothing failed, no rule notice is owed, and no explanation is owed.
+When an inbox's effective behaviour is stricter than the user might expect, say why, for example "report only: its contract says so" or "report only until you review its contract". A partial run is never "completed" or "all good".
+
+For an inbox that only reports (`mode` is `report-only`, or its `outcome` is `partial`), the next action is about its urgent items ("Read the urgent items first"), or "No action needed" when there are none. Never invite acting on its suggestions, since a run there won't move them. You may add once: "MailKeeper only reports for this inbox, so it won't move these." Reply exactly `HEARTBEAT_OK` only when every inbox was checked in full (no `partial` outcome), nothing moved, nothing was suggested, nothing is urgent, nothing failed, no rule notice is owed, and no explanation is owed.
 
 If `submit` reports `effortNotApplied`, add one line: "Reasoning effort isn't applied because no model is selected in MailKeeper settings. Choose a model to use it." For an unsupported agent, say instead: "Reasoning effort isn't supported for <agent> by MailKeeper yet."
 
