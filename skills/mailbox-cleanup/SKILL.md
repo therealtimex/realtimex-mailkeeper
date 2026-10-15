@@ -147,10 +147,19 @@ A failure in one inbox is recorded for that inbox. Skip its remaining steps and 
 
 **In chat**, "run MailKeeper" means every selected inbox; naming an inbox narrows it to that one (`begin --account`). Run it here, in this chat; never start the heartbeat task instead (with Schedule Manual, MailKeeper skips a task started that way). Snapshot and triage each inbox, then preview: counts, top senders and sample subjects, never bodies. Preview together, with `--passes`, every plan for an inbox that one question will ask about. It returns `destinations` (each folder that receives messages, with the messages it really receives, in the order the moves run), the distinct total in `moveCount` (a message two plans match moves once, with the first), the undo lines in `undoWarnings`, and one entry per pass in `plans`. Ask once for the plan as shown: Move all <moveCount> / Choose which / Not now. After the yes, apply the chosen passes in the plan's order without asking again. If the person changes the selection or asks later, preview again and ask again as one question. On an uncertain move, stop and follow the check flow. After moving, say what moved, then the undo line from Reports. A chat run never approves future automatic behaviour. A report-only contract or workspace Mode means nothing moves, even when asked. Say so, and point to the contract.
 
-In a chat plan, from `preview`, for each entry of `destinations` (a folder that receives no messages isn't shown and gets no creation line; `plans[].matchedCount` is for diagnostics, never shown as the plan):
+In a chat plan, from `preview`. With `--passes`, every plan shares the inbox's one read, so take the inbox's fields (`urgentLeftInPlace`, `coverage`, `reportOnly`) from `plans[0]`; with `--pass` they are at the top level. `plans[].matchedCount` is for diagnostics, never shown as the plan.
+
+**Once per inbox**, even when nothing moves (`destinations` is empty); the check-off notices come from the plans that use that check:
+- **Urgent mail left in place**, from `urgentLeftInPlace`: "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. When `urgentLeftInPlace.checked` is `false`, this read wasn't checked for urgent mail: say "I couldn't check work@example.com for urgent messages this time." Never say "nothing urgent" without a check.
+- **Inbox read only in part** (`reportOnly: "partial-coverage"`, with <n> from `coverage.inboxRead`): "I've only checked part of work@example.com (<n> messages), so this plan covers those, and I won't move anything in it." Don't offer Move all for that inbox.
+- **Unsubscribe check off:** when the contract uses No-reply: "This version doesn't check for unsubscribe links. This plan uses the other available checks."
+- **Reply-history cleanups off:** when the contract uses them: "“Repeat senders” and “Personalized outreach” are off in this version, because MailKeeper can't yet read who you've written to. This plan uses the other available checks."
+
+**For each entry of `destinations`** (a folder that receives no messages isn't shown and gets no creation line):
 - **Destination:** when `targetExists` is `false`, say "Auto/Notifications doesn't exist yet; I'll create it when moving." When it is `null`, say "I'll create Auto/Notifications if it doesn't exist." When it is `true`, say nothing.
 - **Move scope:** "I'll move only these <n> messages, from <source folder> to <folder>." Use `from`, `target` and `count`, and take the examples from its `topSenders` and `sampleSubjects`. State these facts; never add guesses about how the move works.
-- **Urgent mail left in place:** "Left in work@example.com for you: <total> urgent messages." Then sender and subject for each of `urgentLeftInPlace.items`, and "…and <k> more." when `more` is above 0. When `urgentLeftInPlace.checked` is `false`, this read wasn't checked for urgent mail: say "I couldn't check work@example.com for urgent messages this time." Never say "nothing urgent" without a check.
+
+**Once per question, before its one yes:**
 - **Undo advice:** put each `undoWarnings[].text` in the question you ask before applying, as given. There is one line per folder and reason. Single-folder lines apply only when the union of this question's folders and this inbox's folders that already received moves in this run is one folder; otherwise the combined lines apply, and a combined line that names a folder replaces that folder's own "couldn't fully check" line. Size and look-alike lines always stay. The lines are:
   - size: "MailKeeper may not be able to undo moves into <folder>: after these moves it would hold more messages than MailKeeper can check."
   - look-alike: "MailKeeper may not be able to undo <lookAlikeCount> of these moves: some messages in <folder> or in this plan look the same."
@@ -160,9 +169,6 @@ In a chat plan, from `preview`, for each entry of `destinations` (a folder that 
   - combined unknown, a folder only in this question: "MailKeeper may not be able to undo all of these moves: it couldn't fully check <folder> just now."
 
   Never say a move "can" or "can't" be undone as a certainty.
-- **Inbox read only in part** (`preview` shows `reportOnly: "partial-coverage"`): "I've only checked part of work@example.com (<n> messages), so this plan covers those, and I won't move anything in it." Don't offer Move all for that inbox.
-- **Unsubscribe check off:** say once per plan, when the contract uses No-reply: "This version doesn't check for unsubscribe links. This plan uses the other available checks."
-- **Reply-history cleanups off:** say once per plan, when the contract uses them: "“Repeat senders” and “Personalized outreach” are off in this version, because MailKeeper can't yet read who you've written to. This plan uses the other available checks."
 
 When the person reviews or promotes an approved rule that this version skips or reduces, use the matching rule notice line from Reports.
 

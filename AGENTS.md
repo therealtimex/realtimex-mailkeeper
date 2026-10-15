@@ -60,7 +60,7 @@ npm run build:plugin
 - Keep mailbox mutations limited to moves into configured archive or `Auto/*` folders; never add delete, trash, reply, or server-side filter behavior.
 - Default to `report-only` and preserve the global mode ceiling. Maintenance executes only human-promoted rules; proposals never activate themselves.
 - Preserve VIP sender, protected domain, flagged-message, and urgency-triage exclusions in every pass. Workspace settings cannot override globally protected domains.
-- Run urgency triage before cleanup passes. Interactive applies require a dry-run preview and explicit human confirmation for each apply.
+- Run urgency triage before cleanup passes. Interactive applies require a dry-run preview and explicit human confirmation for each plan: one question covers the moves it lists; a changed or later selection is asked again.
 - Preserve one receipt per run, each moved UID and its account/source/destination, and the ability to undo across all affected accounts.
 - Treat each inbox contract (`mailboxes/<key>/MAILBOX.md`) as human-owned policy: seed it only when absent and never overwrite existing preferences. Never let one inbox's contract, rules, folders or credential affect another. Keep message bodies and credentials out of chat, logs, files and arguments; credentials reach Himalaya only through `himalaya-runner.js`/`himalaya-auth.js`.
 - Confine host capability access to `runtime/host.js`, using only the public plugin SDK; never import server internals (`@/`). Keep the workspace cleanup CLI self-contained: it may require only its sibling skill files.
