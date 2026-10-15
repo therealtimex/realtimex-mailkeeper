@@ -2318,9 +2318,9 @@ const commands = {
           const list = candidates(passName, ctx, snapshot, urgent);
           const target = targetFolder(passName, ctx, inbox.policy.mode);
           const availability = passAvailability(passName);
-          const wouldMove =
+          const eligible =
             inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete;
-          return { passName, list, target, availability, wouldMove };
+          return { passName, list, target, availability, eligible, assigned: [] };
         });
         // The plans that would move something, as one set of destinations. A
         // message two plans match moves once, with the first plan that takes it;
@@ -2328,13 +2328,15 @@ const commands = {
         const taken = new Set();
         const groups = new Map();
         for (const plan of plans) {
-          if (!plan.wouldMove || !plan.list.length) continue;
-          const group = groups.get(plan.target) || { target: plan.target, incoming: [] };
+          if (!plan.eligible || !plan.list.length) continue;
           for (const e of plan.list) {
             if (taken.has(e.uid)) continue;
             taken.add(e.uid);
-            group.incoming.push(e);
+            plan.assigned.push(e);
           }
+          if (!plan.assigned.length) continue;
+          const group = groups.get(plan.target) || { target: plan.target, incoming: [] };
+          group.incoming.push(...plan.assigned);
           groups.set(plan.target, group);
         }
         const planned = new Map();
@@ -2356,8 +2358,11 @@ const commands = {
           if (!group?.check) return null;
           return { ...group.check, ...(group.check.state === "no-obstacle" ? weigh(set, target) : {}) };
         };
-        const results = plans.map(({ passName, list, target, availability, wouldMove }) => {
-          const advisory = wouldMove && list.length ? adviceFor(target) : null;
+        const results = plans.map(({ passName, list, target, availability, eligible, assigned }) => {
+          // What this plan moves in this question: the messages it takes, not
+          // those an earlier plan in the question moves first.
+          const wouldMove = eligible && assigned.length > 0;
+          const advisory = wouldMove ? adviceFor(target) : null;
           // Matches held back as "always ask first" (urgent hits are reported separately).
           const urgentUids = new Set(urgent.map((e) => e.uid));
           const confirmFirst = snapshot.envelopes.filter(
@@ -2403,13 +2408,23 @@ const commands = {
             coverage: snapshot.coverage || null,
             ...(complete ? {} : { reportOnly: "partial-coverage" }),
             confirmFirstLeftInPlace: confirmFirst,
-            ...summarize(list),
+            matchedCount: list.length,
+            ...(eligible && assigned.length < list.length ? { takenByEarlierPlan: list.length - assigned.length } : {}),
+            ...summarize(eligible ? assigned : list),
           };
         });
         // The lines for the one question, once per folder and reason.
         const warnings = undoWarnings(set, checked);
         if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings };
-        return { account, passes: passNames, moveCount: taken.size, undoWarnings: warnings, plans: results };
+        // What the person is shown: each destination that receives messages in
+        // this question, with the messages it really receives, in plan order.
+        const destinations = checked.map(({ target, incoming, check }) => ({
+          from: snapshot.folder,
+          target,
+          targetExists: check.targetExists,
+          ...summarize(incoming),
+        }));
+        return { account, passes: passNames, moveCount: taken.size, destinations, undoWarnings: warnings, plans: results };
       },
       { requestedMode: args.mode }
     );

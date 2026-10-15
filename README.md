@@ -24,7 +24,7 @@ Setup needs no other screen.
 
 - **Scheduled maintenance**: a plugin-owned heartbeat task, one per workspace, checks every selected inbox at the workspace cadence. Inboxes are checked one after another. Each applies only its own approved rules within its contract, and an inbox that can't be reached doesn't stop the others. Each run posts one report, with a section per inbox, in the **MailKeeper maintenance** thread. With Schedule set to Manual, it runs only when you press Run on its heartbeat row or ask in chat.
   If you press Run and no report appears in the MailKeeper maintenance thread, check MailKeeper's status in its settings, or ask this workspace's chat to “run MailKeeper”. The chat tells you what's in the way.
-- **On request in chat**: "run MailKeeper" (all inboxes) or "clean up my work inbox" (one). The agent previews before any move and asks you for each one.
+- **On request in chat**: "run MailKeeper" (all inboxes) or "clean up my work inbox" (one). The agent previews before any move and asks you once for the plan it shows.
 - **Receipts and undo**: every run records each move with its inbox, source and destination. Ask in chat: "undo MailKeeper run <id>". Moved messages get new IDs in their destination, so undo finds them again by sender, subject and date, and tells you about any it can't match.
 
 **Approved rules and suggestions:**

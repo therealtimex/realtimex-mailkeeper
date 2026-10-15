@@ -1580,52 +1580,105 @@ test("plans asked about together count a shared folder once and a message two pl
   // No-reply both move there, and old no-reply mail matches both.
   const old = Array.from({ length: 10 }, (_, i) => msg(300 + i, `noreply@n${i}.example`, `Digest ${i}`, { age: 60 }));
   const aged = Array.from({ length: 5 }, (_, i) => msg(320 + i, `person${i}@people.example`, `Old note ${i}`, { age: 60 }));
+  const young = Array.from({ length: 3 }, (_, i) => msg(340 + i, `noreply@y${i}.example`, `New digest ${i}`));
   const ws = twoInboxes({
     workspace: { mode: "archive-promoted", modeCeiling: "archive-promoted" },
     b: {
       policy: { mode: "archive-promoted", archiveFolder: "Auto/Notifications", ageThresholdDays: 30, credential: secretB },
-      messages: [...old, ...aged],
+      messages: [...old, ...aged, ...young],
       folders: { "Auto/Notifications": bulkInbox(980, 5001) },
     },
   });
   ws.run("begin", "--run-id", "r1", "--account", "b");
   ws.run("snapshot", "--account", "b", "--run-id", "r1");
   const question = ws.run("preview", "--account", "b", "--passes", "age,no-reply", "--run-id", "r1").json;
-  assert.deepEqual(question.plans.map((p) => [p.pass, p.target, p.count]), [
-    ["age", "Auto/Notifications", 15],
-    ["no-reply", "Auto/Notifications", 10],
+  // Each message once, with the plan that moves it first.
+  assert.deepEqual(question.plans.map((p) => [p.pass, p.target, p.count, p.matchedCount, p.takenByEarlierPlan]), [
+    ["age", "Auto/Notifications", 15, 15, undefined],
+    ["no-reply", "Auto/Notifications", 3, 13, 10],
   ]);
-  // 980 + 15 distinct messages is five pages: fine. Counted twice, it would be six, or ten.
-  assert.equal(question.moveCount, 15);
+  assert.equal(question.moveCount, 18);
+  assert.deepEqual(question.destinations.map((d) => [d.target, d.count]), [["Auto/Notifications", 18]]);
+  // 980 + 18 distinct messages is five pages: fine. Counted twice, it would be six, or ten.
   assert.deepEqual(question.plans.map((p) => [p.undoAdvisory.state, p.undoAdvisory.plannedCount]), [
-    ["no-obstacle", 15],
-    ["no-obstacle", 15],
+    ["no-obstacle", 18],
+    ["no-obstacle", 18],
   ]);
   assert.deepEqual(question.undoWarnings, []);
   assert.equal(listCalls(ws, "b", "Auto/Notifications").length, 5, "the folder is listed once: five pages");
+  assertShownIsMoved(ws, question);
+});
 
-  // Different folders: a no-reply receipt moves with the first plan only, and
-  // the second plan's apply still finds its advice.
-  const ws2 = twoInboxes({
-    b: {
-      messages: [msg(1, "noreply@shop.example", "Your receipt 1"), msg(2, "noreply@shop.example", "Your receipt 2"), msg(3, "orders@shop.example", "Your receipt 3")],
-      folders: { "Auto/Notifications": [], "Auto/Receipts": [] },
-    },
-  });
-  ws2.run("begin", "--run-id", "r1", "--account", "b");
-  ws2.run("snapshot", "--account", "b", "--run-id", "r1");
-  const both = ws2.run("preview", "--account", "b", "--passes", "no-reply,receipt", "--run-id", "r1").json;
-  assert.deepEqual([both.moveCount, both.plans.map((p) => p.count)], [3, [2, 3]]);
-  assert.deepEqual(both.plans.map((p) => p.undoAdvisory.plannedCount), [2, 1]);
-  ws2.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
-  ws2.run("apply", "--account", "b", "--pass", "receipt", "--run-id", "r1");
+/**
+ * Applies a question's plans in order and checks that what each plan and
+ * destination showed (count and sample messages) is what actually moved.
+ */
+function assertShownIsMoved(ws, question) {
+  const before = structuredClone(ws.mailbox().accounts.b.folders);
+  const received = new Map();
+  for (const plan of question.plans) {
+    const result = ws.run("apply", "--account", "b", "--pass", plan.pass, "--run-id", "r1").json.results[0];
+    assert.equal(result.moved, plan.count, `${plan.pass}: shown ${plan.count}, moved ${result.moved}`);
+    received.set(plan.target, (received.get(plan.target) || 0) + result.moved);
+  }
+  const after = ws.mailbox().accounts.b.folders;
+  const shownFolders = question.destinations.map((d) => d.target);
+  assert.deepEqual([...received].filter(([, n]) => n > 0).map(([target]) => target), shownFolders, "only folders that receive mail are shown");
+  for (const destination of question.destinations) {
+    const arrived = (after[destination.target] || []).slice((before[destination.target] || []).length);
+    assert.equal(arrived.length, destination.count, destination.target);
+    assert.deepEqual(
+      [...destination.sampleSubjects].sort(),
+      arrived.slice(0, 10).map((m) => `${m.from.addr} — ${m.subject}`).sort(),
+      `${destination.target}: the samples are the messages that arrived`
+    );
+  }
+  for (const target of Object.keys(after)) {
+    if (!shownFolders.includes(target) && !(target in before)) assert.fail(`${target} was created without being shown`);
+  }
+}
+
+test("what a question shows per destination is what the in-order applies move: partial and complete overlap", () => {
+  const receipts = (...rows) => twoInboxes({ b: { messages: rows, folders: { "Auto/Notifications": [] } } });
+  const start = (ws) => {
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    ws.run("snapshot", "--account", "b", "--run-id", "r1");
+    return ws.run("preview", "--account", "b", "--passes", "no-reply,receipt", "--run-id", "r1").json;
+  };
+
+  // Partial: two no-reply receipts go to Notifications, the third to Receipts.
+  const partial = receipts(msg(1, "noreply@shop.example", "Your receipt 1"), msg(2, "noreply@shop.example", "Your receipt 2"), msg(3, "orders@shop.example", "Your receipt 3"));
+  const some = start(partial);
+  assert.deepEqual([some.moveCount, some.plans.map((p) => [p.count, p.matchedCount])], [3, [[2, 2], [1, 3]]]);
+  assert.deepEqual(some.destinations.map((d) => [d.target, d.count, d.targetExists]), [
+    ["Auto/Notifications", 2, true],
+    ["Auto/Receipts", 1, false],
+  ]);
+  assert.deepEqual(some.destinations[1].sampleSubjects, ["orders@shop.example — Your receipt 3"]);
+  assert.deepEqual(some.plans.map((p) => p.undoAdvisory.plannedCount), [2, 1]);
+  assertShownIsMoved(partial, some);
   assert.deepEqual(
-    ws2.run_("r1").undoAdvice.map((u) => [u.to, u.state]),
+    partial.run_("r1").undoAdvice.map((u) => [u.to, u.state]),
     [
       ["Auto/Notifications", "no-obstacle"],
       ["Auto/Receipts", "no-obstacle"],
+    ],
+    "the second apply still finds its advice"
+  );
+
+  // Complete: every receipt is a no-reply one; Receipts is never shown or created.
+  const complete = receipts(msg(1, "noreply@shop.example", "Your receipt 1"), msg(2, "noreply@shop.example", "Your receipt 2"));
+  const all = start(complete);
+  assert.deepEqual(
+    all.plans.map((p) => [p.pass, p.wouldMove, p.count, p.matchedCount, p.takenByEarlierPlan, p.undoAdvisory, p.targetExists]),
+    [
+      ["no-reply", true, 2, 2, undefined, all.plans[0].undoAdvisory, true],
+      ["receipt", false, 0, 2, 2, null, null],
     ]
   );
+  assert.deepEqual([all.moveCount, all.destinations.map((d) => d.target)], [2, ["Auto/Notifications"]]);
+  assertShownIsMoved(complete, all);
+  assert.equal("Auto/Receipts" in complete.mailbox().accounts.b.folders, false);
 });
 
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {
