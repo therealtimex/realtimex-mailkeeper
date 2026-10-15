@@ -2,7 +2,7 @@
   "id": "com.realtimex.mailkeeper",
   "name": "realtimex-mailkeeper",
   "displayName": "RealTimeX MailKeeper",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "To start, ask this workspace's chat to “set up MailKeeper.” Then each inbox is kept tidy by its own contract, on a schedule or when you ask.",
   "author": {
     "name": "RealTimeX Team"
