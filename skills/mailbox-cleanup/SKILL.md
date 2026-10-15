@@ -172,7 +172,7 @@ One report per run. Give each inbox its own section, inbox name first, and say w
 > **personal@example.com:** not checked. I couldn't sign in. Nothing was changed. → Check the Login "MailKeeper – personal@example.com" in Settings → Secrets, then ask this workspace's chat to run MailKeeper.
 > To undo this run, ask this workspace's chat: "undo MailKeeper run 7f3a".
 
-When `coverage.folder` isn't `INBOX`, the run read only that folder: name it in every coverage line, chat plan included, as "work@example.com, folder “Receipts”: checked in full (<n> messages)", and never present it as the whole inbox.
+When `coverage.folder` is present, not empty and isn't `INBOX`, the run read only that folder: name it in every coverage line, chat plan included, as "work@example.com, folder “Receipts”: checked in full (<n> messages)", and never present it as the whole inbox. A missing or empty `folder` is unknown: don't name a folder, and don't claim the whole inbox was checked either.
 
 An inbox whose `outcome` is `partial` was read only in part, so nothing was moved in it. Use `coverage.inboxRead` for <n>:
 - `coverage.stopReason` is `budget` or `deadline`: "work@example.com: checked <n> messages. MailKeeper couldn't finish checking this inbox within this check's limit, so it only reports for it. Nothing was changed."
