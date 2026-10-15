@@ -142,6 +142,11 @@ function makeWorkspace({ inboxes, promoted = [], workspace = {}, revision = 1 })
   return ws;
 }
 
+/** A fresh, random sign-in for the local IMAP stub; never a real credential. */
+function stubCredential(label) {
+  return ["mk", label, crypto.randomBytes(10).toString("hex")].join("-");
+}
+
 const secretA = { kind: "realtimex-secret", passwordRef: "secret://a-imap#password" };
 const secretB = { kind: "realtimex-secret", passwordRef: "secret://b-imap#password" };
 const ruleB = {
@@ -490,6 +495,97 @@ test("setup works before the inbox is selected and never overwrites a contract",
   assert.equal(ws.run("check", "--account", "nobody@example.com").json.code, "MAILKEEPER_ACCOUNT_NOT_FOUND", "an address is valid only when discovered");
   assert.equal(core.parseContract(draft, "c").policy.credential.passwordRef, "secret://a-imap#password");
   assertNoSecrets(ws);
+});
+
+test("contract-check works before the inbox is selected, without selecting it or granting an effective mode", () => {
+  const ws = twoInboxes();
+  const box = ws.mailbox();
+  box.accounts.c = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [], Archive: [], Sent: [] } };
+  box.accounts.d = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [] } };
+  fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
+  const rulesFile = path.join(ws.dir, ".mailkeeper", "rules.json");
+
+  // Setup step 3 in order, before Configure → Save: a new inbox beside a configured one.
+  assert.equal(ws.run("check", "--account", "c", "--password-ref", "secret://a-imap").json.ok, true);
+  assert.equal(ws.run("contract-init", "--account", "c", "--password-ref", "secret://a-imap").json.created, true);
+  assert.equal(ws.run("contract-set", "--account", "c", "--vip", "boss@example.com").json.ok, true);
+  const rulesBefore = fs.readFileSync(rulesFile, "utf8");
+  const unselected = ws.run("contract-check", "--account", "c").json;
+  assert.deepEqual(
+    [unselected.ok, unselected.selected, unselected.status, unselected.settings.mode, unselected.settings.effectiveMode, unselected.promotablePasses],
+    [true, false, "valid", "report-only", null, null]
+  );
+  assert.deepEqual(unselected.settings.vipSenders, ["boss@example.com"]);
+  assert.equal(fs.readFileSync(rulesFile, "utf8"), rulesBefore, "validating doesn't select the inbox or save settings");
+
+  // The selected inbox keeps its effective policy.
+  const selected = ws.run("contract-check", "--account", "a").json;
+  assert.deepEqual([selected.ok, selected.selected, selected.settings.effectiveMode], [true, true, "label-only"]);
+
+  // Before MailKeeper has any settings at all.
+  fs.renameSync(rulesFile, `${rulesFile}.away`);
+  const fresh = ws.run("contract-check", "--account", "c").json;
+  assert.deepEqual([fresh.ok, fresh.selected, fresh.settings.effectiveMode, fresh.workspaceVipSenders], [true, false, null, []]);
+  fs.renameSync(`${rulesFile}.away`, rulesFile);
+
+  // Existing failures stay failures, never "not selected".
+  assert.equal(ws.run("contract-check", "--account", "d").json.code, "MAILKEEPER_CONTRACT_INVALID", "no contract yet");
+  ws.writeRules({ accounts: { ...ws.rules.accounts, c: { key: "someone-else", contract: "mailboxes/someone-else/MAILBOX.md" } } });
+  assert.equal(ws.run("contract-check", "--account", "c").json.code, "MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH");
+  fs.writeFileSync(rulesFile, "{ not json");
+  assert.equal(ws.run("contract-check", "--account", "c").json.code, "MAILKEEPER_NOT_CONFIGURED");
+  assertNoSecrets(ws);
+});
+
+test("a connection check counts for setup only with the sign-in and server settings it used", () => {
+  const ws = twoInboxes();
+  const configFile = path.join(ws.dir, "himalaya.toml");
+  const stanzas = (aHost, bPassword) =>
+    [
+      "[accounts.a]",
+      'email = "a@example.com"',
+      `backend.host = "${aHost}"`,
+      "",
+      "[accounts.b]",
+      'email = "b@example.com"',
+      'backend.host = "imap.b.example"',
+      `backend.auth.raw = "${bPassword}"`,
+      "",
+    ].join("\n");
+  fs.writeFileSync(configFile, stanzas("imap.a.example", "first"));
+  const complete = () => Object.fromEntries(ws.run("status").json.inboxes.map((i) => [i.name, [i.setupComplete, i.lastCheck?.current ?? null]]));
+  ws.run("check", "--account", "a");
+  ws.run("check", "--account", "b");
+  assert.deepEqual(complete(), { a: [true, true], b: [true, true] });
+  assert.equal(fs.readFileSync(path.join(ws.dir, ".mailkeeper", "accounts", core.accountKey("b"), "check.json"), "utf8").includes("first"), false);
+
+  // Policy-only edits, and a changed password line, keep the check.
+  ws.run("contract-set", "--account", "a", "--vip", "boss@example.com");
+  fs.writeFileSync(configFile, stanzas("imap.a.example", "second"));
+  assert.deepEqual(complete(), { a: [true, true], b: [true, true] });
+
+  // A different Login, or different server settings, need a new check.
+  ws.run("contract-set", "--account", "a", "--password-ref", "secret://gone-login");
+  assert.deepEqual(complete().a, [false, false]);
+  assert.equal(ws.run("check", "--account", "a").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
+  assert.deepEqual(complete().a, [false, true], "the failed check is current, and not ok");
+  ws.run("contract-set", "--account", "a", "--password-ref", "secret://a-imap");
+  ws.run("check", "--account", "a");
+  assert.deepEqual(complete().a, [true, true]);
+  fs.writeFileSync(configFile, stanzas("imap.elsewhere.example", "second"));
+  assert.deepEqual(complete().a, [false, false]);
+
+  // A check made before the contract existed counts once the contract names the same Login.
+  const box = ws.mailbox();
+  box.accounts.c = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [] } };
+  fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
+  ws.run("check", "--account", "c", "--password-ref", "secret://a-imap");
+  ws.run("contract-init", "--account", "c", "--password-ref", "secret://a-imap");
+  ws.writeRules({
+    config: { ...ws.rules.config, emailAccounts: [...ws.rules.config.emailAccounts, "c"] },
+    accounts: { ...ws.rules.accounts, c: { key: core.accountKey("c"), contract: core.contractRelativePath(core.accountKey("c")) } },
+  });
+  assert.deepEqual(complete().c, [true, true], "the earlier check counts for the contract's Login");
 });
 
 test("contract-set changes only the settings block and never implies review consent", () => {
@@ -1416,15 +1512,14 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   assert.deepEqual(abandoned.receipt("r1").accounts.b.movedByDestination, { "Auto/Calendar": 10 });
   assert.deepEqual(abandoned.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Calendar", confirmed: 10, state: "no-obstacle", reason: null }]);
 
-  // Both previewed one at a time, then applied in turn: the moves the first
-  // apply confirmed count, and nothing is listed again.
+  // Both asked about in one question, then applied in turn: each move is
+  // weighed with what was confirmed by then, and nothing is listed again.
   const both = twoInboxes({
     b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
   });
   both.run("begin", "--run-id", "r1", "--account", "b");
   both.run("snapshot", "--account", "b", "--run-id", "r1");
-  both.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
-  assert.equal(both.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.undoAdvisory.state, "no-obstacle");
+  both.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
   const listed = both.mailbox().calls.length;
   both.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
   both.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
@@ -1434,7 +1529,7 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
       ["Auto/Notifications", "no-obstacle", null],
       ["Auto/Calendar", "limit", "combined-size"],
     ],
-    "before each move: what was confirmed by then"
+    "before each move: its own plan and what was confirmed by then"
   );
   both.run("submit", "--run-id", "r1", "--summary", "t");
   assert.deepEqual(
@@ -1703,9 +1798,99 @@ test("the receipt carries the undo advice for moves made, and unassessed for sch
   const box = changed.mailbox().accounts.b.folders;
   changed.setFake("b", { folders: { ...box, INBOX: [...box.INBOX, msg(77, "noreply@late.example", "Late arrival")] } });
   changed.run("snapshot", "--account", "b", "--run-id", "r1");
-  changed.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  // The plan shown is no longer the plan: nothing moves until it is shown again.
+  const refused = changed.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([refused.code, refused.established, refused.movedInQuestion], ["MAILKEEPER_PLAN_CHANGED", true, 0]);
+  assert.equal(changed.run_("r1").actions.length, 0);
+  assert.equal(changed.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.count, 3);
+  assert.equal(changed.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.results[0].moved, 3);
   changed.run("submit", "--run-id", "r1", "--summary", "t");
-  assert.deepEqual(changed.receipt("r1").accounts.b.undoAdvisories.map((u) => u.state), ["unassessed"], "the advice was for a different plan");
+  assert.deepEqual(changed.receipt("r1").accounts.b.undoAdvisories.map((u) => u.state), ["no-obstacle"], "advice for the plan shown again");
+});
+
+test("a chat apply moves only what the last question showed, in its order, from the same read", () => {
+  const calendar = Array.from({ length: 3 }, (_, i) => msg(400 + i, `p${i}@people.example`, `Accepted: Meeting ${i}`));
+  const setup = (messages = [...tenNoReply().slice(0, 2), ...calendar]) => {
+    const ws = twoInboxes({ b: { messages, folders: { "Auto/Notifications": [] } } });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    ws.run("snapshot", "--account", "b", "--run-id", "r1");
+    return ws;
+  };
+  const refusedWith = (ws, pass) => {
+    const before = structuredClone(ws.mailbox().accounts.b.folders);
+    const outcome = ws.run_("r1").accounts.b.outcome;
+    const answer = ws.run("apply", "--account", "b", "--pass", pass, "--run-id", "r1").json;
+    assert.deepEqual(ws.mailbox().accounts.b.folders, before, `${pass}: nothing moved and no folder created`);
+    assert.equal(ws.run_("r1").accounts.b.outcome, outcome, "a refusal doesn't change the inbox's outcome");
+    return [answer.code, answer.established, answer.movedInQuestion];
+  };
+
+  // A new message after the question: established, nothing moved yet.
+  const arrival = setup();
+  arrival.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  const box = arrival.mailbox().accounts.b.folders;
+  arrival.setFake("b", { folders: { ...box, INBOX: [...box.INBOX, msg(77, "noreply@late.example", "Late arrival")] } });
+  arrival.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.deepEqual(refusedWith(arrival, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", true, 0], "a new read ends the question; the new message is established");
+  arrival.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  assert.equal(arrival.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.results[0].moved, 3);
+
+  // The same contents read again, or a read that fails: the old question is gone.
+  const reread = setup();
+  reread.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  reread.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.deepEqual(refusedWith(reread, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", false, 0], "same contents: not established");
+  const failed = setup();
+  failed.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  failed.setFake("b", { listFailPage: 1 });
+  assert.equal(failed.run("snapshot", "--account", "b", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+  failed.setFake("b", { listFailPage: null });
+  assert.deepEqual(refusedWith(failed, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", false, 0], "a failed read leaves no approval");
+
+  // A narrower question drops a pass: that pass can't be applied from the older one.
+  const narrowed = setup();
+  narrowed.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  narrowed.run("preview", "--account", "b", "--passes", "calendar-response", "--run-id", "r1");
+  assert.deepEqual(refusedWith(narrowed, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", false, 0], "counted against the current question");
+  assert.equal(narrowed.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.results[0].moved, 3);
+
+  // Out of order, even with no shared messages: refused before Auto/Calendar is
+  // created; after the earlier pass, the later one moves what it showed.
+  const order = setup();
+  order.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  assert.deepEqual(refusedWith(order, "calendar-response"), ["MAILKEEPER_PLAN_CHANGED", false, 0]);
+  assert.equal("Auto/Calendar" in order.mailbox().accounts.b.folders, false);
+  assert.equal(order.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.results[0].moved, 2);
+  assert.equal(order.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.results[0].moved, 3);
+
+  // Part of a question moved, then the messages changed: established, with the
+  // question's confirmed count; earlier moves are kept.
+  const partway = setup();
+  partway.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  partway.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  const question = partway.run_("r1").questions.b;
+  const folders = partway.mailbox().accounts.b.folders;
+  partway.setFake("b", { folders: { ...folders, INBOX: [...folders.INBOX, msg(90, "q@people.example", "Accepted: Late meeting")] } });
+  partway.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.deepEqual(refusedWith(partway, "calendar-response"), ["MAILKEEPER_PLAN_CHANGED", true, 2]);
+  assert.equal(partway.run_("r1").actions.length, 2, "the question's earlier moves are kept");
+  assert.equal(partway.run_("r1").questions.b.id, question.id);
+
+  // No question to count against (a run from before this version): unknown, not zero.
+  const legacy = setup();
+  legacy.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  const runFile = path.join(legacy.dir, ".mailkeeper", "runs", "r1.json");
+  const stored = JSON.parse(fs.readFileSync(runFile, "utf8"));
+  delete stored.questions;
+  fs.writeFileSync(runFile, JSON.stringify(stored));
+  assert.deepEqual(refusedWith(legacy, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", false, null]);
+
+  // A pending or uncertain move still wins over a plan refusal.
+  const uncertain = setup();
+  uncertain.setFake("b", { failMove: "unknown" });
+  uncertain.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  assert.equal(uncertain.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
+  assert.equal(uncertain.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
 });
 
 test("a move stopped partway keeps the undo advice for the folder that received mail, and the skill asks for the check first", () => {
@@ -1787,7 +1972,7 @@ function cli(dir, args, env = {}) {
 }
 
 test("real Himalaya: a full page followed by the page past the end is a complete read", { skip: !HAS_HIMALAYA && "himalaya not installed" }, async () => {
-  const password = `mk-pages-${crypto.randomBytes(10).toString("hex")}`;
+  const password = stubCredential("pages");
   for (const [messages, pages] of [
     [0, 1],
     [200, 2],
@@ -1907,7 +2092,7 @@ test("account-config creates a missing settings file at the pinned location", { 
 });
 
 test("the setup path signs in through Secrets end to end, and discovery runs no auth command", { skip: !HAS_HIMALAYA && "himalaya not installed" }, async () => {
-  const password = `mk-e2e-${crypto.randomBytes(10).toString("hex")}`;
+  const password = stubCredential("e2e");
   const stub = await startImapStub({ user: "w@example.com", password });
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "mk-e2e-"));
   const configFile = path.join(home, "config.toml");

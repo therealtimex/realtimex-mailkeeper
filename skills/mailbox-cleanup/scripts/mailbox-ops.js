@@ -89,6 +89,7 @@ const MESSAGES = {
   MAILKEEPER_CONTRACT_REVIEW_REQUIRED: "This inbox's contract needs the user's review; only reporting until then.",
   MAILKEEPER_CONTRACT_INVALID: "This inbox's contract settings can't be read; only reporting until fixed.",
   MAILKEEPER_CONTRACT_CHANGED: "The contract or approved rules changed during this run; preview again before changing anything.",
+  MAILKEEPER_PLAN_CHANGED: "This move isn't part of the plan the person was last shown; show the current plan and ask again before moving anything.",
   MAILKEEPER_CREDENTIAL_UNAVAILABLE: "The saved password for this inbox can't be used.",
   MAILKEEPER_RTXEXEC_UNAVAILABLE: "The RealTimeX secret runner isn't available in this terminal.",
   MAILKEEPER_SESSION_UNAVAILABLE: "This terminal has no RealTimeX workspace session.",
@@ -1229,6 +1230,45 @@ const fingerprint = (e) => `${e.fromAddress}\n${String(e.subject).slice(0, 200)}
 /** One message as a plan sees it: its UID and its fingerprint. */
 const candidateKey = (e) => crypto.createHash("sha256").update(`${e.uid}\t${fingerprint(e)}`).digest("hex").slice(0, 16);
 
+/**
+ * Whether a chat apply of `pass` belongs to the inbox's current question (the
+ * last preview): same read, source, mode and destination, in the question's
+ * order (every earlier pass that takes messages applied first), and moving
+ * only messages shown for this pass. Fewer is fine; a new one never is.
+ * Otherwise it refuses, procedurally, with `established` (whether the
+ * messages this pass would take now differ from those it showed, compared
+ * assignment to assignment) and `movedInQuestion` (this question's confirmed
+ * moves, or null when there is no question to count them against).
+ */
+function planCheck(run, account, { pass, snapshot, mode, to, list, matchesOf }) {
+  const question = core.own(run.questions || {}, account);
+  const plan = question && core.own(question.plans, pass);
+  const keys = list.map(candidateKey);
+  let current =
+    Boolean(plan) && !question.endedAt && question.readId === snapshot.readId && question.from === snapshot.folder && question.mode === mode && plan.target === to;
+  const earlier = plan ? question.passes.slice(0, question.passes.indexOf(pass)) : [];
+  if (current) current = earlier.every((name) => !core.own(question.plans, name)?.shown.length || question.applied.includes(name));
+  const shown = new Set(plan?.shown || []);
+  if (current && keys.every((key) => shown.has(key))) return question;
+  const moved = question ? run.actions.filter((a) => a.account === account && a.question === question.id) : null;
+  let established = false;
+  if (plan && question.from === snapshot.folder && plan.target === to) {
+    // What this pass would take now in the question's order: its matches
+    // less those an earlier pass of the question takes first.
+    const taken = new Set(earlier.filter((name) => core.own(question.plans, name)?.eligible).flatMap((name) => matchesOf(name).map(candidateKey)));
+    const now = new Set(keys.filter((key) => !taken.has(key)));
+    const movedKeys = new Set(moved.map((a) => candidateKey({ uid: a.uid, fromAddress: a.fromAddress, subject: a.subject, date: a.date })));
+    established = [...now].some((key) => !shown.has(key)) || plan.shown.some((key) => !now.has(key) && !movedKeys.has(key));
+  }
+  throw failure("MAILKEEPER_PLAN_CHANGED", {
+    account,
+    procedural: true,
+    pass,
+    established,
+    movedInQuestion: moved ? moved.length : null,
+  });
+}
+
 /** One destination check: source, target, the accepted read, and the incoming messages. */
 function planKeyFor({ from, target, list, readId }) {
   return crypto
@@ -1785,6 +1825,55 @@ const DEFAULT_CAPS = {
  * the user selects the inbox in settings, so it needs only the inbox to be
  * in the email settings, never the workspace selection.
  */
+/** A contract's own settings, plain; `effectiveMode` is null until the inbox is selected. */
+function contractSettings(policy, effectiveMode) {
+  if (!policy) return null;
+  return {
+    mode: policy.mode,
+    effectiveMode,
+    ageThresholdDays: policy.ageThresholdDays,
+    aggressiveness: policy.aggressiveness,
+    vipSenders: policy.vipSenders,
+    excludedPasses: policy.excludedPasses,
+    archiveFolder: policy.archiveFolder,
+    sentFolder: policy.sentFolder,
+    signIn: policy.credential
+      ? policy.credential.kind === "realtimex-secret"
+        ? { kind: "realtimex-secret", login: policy.credential.passwordRef.replace(/^secret:\/\//, "").replace(/#.*$/, "") }
+        : { kind: "himalaya-native" }
+      : null,
+    reviewRequired: policy.reviewRequired,
+  };
+}
+
+/**
+ * What a connection check was made with: the sign-in (the Login reference or
+ * native) and a digest of this inbox's server settings in the email settings
+ * file. Password lines are left out of the digest, so no secret is hashed. A
+ * check counts for setup only while these still match.
+ */
+function connectionBinding(config, account, credential) {
+  let file = null;
+  let settings = null;
+  for (const candidate of config.paths || []) {
+    try {
+      const lines = fs.readFileSync(candidate, "utf8").split(/\r?\n/);
+      const stanza = findStanza(lines, account);
+      if (stanza.start === -1) continue;
+      const kept = lines.slice(stanza.start, stanza.end).filter((line) => !/(^|\.)(raw|password|passwd)$/.test(keyName(line) || ""));
+      file = candidate;
+      settings = crypto.createHash("sha256").update(kept.join("\n")).digest("hex").slice(0, 32);
+      break;
+    } catch {
+      // An unreadable file is no settings: compared as such.
+    }
+  }
+  const signIn = !credential ? null : credential.kind === "realtimex-secret" ? `secret:${credential.passwordRef}` : credential.kind;
+  return { signIn, file, settings };
+}
+
+const sameBinding = (a, b) => Boolean(a && b && a.signIn && a.signIn === b.signIn && a.file === b.file && a.settings === b.settings);
+
 function setupInbox(account) {
   if (!core.validAccountName(account)) throw failure("MAILKEEPER_ACCOUNT_NOT_FOUND");
   const rules = readJson(statePath("rules.json"));
@@ -1804,6 +1893,7 @@ function setupInbox(account) {
     text,
     contract: text === null ? null : core.parseContract(text, account),
     rules: rules?.schemaVersion === 2 ? rules : null,
+    config,
     caps: rules?.schemaVersion === 2 ? rules.config : DEFAULT_CAPS,
     selected: Boolean(rules?.config?.emailAccounts?.includes(account)),
   };
@@ -2028,37 +2118,47 @@ const commands = {
     });
   },
 
+  /**
+   * The inbox's contract as MailKeeper reads it. For an inbox selected here,
+   * with the workspace's limits applied (`effectiveMode`). Before the inbox is
+   * selected (setup step 3 comes before Configure → Save), it is validated
+   * the way setup reads it, with `selected: false` and no effective mode;
+   * validating never selects the inbox or saves settings. A malformed
+   * settings file, an identity mismatch or a missing contract still fail.
+   */
   "contract-check"(args) {
-    const rules = loadRules();
-    const inbox = inboxFor(rules, oneAccount(args));
-    const policy = inbox.contract.policy;
+    const account = oneAccount(args);
+    const stored = isFile(statePath("rules.json")) ? loadRules() : null;
+    if (stored && stored.config.emailAccounts.includes(account)) {
+      const inbox = inboxFor(stored, account);
+      output({
+        ok: inbox.contract.status === "valid",
+        account: inbox.account,
+        selected: true,
+        contract: inbox.contractPath,
+        status: inbox.contract.status,
+        ...(inbox.contract.code ? { code: inbox.contract.code, message: MESSAGES[inbox.contract.code] } : {}),
+        legacyContract: stored.legacyContract || null,
+        settings: contractSettings(inbox.contract.policy, inbox.policy.mode),
+        workspaceVipSenders: stored.config.vipSenders,
+        promotablePasses: inbox.policy.promotablePasses,
+      });
+      return;
+    }
+    const setup = setupInbox(account);
+    if (setup.text === null) throw failure("MAILKEEPER_CONTRACT_INVALID", { account, contract: setup.file.relative, reason: "contract missing" });
     output({
-      ok: inbox.contract.status === "valid",
-      account: inbox.account,
-      contract: inbox.contractPath,
-      status: inbox.contract.status,
-      ...(inbox.contract.code ? { code: inbox.contract.code, message: MESSAGES[inbox.contract.code] } : {}),
-      legacyContract: rules.legacyContract || null,
-      settings: policy
-        ? {
-            mode: policy.mode,
-            effectiveMode: inbox.policy.mode,
-            ageThresholdDays: policy.ageThresholdDays,
-            aggressiveness: policy.aggressiveness,
-            vipSenders: policy.vipSenders,
-            excludedPasses: policy.excludedPasses,
-            archiveFolder: policy.archiveFolder,
-            sentFolder: policy.sentFolder,
-            signIn: policy.credential
-              ? policy.credential.kind === "realtimex-secret"
-                ? { kind: "realtimex-secret", login: policy.credential.passwordRef.replace(/^secret:\/\//, "").replace(/#.*$/, "") }
-                : { kind: "himalaya-native" }
-              : null,
-            reviewRequired: policy.reviewRequired,
-          }
-        : null,
-      workspaceVipSenders: rules.config.vipSenders,
-      promotablePasses: inbox.policy.promotablePasses,
+      ok: setup.contract.status === "valid",
+      account: setup.account,
+      selected: false,
+      contract: setup.file.relative,
+      status: setup.contract.status,
+      ...(setup.contract.code ? { code: setup.contract.code, message: MESSAGES[setup.contract.code] } : {}),
+      legacyContract: stored?.legacyContract || null,
+      // The workspace's limits apply only once the inbox is selected and saved.
+      settings: contractSettings(setup.contract.policy, null),
+      workspaceVipSenders: stored ? stored.config.vipSenders : [],
+      promotablePasses: null,
     });
   },
 
@@ -2071,14 +2171,15 @@ const commands = {
     const setup = setupInbox(oneAccount(args));
     const credential = credentialFromArgs(args) ?? setup.contract?.policy?.credential ?? (setup.contract?.status === "review-required" ? { kind: "himalaya-native" } : null);
     const inbox = { account: setup.account, key: setup.key, policy: { credential } };
+    const binding = connectionBinding(setup.config, setup.account, credential);
     let folders;
     try {
       folders = folderNames(setup.rules, inbox);
     } catch (error) {
-      writeJson(checkFile(setup.key), { account: setup.account, ok: false, code: error.code, at: new Date().toISOString() });
+      writeJson(checkFile(setup.key), { account: setup.account, ok: false, code: error.code, binding, at: new Date().toISOString() });
       throw error;
     }
-    writeJson(checkFile(setup.key), { account: setup.account, ok: true, signIn: credential.kind, at: new Date().toISOString() });
+    writeJson(checkFile(setup.key), { account: setup.account, ok: true, signIn: credential.kind, binding, at: new Date().toISOString() });
     output({ ok: true, account: setup.account, changed: false, folders });
   },
 
@@ -2163,13 +2264,16 @@ const commands = {
       const { relative, target } = contractFile(key);
       const contract = isFile(target) ? core.parseContract(fs.readFileSync(target, "utf8"), name) : { status: "missing", code: null };
       const check = readJson(checkFile(key));
+      // A check counts only for the sign-in and server settings in use now.
+      const credential = contract.policy?.credential ?? (contract.status === "review-required" ? { kind: "himalaya-native" } : null);
+      const current = Boolean(check) && sameBinding(check.binding, connectionBinding(pinnedConfig(rules), name, credential));
       return {
         name,
         contract: relative,
         contractStatus: contract.status,
         code: contract.code,
-        lastCheck: check ? { ok: check.ok === true, at: check.at, code: check.code || null } : null,
-        setupComplete: agentChosen && contract.status === "valid" && check?.ok === true,
+        lastCheck: check ? { ok: check.ok === true, at: check.at, code: check.code || null, current } : null,
+        setupComplete: agentChosen && contract.status === "valid" && check?.ok === true && current,
       };
     });
     output({
@@ -2238,6 +2342,10 @@ const commands = {
       // filters can't be paged reliably, so every snapshot lists the folder
       // from the top within the read budget.
       clearUrgent(run, account, folder);
+      // A new read, even a failed one, ends the question shown from the last
+      // one; it is kept only to say what changed and what it already moved.
+      const shownQuestion = core.own(run.questions || {}, account);
+      if (shownQuestion && !shownQuestion.endedAt) shownQuestion.endedAt = new Date().toISOString();
       const budget = readBudget();
       const listing = listCapped(rules, inbox, folder, budget);
       const envelopes = listing.envelopes;
@@ -2413,6 +2521,22 @@ const commands = {
             ...summarize(eligible ? assigned : list),
           };
         });
+        // The question as shown: its passes in order, each with the messages it
+        // takes, bound to this read. It replaces any earlier question for the
+        // inbox; an apply must belong to it (see planCheck).
+        run.questions = run.questions || {};
+        core.setOwn(run.questions, account, {
+          id: crypto.randomBytes(8).toString("hex"),
+          readId: snapshot.readId || null,
+          from: snapshot.folder,
+          mode: inbox.policy.mode,
+          passes: passNames,
+          plans: Object.fromEntries(
+            plans.map(({ passName, target, eligible, assigned }) => [passName, { target, eligible, shown: eligible ? assigned.map(candidateKey) : [] }])
+          ),
+          applied: [],
+          at: new Date().toISOString(),
+        });
         // The lines for the one question, once per folder and reason.
         const warnings = undoWarnings(set, checked);
         if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings };
@@ -2494,6 +2618,9 @@ const commands = {
           }
           let moved = 0;
           const undoAdvisory = advisoryFor(run, account, { from: snapshot.folder, target: to, list, readId: snapshot.readId });
+          // A chat apply moves only what the person was shown, in the question's
+          // order; checked before any folder is created or message moved.
+          const question = !dryRun && step.ruleId === null ? planCheck(run, account, { pass: step.pass, snapshot, mode, to, list, matchesOf: (name) => candidates(name, ctx, snapshot, urgent) }) : null;
           if (!dryRun && list.length) {
             revalidate(run, rules, account);
             // Kept with the journal before any move, so a partway stop still
@@ -2501,13 +2628,18 @@ const commands = {
             run.undoAdvice = run.undoAdvice || [];
             run.undoAdvice.push({ account, to, pass: step.pass, ruleId: step.ruleId, ...undoAdvisory, at: new Date().toISOString() });
             ensureFolder(rules, inbox, to);
-            moved = moveChunks(run, rules, inbox, list, snapshot.folder, to, { pass: step.pass, ruleId: step.ruleId });
+            moved = moveChunks(run, rules, inbox, list, snapshot.folder, to, {
+              pass: step.pass,
+              ruleId: step.ruleId,
+              ...(question ? { question: question.id } : {}),
+            });
             // Drop moved messages from this inbox's cache by account and
             // source folder, not by UID alone.
             const movedUids = new Set(run.actions.filter((a) => a.account === account && a.from === snapshot.folder).map((a) => a.uid));
             snapshot.envelopes = snapshot.envelopes.filter((e) => !(e.folder === snapshot.folder && movedUids.has(e.uid)));
             writeJson(snapshotFile(inbox), snapshot);
           }
+          if (question) question.applied.push(step.pass);
           const unchecked = passAvailability(step.pass).uncheckedSignals;
           run.passes.push({
             account,
