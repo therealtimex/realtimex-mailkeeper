@@ -814,6 +814,7 @@ test("the read stops at five pages: only a short or empty last page is a complet
       verified: false,
       stopReason: complete ? null : "budget",
       code: null,
+      folder: "INBOX",
       inboxRead: size,
       replyHistory: "unavailable",
       unsubscribeSignal: "not-checked",
@@ -823,6 +824,20 @@ test("the read stops at five pages: only a short or empty last page is a complet
     assert.ok(calls.every((call) => call.query === ""), "never a filtered or dated query");
     assert.equal(ws.mailbox().calls.some((call) => call.folder === "Sent"), false, "Sent is not read");
   }
+});
+
+test("a folder-scoped read records its folder, so a complete folder is never read as the whole inbox", () => {
+  const folderMessages = [...standardInbox().slice(0, 2), msg(900, "colleague@people.example", "Stays")];
+  const ws = twoInboxes({ b: { messages: bulkInbox(1000), folders: { "Auto/Notifications": [], "MailKeeper Test": folderMessages } } });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  const inbox = ws.run("snapshot", "--account", "b", "--run-id", "r1").json;
+  assert.deepEqual([inbox.coverage.folder, inbox.coverage.complete, inbox.coverage.stopReason], ["INBOX", false, "budget"]);
+  const folder = ws.run("snapshot", "--account", "b", "--run-id", "r1", "--folder", "MailKeeper Test").json;
+  assert.deepEqual([folder.coverage.folder, folder.coverage.complete, folder.coverage.inboxRead], ["MailKeeper Test", true, 3]);
+  const applied = ws.run("apply", "--account", "b", "--promoted-only", "--run-id", "r1").json;
+  assert.deepEqual([applied.dryRun, applied.results[0].moved], [false, 2], "the folder's complete read allows its moves");
+  const submit = ws.run("submit", "--run-id", "r1", "--summary", "t").json;
+  assert.deepEqual([submit.accounts.b.outcome, submit.accounts.b.coverage.folder], ["completed", "MailKeeper Test"]);
 });
 
 test("a repeated page, an answer that isn't a list, or a later failure stops the read and keeps what was read", () => {

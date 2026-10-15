@@ -1921,6 +1921,8 @@ const commands = {
         verified: false,
         stopReason: listing.stopReason,
         code: listing.code || null,
+        // Which folder this coverage describes; reports name it when it isn't INBOX.
+        folder,
         inboxRead: envelopes.length,
         replyHistory: "unavailable",
         unsubscribeSignal: "not-checked",

@@ -41,8 +41,9 @@ const READ_STOP_REASONS = ["budget", "deadline", "no_progress", "overlap", "inva
 
 /**
  * Each inbox's outcome for the run list, from fixed values only: whether its
- * read reached a clear end, why it stopped when it didn't, and how many
- * messages it read. A partial inbox is never shown as checked in full.
+ * read reached a clear end, why it stopped when it didn't, how many messages
+ * it read and from which folder. A partial inbox is never shown as checked in
+ * full, and a folder's read never as the whole inbox's.
  */
 function inboxSummary(accounts) {
   const out = Object.create(null);
@@ -54,6 +55,7 @@ function inboxSummary(accounts) {
       readComplete: coverage ? coverage.complete === true : null,
       stopReason: READ_STOP_REASONS.includes(coverage?.stopReason) ? coverage.stopReason : null,
       inboxRead: Number.isInteger(coverage?.inboxRead) && coverage.inboxRead >= 0 ? coverage.inboxRead : null,
+      folder: typeof coverage?.folder === "string" && coverage.folder ? text(coverage.folder, 200) : null,
     };
   }
   return out;

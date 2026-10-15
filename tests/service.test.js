@@ -405,7 +405,7 @@ test("the run list carries each inbox's read coverage, from fixed values only", 
     runId: "run-1",
     outcome: "blocked",
     accounts: {
-      work: { outcome: "completed", coverage: { complete: true, stopReason: null, inboxRead: 42 } },
+      work: { outcome: "completed", coverage: { complete: true, stopReason: null, inboxRead: 42, folder: "Receipts" } },
       home: { outcome: "partial", coverage: { complete: false, stopReason: "budget", inboxRead: 1000, code: "x" } },
       odd: { outcome: "all good", coverage: { complete: "yes", stopReason: "<b>", inboxRead: -1 } },
     },
@@ -413,9 +413,9 @@ test("the run list carries each inbox's read coverage, from fixed values only", 
   const [run] = (await service.status(workspace)).recentRuns;
   assert.equal(run.outcome, "blocked");
   assert.deepEqual(run.inboxes, {
-    work: { outcome: "completed", readComplete: true, stopReason: null, inboxRead: 42 },
-    home: { outcome: "partial", readComplete: false, stopReason: "budget", inboxRead: 1000 },
-    odd: { outcome: null, readComplete: false, stopReason: null, inboxRead: null },
+    work: { outcome: "completed", readComplete: true, stopReason: null, inboxRead: 42, folder: "Receipts" },
+    home: { outcome: "partial", readComplete: false, stopReason: "budget", inboxRead: 1000, folder: null },
+    odd: { outcome: null, readComplete: false, stopReason: null, inboxRead: null, folder: null },
   });
 });
 
