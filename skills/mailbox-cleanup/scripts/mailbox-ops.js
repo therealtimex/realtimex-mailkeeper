@@ -1226,37 +1226,44 @@ function clearUrgent(run, account, folder) {
 
 const fingerprint = (e) => `${e.fromAddress}\n${String(e.subject).slice(0, 200)}\n${e.date}`;
 
-/** One plan: pass, source, target, the accepted read, and each candidate's UID and fingerprint. */
-function planKeyFor({ pass, from, target, list, readId }) {
+/** One message as a plan sees it: its UID and its fingerprint. */
+const candidateKey = (e) => crypto.createHash("sha256").update(`${e.uid}\t${fingerprint(e)}`).digest("hex").slice(0, 16);
+
+/** One destination check: source, target, the accepted read, and the incoming messages. */
+function planKeyFor({ from, target, list, readId }) {
   return crypto
     .createHash("sha256")
-    .update([pass, from, target, readId || "", ...list.map((e) => `${e.uid}\t${fingerprint(e)}`).sort()].join("\n"))
+    .update([from, target, readId || "", ...list.map(candidateKey).sort()].join("\n"))
     .digest("hex")
     .slice(0, 32);
 }
 
 /**
- * Whether moves into `target` could later be undone, as far as one bounded
- * check can tell now. It is advice for the person before they confirm, never
- * a promise and never a block. One allowance per inbox per run (five listing
- * pages, the same as undo's, and one minute from the first check, which also
- * bounds the folder list) covers every destination checked; it is never
- * renewed. Failures stay local: they make the advice unknown and never
- * fail the inbox or touch the source snapshot.
+ * What one bounded check can tell now about undoing moves of `list` into
+ * `target`, on its own: absent or present, too large, look-alikes, or
+ * unknown, with the folder's size for weigh(). It is advice for the person
+ * before they confirm, never a promise and never a block. One allowance per
+ * inbox per run (five listing pages, the same as undo's, and one minute from
+ * the first check, which also bounds the folder list) covers every check; it
+ * is never renewed, and an unchanged check is reused. Failures stay local:
+ * they make the advice unknown and never fail the inbox or touch the source
+ * snapshot.
  */
-function destinationAdvisory(rules, run, inbox, { pass, from, target, list, readId }) {
+function destinationAdvisory(rules, run, inbox, { from, target, list, readId }) {
   run.destinationChecks = run.destinationChecks || {};
   let allowance = core.own(run.destinationChecks, inbox.account);
   if (!allowance) {
-    allowance = { pagesLeft: READ_PAGE_BUDGET, deadline: null, advisories: {} };
+    allowance = { pagesLeft: READ_PAGE_BUDGET, deadline: null, advisories: {}, sizes: {} };
     core.setOwn(run.destinationChecks, inbox.account, allowance);
   }
-  const planKey = planKeyFor({ pass, from, target, list, readId });
-  const cached = core.own(allowance.advisories, target);
-  if (cached && cached.planKey === planKey) return { ...cached, ...withConfirmed(run, inbox.account, allowance, cached) };
+  const planKey = planKeyFor({ from, target, list, readId });
+  const cached = core.own(allowance.advisories, planKey);
+  if (cached) return cached;
 
   const advisory = {
     destination: target,
+    from,
+    readId: readId || null,
     plannedCount: list.length,
     checkedAt: new Date().toISOString(),
     targetExists: null,
@@ -1266,6 +1273,8 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list, read
     pagesNeeded: null,
     existingCount: null,
     confirmedAtCheck: 0,
+    tooLarge: false,
+    candidates: list.map(candidateKey),
     planKey,
   };
   const incoming = list.map(fingerprint);
@@ -1298,7 +1307,7 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list, read
         }
         if (!listing.complete) {
           // A full read limit means the folder is already too large to check.
-          if (listing.stopReason === "budget" && wholeAllowance) Object.assign(advisory, { state: "limit", reason: "size" });
+          if (listing.stopReason === "budget" && wholeAllowance) Object.assign(advisory, { state: "limit", reason: "size", tooLarge: true });
           else advisory.reason = listing.stopReason === "budget" ? "allowance-used" : listing.stopReason || "check-failed";
         } else {
           advisory.pagesNeeded = Math.floor((existing.length + list.length) / BATCH) + 1;
@@ -1315,7 +1324,7 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list, read
           } else if (advisory.pagesNeeded > READ_PAGE_BUDGET) {
             Object.assign(advisory, { state: "limit", reason: "size" });
           } else {
-            // Fine on its own; withConfirmed weighs it with this run's moves when read.
+            // Fine on its own; weigh() puts it together with the other folders.
             Object.assign(advisory, { state: "no-obstacle", reason: null });
           }
         }
@@ -1325,53 +1334,181 @@ function destinationAdvisory(rules, run, inbox, { pass, from, target, list, read
     advisory.reason = "check-failed";
   }
   allowance.pagesLeft = budget.pagesLeft;
-  core.setOwn(allowance.advisories, target, advisory);
-  return { ...advisory, ...withConfirmed(run, inbox.account, allowance, advisory) };
+  core.setOwn(allowance.advisories, planKey, advisory);
+  // The folder's latest size, for weighing it together with other folders.
+  allowance.sizes = allowance.sizes || {};
+  if (advisory.tooLarge || Number.isInteger(advisory.existingCount)) {
+    core.setOwn(allowance.sizes, target, {
+      existingCount: advisory.existingCount,
+      confirmedAtCheck: advisory.confirmedAtCheck,
+      tooLarge: advisory.tooLarge,
+    });
+  }
+  return advisory;
 }
 
-/**
- * An advisory as it stands now. A destination that is fine on its own is
- * weighed together with the destinations that actually received moves in this
- * run so far, each sized from its own check plus the moves confirmed since; a
- * plan that was only previewed never counts. A destination that received
- * moves but was never sized makes the result unknown.
- */
-function withConfirmed(run, account, allowance, advisory) {
-  if (advisory.state !== "no-obstacle") return { state: advisory.state, reason: advisory.reason };
+function confirmedByDestination(run, account) {
   const confirmed = new Map();
   for (const action of run.actions) {
     if (action.account === account) confirmed.set(action.to, (confirmed.get(action.to) || 0) + 1);
   }
-  const pages = (check, planned) =>
-    Math.floor((check.existingCount + (confirmed.get(check.destination) || 0) - check.confirmedAtCheck + planned) / BATCH) + 1;
-  let total = pages(advisory, advisory.plannedCount);
-  if (total > READ_PAGE_BUDGET) return { state: "limit", reason: "size" };
-  const combinedWith = [];
-  const uncheckedWith = [];
-  for (const destination of confirmed.keys()) {
-    if (destination === advisory.destination) continue;
-    const other = core.own(allowance.advisories, destination);
-    if (other && Number.isInteger(other.existingCount)) {
-      total += pages(other, 0);
-      combinedWith.push(destination);
-    } else {
-      uncheckedWith.push(destination);
+  return confirmed;
+}
+
+/**
+ * The folders one undo of this inbox's run would have to check: those that
+ * received confirmed moves in this run (first), then `planned` (destination →
+ * distinct messages still to move: the plans asked about together). A plan
+ * that was only previewed never counts. Each folder is sized from its own
+ * check (`checks`, else this inbox's latest check of it) plus the moves
+ * confirmed into it since; a folder too large to list counts as more than one
+ * undo reads, and one never sized is unsized.
+ */
+function undoSet(run, account, allowance, planned = new Map(), checks = new Map()) {
+  const confirmed = confirmedByDestination(run, account);
+  const folders = [...new Set([...confirmed.keys(), ...planned.keys()])];
+  const pages = new Map();
+  let total = 0;
+  for (const destination of folders) {
+    const check = checks.get(destination) || core.own(allowance?.sizes || {}, destination);
+    let n = null;
+    if (check?.tooLarge) n = READ_PAGE_BUDGET + 1;
+    else if (check && Number.isInteger(check.existingCount)) {
+      const count = check.existingCount + (confirmed.get(destination) || 0) - (check.confirmedAtCheck || 0) + (planned.get(destination) || 0);
+      n = Math.floor(count / BATCH) + 1;
     }
+    pages.set(destination, n);
+    if (n !== null) total += n;
   }
-  // Together, one undo couldn't check every folder that received mail.
-  if (total > READ_PAGE_BUDGET) return { state: "limit", reason: "combined-size", combinedWith };
-  if (uncheckedWith.length) return { state: "unknown", reason: "combined-unknown", uncheckedWith };
+  return { folders, confirmed, pages, total };
+}
+
+/**
+ * One folder's advice within its set (undoSet): too large on its own,
+ * together too large for one undo, unknown because another folder in the set
+ * was never sized (`uncheckedWith` when it already received moves, else
+ * `uncheckedInPlan`), or no obstacle.
+ */
+function weigh(set, target) {
+  const own = set.pages.get(target);
+  if (own === null || own === undefined) return { state: "unknown", reason: "check-failed" };
+  if (own > READ_PAGE_BUDGET) return { state: "limit", reason: "size" };
+  const others = set.folders.filter((destination) => destination !== target);
+  const combinedWith = others.filter((destination) => set.pages.get(destination) !== null);
+  if (set.total > READ_PAGE_BUDGET) return { state: "limit", reason: "combined-size", combinedWith };
+  const unsized = others.filter((destination) => set.pages.get(destination) === null);
+  if (unsized.length) {
+    const uncheckedWith = unsized.filter((destination) => set.confirmed.has(destination));
+    const uncheckedInPlan = unsized.filter((destination) => !set.confirmed.has(destination));
+    return {
+      state: "unknown",
+      reason: "combined-unknown",
+      ...(uncheckedWith.length ? { uncheckedWith } : {}),
+      ...(uncheckedInPlan.length ? { uncheckedInPlan } : {}),
+    };
+  }
   return { state: "no-obstacle", reason: null };
 }
 
-/** The advisory to carry into a receipt for moves actually made, or "unassessed". */
-function advisoryFor(run, account, { pass, from, target, list, readId }) {
+const folderList = (folders) => (folders.length < 2 ? folders.join("") : `${folders.slice(0, -1).join(", ")} and ${folders[folders.length - 1]}`);
+
+/**
+ * The lines to put before one yes (Product/UX, contract §5): one per folder
+ * and reason. Single-folder lines apply only when this question's folders and
+ * the folders that already received moves in this run are one folder;
+ * otherwise a combined line names the folders, and replaces a folder's own
+ * "couldn't fully check" line. Size and look-alike lines always stay.
+ */
+function undoWarnings(set, groups) {
+  const warnings = [];
+  const add = (reason, folders, text) => warnings.push({ reason, folders, text });
+  const together = set.folders.length > 1;
+  for (const { target, check } of groups) {
+    if (check.state === "limit" && check.reason === "size") {
+      add("size", [target], `MailKeeper may not be able to undo moves into ${target}: after these moves it would hold more messages than MailKeeper can check.`);
+    } else if (check.state === "limit" && check.reason === "look-alike") {
+      add(
+        "look-alike",
+        [target],
+        `MailKeeper may not be able to undo ${check.lookAlikeCount} of these moves: some messages in ${target} or in this plan look the same.`
+      );
+    } else if (check.state === "no-obstacle" && set.pages.get(target) > READ_PAGE_BUDGET) {
+      add("size", [target], `MailKeeper may not be able to undo moves into ${target}: after these moves it would hold more messages than MailKeeper can check.`);
+    } else if (check.state === "unknown" && !together) {
+      add("unknown", [target], `MailKeeper may not be able to undo moves into ${target}: it couldn't fully check that folder just now.`);
+    }
+  }
+  if (!together) return warnings;
+  const sized = set.folders.filter((destination) => set.pages.get(destination) !== null);
+  if (sized.length > 1 && set.total > READ_PAGE_BUDGET) {
+    add(
+      "combined-size",
+      sized,
+      `MailKeeper may not be able to undo all of these moves: together, ${folderList(sized)} would hold more messages than MailKeeper can check in one undo.`
+    );
+  }
+  const unsized = set.folders.filter((destination) => set.pages.get(destination) === null);
+  const received = unsized.filter((destination) => set.confirmed.has(destination));
+  const proposed = unsized.filter((destination) => !set.confirmed.has(destination));
+  if (received.length) {
+    add(
+      "combined-unknown",
+      received,
+      `MailKeeper may not be able to undo all of these moves: it couldn't fully check ${folderList(received)}, which already received moves in this run.`
+    );
+  }
+  if (proposed.length) {
+    add("combined-unknown", proposed, `MailKeeper may not be able to undo all of these moves: it couldn't fully check ${folderList(proposed)} just now.`);
+  }
+  return warnings;
+}
+
+/**
+ * The receipt's undo advice, per destination that received confirmed moves
+ * (even if a later chunk failed). A folder's own result is the one found
+ * before its moves; whether one undo could check it together with the others
+ * is weighed now, over the folders that actually received mail, so a plan
+ * that moved nothing is never named.
+ */
+function undoOutlook(run, account) {
+  const before = new Map();
+  for (const advice of run.undoAdvice || []) if (advice.account === account) before.set(advice.to, advice);
+  const checks = new Map([...before].filter(([, advice]) => advice.tooLarge || Number.isInteger(advice.existingCount)));
+  const set = undoSet(run, account, core.own(run.destinationChecks || {}, account), new Map(), checks);
+  return [...set.confirmed].map(([destination, confirmed]) => {
+    const advice = before.get(destination);
+    let outcome;
+    if (!advice || advice.state === "unassessed") outcome = { state: "unassessed", reason: null };
+    else if (advice.state === "no-obstacle" || String(advice.reason).startsWith("combined-")) outcome = weigh(set, destination);
+    else outcome = { state: advice.state, reason: advice.reason };
+    return { destination, confirmed, ...outcome };
+  });
+}
+
+/**
+ * The advice to record before moves actually made: the latest check from
+ * this read whose incoming messages include every one about to move (a plan
+ * asked about together with others, or one that lost messages to an earlier
+ * plan in the same question), else "unassessed".
+ */
+function advisoryFor(run, account, { from, target, list, readId }) {
   const allowance = core.own(run.destinationChecks || {}, account);
-  const advisory = allowance && core.own(allowance.advisories, target);
-  if (!advisory) return { state: "unassessed", reason: null };
-  if (advisory.planKey !== planKeyFor({ pass, from, target, list, readId })) return { state: "unassessed", reason: null };
-  // Weighed with the moves confirmed by now, which may have happened since the preview.
-  return withConfirmed(run, account, allowance, advisory);
+  if (!allowance || !readId) return { state: "unassessed", reason: null };
+  const keys = list.map(candidateKey);
+  const check = Object.values(allowance.advisories)
+    .filter((c) => c.destination === target && c.from === from && c.readId === readId && Array.isArray(c.candidates))
+    .filter((c) => {
+      const covered = new Set(c.candidates);
+      return keys.every((key) => covered.has(key));
+    })
+    .sort((x, y) => String(y.checkedAt).localeCompare(String(x.checkedAt)))[0];
+  if (!check) return { state: "unassessed", reason: null };
+  // The check's facts, weighed with the moves confirmed by now (which may have
+  // happened since the preview) and this plan's own.
+  const facts = { existingCount: check.existingCount, confirmedAtCheck: check.confirmedAtCheck, tooLarge: check.tooLarge };
+  if (check.state !== "no-obstacle") return { state: check.state, reason: check.reason, ...facts };
+  const set = undoSet(run, account, allowance, new Map([[target, list.length]]), new Map([[target, check]]));
+  return { ...weigh(set, target), ...facts };
 }
 
 /**
@@ -2159,71 +2296,120 @@ const commands = {
   },
 
   preview(args) {
+    // Several passes asked about in one question are one set of destinations:
+    // `--passes a,b`. `--pass a` is a set of one.
+    const passNames =
+      typeof args.passes === "string"
+        ? [...new Set(args.passes.split(",").map((name) => name.trim()).filter(Boolean))]
+        : [typeof args.pass === "string" ? args.pass : ""];
+    const unknown = passNames.filter((name) => !core.own(PASSES, name));
+    if (typeof args.passes === "string" && (!passNames.length || unknown.length)) {
+      throw failure("MAILKEEPER_OPERATION_FAILED", { procedural: true, reason: `unknown pass: ${unknown.join(", ") || "(none)"}` });
+    }
     perInbox(
       args,
       ({ rules, run, account, inbox, entry }) => {
-        const passName = typeof args.pass === "string" ? args.pass : "";
         const snapshot = loadSnapshot(inbox);
         const ctx = buildContext(rules, inbox, snapshot);
         const urgent = urgentHits(snapshot);
         const recorded = currentUrgent(run, account, snapshot);
-        const list = candidates(passName, ctx, snapshot, urgent);
-        // Matches held back as "always ask first" (urgent hits are reported separately).
-        const urgentUids = new Set(urgent.map((e) => e.uid));
-        const confirmFirst = snapshot.envelopes.filter(
-          (e) => !urgentUids.has(e.uid) && ctx.isConfirmFirst(e) && PASSES[passName].match(e, ctx)
-        ).length;
-        const target = targetFolder(passName, ctx, inbox.policy.mode);
-        const availability = passAvailability(passName);
         const complete = coverageComplete(entry, snapshot);
-        const wouldMove =
-          inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete;
-        // Undo advice only for a plan that would move something.
-        const advisory =
-          wouldMove && list.length
-            ? destinationAdvisory(rules, run, inbox, { pass: passName, from: snapshot.folder, target, list, readId: snapshot.readId })
-            : null;
-        core.setOwn(run.previews, account, {
-          ...(core.own(run.previews, account) || {}),
-          [passName]: { contractDigest: entry.contractDigest, rulesRevision: run.rulesRevision, count: list.length, at: new Date().toISOString() },
+        const plans = passNames.map((passName) => {
+          const list = candidates(passName, ctx, snapshot, urgent);
+          const target = targetFolder(passName, ctx, inbox.policy.mode);
+          const availability = passAvailability(passName);
+          const wouldMove =
+            inbox.policy.mode !== "report-only" && Boolean(target) && !inbox.policy.excludedPasses.includes(passName) && availability.available && complete;
+          return { passName, list, target, availability, wouldMove };
         });
-        entry.steps.push(`preview:${passName}`);
-        return {
-          account,
-          pass: passName,
-          rule: PASSES[passName].describe(ctx),
-          mode: inbox.policy.mode,
-          wouldMove,
-          from: snapshot.folder,
-          target,
-          targetExists: advisory ? advisory.targetExists : null,
-          undoAdvisory: advisory
-            ? {
-                state: advisory.state,
-                reason: advisory.reason,
-                plannedCount: advisory.plannedCount,
-                ...(advisory.reason === "look-alike" ? { lookAlikeCount: advisory.lookAlikeCount } : {}),
-                ...(advisory.reason === "combined-size" ? { combinedWith: advisory.combinedWith } : {}),
-                ...(advisory.reason === "combined-unknown" ? { uncheckedWith: advisory.uncheckedWith } : {}),
-                checkedAt: advisory.checkedAt,
-              }
-            : null,
-          urgentLeftInPlace: recorded
-            ? {
-                checked: true,
-                total: recorded.length,
-                items: recorded.slice(0, URGENT_SHOWN).map((e) => ({ from: e.from, subject: e.subject.slice(0, 90) })),
-                more: Math.max(0, recorded.length - URGENT_SHOWN),
-              }
-            : { checked: false, total: null, items: [], more: 0 },
-          excluded: inbox.policy.excludedPasses.includes(passName),
-          ...(availability.skipReason ? { skipped: availability.skipReason } : {}),
-          ...(availability.uncheckedSignals.length ? { uncheckedSignals: availability.uncheckedSignals } : {}),
-          coverage: snapshot.coverage || null,
-          ...(complete ? {} : { reportOnly: "partial-coverage" }),
-          confirmFirstLeftInPlace: confirmFirst,
-          ...summarize(list),
+        // The plans that would move something, as one set of destinations. A
+        // message two plans match moves once, with the first plan that takes it;
+        // passes into the same folder share one incoming set and one check.
+        const taken = new Set();
+        const groups = new Map();
+        for (const plan of plans) {
+          if (!plan.wouldMove || !plan.list.length) continue;
+          const group = groups.get(plan.target) || { target: plan.target, incoming: [] };
+          for (const e of plan.list) {
+            if (taken.has(e.uid)) continue;
+            taken.add(e.uid);
+            group.incoming.push(e);
+          }
+          groups.set(plan.target, group);
+        }
+        const planned = new Map();
+        const checks = new Map();
+        for (const group of groups.values()) {
+          // Undo advice only for a plan that would move something; each folder's
+          // own check comes from the inbox's one allowance.
+          if (group.incoming.length) {
+            group.check = destinationAdvisory(rules, run, inbox, { from: snapshot.folder, target: group.target, list: group.incoming, readId: snapshot.readId });
+            planned.set(group.target, group.incoming.length);
+            checks.set(group.target, group.check);
+          }
+        }
+        const checked = [...groups.values()].filter((group) => group.check);
+        // Then weighed together with the folders that already received moves in this run.
+        const set = undoSet(run, account, core.own(run.destinationChecks || {}, account), planned, checks);
+        const adviceFor = (target) => {
+          const group = groups.get(target);
+          if (!group?.check) return null;
+          return { ...group.check, ...(group.check.state === "no-obstacle" ? weigh(set, target) : {}) };
         };
+        const results = plans.map(({ passName, list, target, availability, wouldMove }) => {
+          const advisory = wouldMove && list.length ? adviceFor(target) : null;
+          // Matches held back as "always ask first" (urgent hits are reported separately).
+          const urgentUids = new Set(urgent.map((e) => e.uid));
+          const confirmFirst = snapshot.envelopes.filter(
+            (e) => !urgentUids.has(e.uid) && ctx.isConfirmFirst(e) && PASSES[passName].match(e, ctx)
+          ).length;
+          core.setOwn(run.previews, account, {
+            ...(core.own(run.previews, account) || {}),
+            [passName]: { contractDigest: entry.contractDigest, rulesRevision: run.rulesRevision, count: list.length, at: new Date().toISOString() },
+          });
+          entry.steps.push(`preview:${passName}`);
+          return {
+            account,
+            pass: passName,
+            rule: PASSES[passName].describe(ctx),
+            mode: inbox.policy.mode,
+            wouldMove,
+            from: snapshot.folder,
+            target,
+            targetExists: advisory ? advisory.targetExists : null,
+            undoAdvisory: advisory
+              ? {
+                  state: advisory.state,
+                  reason: advisory.reason,
+                  plannedCount: advisory.plannedCount,
+                  ...(advisory.reason === "look-alike" ? { lookAlikeCount: advisory.lookAlikeCount } : {}),
+                  ...(advisory.reason === "combined-size" ? { combinedWith: advisory.combinedWith } : {}),
+                  ...(advisory.uncheckedWith ? { uncheckedWith: advisory.uncheckedWith } : {}),
+                  ...(advisory.uncheckedInPlan ? { uncheckedInPlan: advisory.uncheckedInPlan } : {}),
+                  checkedAt: advisory.checkedAt,
+                }
+              : null,
+            urgentLeftInPlace: recorded
+              ? {
+                  checked: true,
+                  total: recorded.length,
+                  items: recorded.slice(0, URGENT_SHOWN).map((e) => ({ from: e.from, subject: e.subject.slice(0, 90) })),
+                  more: Math.max(0, recorded.length - URGENT_SHOWN),
+                }
+              : { checked: false, total: null, items: [], more: 0 },
+            excluded: inbox.policy.excludedPasses.includes(passName),
+            ...(availability.skipReason ? { skipped: availability.skipReason } : {}),
+            ...(availability.uncheckedSignals.length ? { uncheckedSignals: availability.uncheckedSignals } : {}),
+            coverage: snapshot.coverage || null,
+            ...(complete ? {} : { reportOnly: "partial-coverage" }),
+            confirmFirstLeftInPlace: confirmFirst,
+            ...summarize(list),
+          };
+        });
+        // The lines for the one question, once per folder and reason.
+        const warnings = undoWarnings(set, checked);
+        if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings };
+        return { account, passes: passNames, moveCount: taken.size, undoWarnings: warnings, plans: results };
       },
       { requestedMode: args.mode }
     );
@@ -2292,7 +2478,7 @@ const commands = {
             continue;
           }
           let moved = 0;
-          const undoAdvisory = advisoryFor(run, account, { pass: step.pass, from: snapshot.folder, target: to, list, readId: snapshot.readId });
+          const undoAdvisory = advisoryFor(run, account, { from: snapshot.folder, target: to, list, readId: snapshot.readId });
           if (!dryRun && list.length) {
             revalidate(run, rules, account);
             // Kept with the journal before any move, so a partway stop still
@@ -2406,21 +2592,8 @@ const commands = {
         urgentCount: run.urgent.filter((u) => u.account === account).length,
         // A failed or missing read is never "nothing urgent".
         urgentChecked: core.own(run.urgentChecks || {}, account)?.ok === true,
-        // Per destination that received confirmed moves (even if a later chunk
-        // failed): what was known about undoing it before the move.
-        undoAdvisories: [...run.actions.filter((a) => a.account === account).reduce((m, a) => m.set(a.to, (m.get(a.to) || 0) + 1), new Map())].map(
-          ([destination, confirmed]) => {
-            const advice = [...(run.undoAdvice || [])].reverse().find((a) => a.account === account && a.to === destination);
-            return {
-              destination,
-              confirmed,
-              state: advice?.state || "unassessed",
-              reason: advice?.reason || null,
-              ...(advice?.combinedWith ? { combinedWith: advice.combinedWith } : {}),
-              ...(advice?.uncheckedWith ? { uncheckedWith: advice.uncheckedWith } : {}),
-            };
-          }
-        ),
+        // Per destination that received confirmed moves (even if a later chunk failed).
+        undoAdvisories: undoOutlook(run, account),
       });
     }
     const outcomes = Object.values(accounts).map((a) => a.outcome);

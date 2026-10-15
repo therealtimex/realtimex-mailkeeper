@@ -1396,8 +1396,9 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   assert.deepEqual([second.undoAdvisory.state, second.undoAdvisory.reason, second.undoAdvisory.combinedWith], ["limit", "combined-size", ["Auto/Notifications"]]);
   ws.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
   ws.run("submit", "--run-id", "r1", "--summary", "t");
+  // The receipt weighs what actually moved: both folders, each naming the other.
   assert.deepEqual(ws.receipt("r1").accounts.b.undoAdvisories, [
-    { destination: "Auto/Notifications", confirmed: 10, state: "no-obstacle", reason: null },
+    { destination: "Auto/Notifications", confirmed: 10, state: "limit", reason: "combined-size", combinedWith: ["Auto/Calendar"] },
     { destination: "Auto/Calendar", confirmed: 10, state: "limit", reason: "combined-size", combinedWith: ["Auto/Notifications"] },
   ]);
 
@@ -1415,8 +1416,8 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   assert.deepEqual(abandoned.receipt("r1").accounts.b.movedByDestination, { "Auto/Calendar": 10 });
   assert.deepEqual(abandoned.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Calendar", confirmed: 10, state: "no-obstacle", reason: null }]);
 
-  // Both previewed first, then applied in turn: the second apply is weighed
-  // with the moves the first one confirmed, not with the earlier preview alone.
+  // Both previewed one at a time, then applied in turn: the moves the first
+  // apply confirmed count, and nothing is listed again.
   const both = twoInboxes({
     b: { messages: [...tenNoReply(), ...calendar()], folders: { "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) } },
   });
@@ -1427,11 +1428,19 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   const listed = both.mailbox().calls.length;
   both.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
   both.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  assert.deepEqual(
+    both.run_("r1").undoAdvice.map((u) => [u.to, u.state, u.reason]),
+    [
+      ["Auto/Notifications", "no-obstacle", null],
+      ["Auto/Calendar", "limit", "combined-size"],
+    ],
+    "before each move: what was confirmed by then"
+  );
   both.run("submit", "--run-id", "r1", "--summary", "t");
   assert.deepEqual(
     both.receipt("r1").accounts.b.undoAdvisories.map((u) => [u.destination, u.state, u.reason]),
     [
-      ["Auto/Notifications", "no-obstacle", null],
+      ["Auto/Notifications", "limit", "combined-size"],
       ["Auto/Calendar", "limit", "combined-size"],
     ]
   );
@@ -1468,6 +1477,155 @@ test("undo advice shares one allowance per inbox: two folders that only overflow
   assert.equal(used.run("preview", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.undoAdvisory.state, "no-obstacle");
   const after = used.run("preview", "--account", "b", "--pass", "calendar-response", "--run-id", "r1").json;
   assert.deepEqual([after.undoAdvisory.state, after.undoAdvisory.reason], ["unknown", "allowance-used"]);
+});
+
+test("plans asked about in one question are weighed together, and a later, narrower question isn't", () => {
+  const calendar = Array.from({ length: 10 }, (_, i) => msg(400 + i, `p${i}@people.example`, `Accepted: Meeting ${i}`));
+  const setup = (folders) => {
+    const ws = twoInboxes({ b: { messages: [...tenNoReply(), ...calendar], folders } });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    ws.run("snapshot", "--account", "b", "--run-id", "r1");
+    return ws;
+  };
+  const sized = () => ({ "Auto/Notifications": bulkInbox(399, 5001), "Auto/Calendar": bulkInbox(399, 7001) });
+
+  // Move all: both destinations together overflow one undo, before anything moved.
+  const all = setup(sized());
+  const question = all.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1").json;
+  assert.deepEqual(question.passes, ["no-reply", "calendar-response"]);
+  assert.deepEqual(
+    question.plans.map((p) => [p.pass, p.target, p.count, p.undoAdvisory.state, p.undoAdvisory.reason, p.undoAdvisory.combinedWith]),
+    [
+      ["no-reply", "Auto/Notifications", 10, "limit", "combined-size", ["Auto/Calendar"]],
+      ["calendar-response", "Auto/Calendar", 10, "limit", "combined-size", ["Auto/Notifications"]],
+    ]
+  );
+  assert.equal(question.moveCount, 20);
+  // What is said before the one yes: the combined line once, naming both folders.
+  assert.deepEqual(question.undoWarnings.map((w) => w.text), [
+    "MailKeeper may not be able to undo all of these moves: together, Auto/Notifications and Auto/Calendar would hold more messages than MailKeeper can check in one undo.",
+  ]);
+  assert.equal(all.run_("r1").destinationChecks.b.pagesLeft, 1, "one allowance: two pages per folder");
+  const allowance = all.run_("r1").destinationChecks.b;
+  const listedBefore = all.mailbox().calls.filter((call) => call.op === "envelope list").length;
+  const again = all.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1").json;
+  assert.deepEqual(again.undoWarnings, question.undoWarnings, "asking again gives the same lines");
+  assert.equal(all.mailbox().calls.filter((call) => call.op === "envelope list").length, listedBefore, "and lists nothing again");
+  assert.deepEqual(
+    [all.run_("r1").destinationChecks.b.pagesLeft, all.run_("r1").destinationChecks.b.deadline],
+    [allowance.pagesLeft, allowance.deadline],
+    "the allowance isn't renewed"
+  );
+  all.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  all.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  all.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(
+    all.receipt("r1").accounts.b.undoAdvisories.map((u) => [u.destination, u.reason, u.combinedWith]),
+    [
+      ["Auto/Notifications", "combined-size", ["Auto/Calendar"]],
+      ["Auto/Calendar", "combined-size", ["Auto/Notifications"]],
+    ]
+  );
+
+  // Choose which: either folder asked about on its own fits; the earlier question doesn't count.
+  const chosen = setup(sized());
+  chosen.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  const listed = chosen.mailbox().calls.filter((call) => call.op === "envelope list").length;
+  const notifications = chosen.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([notifications.plans[0].undoAdvisory.state, notifications.undoWarnings], ["no-obstacle", []]);
+  const narrower = chosen.run("preview", "--account", "b", "--passes", "calendar-response", "--run-id", "r1").json;
+  assert.deepEqual([narrower.plans[0].undoAdvisory.state, narrower.plans[0].undoAdvisory.reason, narrower.undoWarnings], ["no-obstacle", null, []]);
+  assert.equal(chosen.mailbox().calls.filter((call) => call.op === "envelope list").length, listed, "asking again lists nothing again");
+  chosen.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r1");
+  chosen.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.deepEqual(chosen.receipt("r1").accounts.b.undoAdvisories, [{ destination: "Auto/Calendar", confirmed: 10, state: "no-obstacle", reason: null }]);
+
+  // A folder in the question that couldn't be sized is named as part of this plan.
+  const short = setup({ "Auto/Notifications": bulkInbox(900, 5001), "Auto/Calendar": [] });
+  const partial = short.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1").json;
+  assert.deepEqual(
+    partial.plans.map((p) => [p.target, p.undoAdvisory.state, p.undoAdvisory.reason, p.undoAdvisory.uncheckedInPlan, p.undoAdvisory.uncheckedWith]),
+    [
+      ["Auto/Notifications", "unknown", "combined-unknown", ["Auto/Calendar"], undefined],
+      ["Auto/Calendar", "unknown", "allowance-used", undefined, undefined],
+    ]
+  );
+  // Only proposed, so never "already received moves"; and it replaces Calendar's own unknown line.
+  assert.deepEqual(partial.undoWarnings.map((w) => w.text), [
+    "MailKeeper may not be able to undo all of these moves: it couldn't fully check Auto/Calendar just now.",
+  ]);
+
+  // A later, separate yes: Notifications already received its 10, then Calendar is asked about.
+  const later = setup(sized());
+  later.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  later.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  const refreshed = later.run("preview", "--account", "b", "--passes", "calendar-response", "--run-id", "r1").json;
+  assert.deepEqual(refreshed.undoWarnings.map((w) => w.text), ["MailKeeper may not be able to undo all of these moves: together, Auto/Notifications and Auto/Calendar would hold more messages than MailKeeper can check in one undo."]);
+
+  const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
+  assert.ok(
+    skill.includes(
+      "Single-folder lines apply only when the union of this question's folders and this inbox's folders that already received moves in this run is one folder"
+    )
+  );
+  assert.ok(skill.includes("put each `undoWarnings[].text` in the question you ask before applying, as given"));
+
+  const bad = setup(sized());
+  assert.equal(bad.run("preview", "--account", "b", "--passes", "no-reply,nope", "--run-id", "r1").json.code, "MAILKEEPER_OPERATION_FAILED");
+  assert.equal(bad.run_("r1").accounts.b.outcome, null, "a mistyped pass doesn't fail the inbox");
+});
+
+test("plans asked about together count a shared folder once and a message two plans match once", () => {
+  // Same folder: in this inbox the archive is Auto/Notifications, so Age and
+  // No-reply both move there, and old no-reply mail matches both.
+  const old = Array.from({ length: 10 }, (_, i) => msg(300 + i, `noreply@n${i}.example`, `Digest ${i}`, { age: 60 }));
+  const aged = Array.from({ length: 5 }, (_, i) => msg(320 + i, `person${i}@people.example`, `Old note ${i}`, { age: 60 }));
+  const ws = twoInboxes({
+    workspace: { mode: "archive-promoted", modeCeiling: "archive-promoted" },
+    b: {
+      policy: { mode: "archive-promoted", archiveFolder: "Auto/Notifications", ageThresholdDays: 30, credential: secretB },
+      messages: [...old, ...aged],
+      folders: { "Auto/Notifications": bulkInbox(980, 5001) },
+    },
+  });
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  const question = ws.run("preview", "--account", "b", "--passes", "age,no-reply", "--run-id", "r1").json;
+  assert.deepEqual(question.plans.map((p) => [p.pass, p.target, p.count]), [
+    ["age", "Auto/Notifications", 15],
+    ["no-reply", "Auto/Notifications", 10],
+  ]);
+  // 980 + 15 distinct messages is five pages: fine. Counted twice, it would be six, or ten.
+  assert.equal(question.moveCount, 15);
+  assert.deepEqual(question.plans.map((p) => [p.undoAdvisory.state, p.undoAdvisory.plannedCount]), [
+    ["no-obstacle", 15],
+    ["no-obstacle", 15],
+  ]);
+  assert.deepEqual(question.undoWarnings, []);
+  assert.equal(listCalls(ws, "b", "Auto/Notifications").length, 5, "the folder is listed once: five pages");
+
+  // Different folders: a no-reply receipt moves with the first plan only, and
+  // the second plan's apply still finds its advice.
+  const ws2 = twoInboxes({
+    b: {
+      messages: [msg(1, "noreply@shop.example", "Your receipt 1"), msg(2, "noreply@shop.example", "Your receipt 2"), msg(3, "orders@shop.example", "Your receipt 3")],
+      folders: { "Auto/Notifications": [], "Auto/Receipts": [] },
+    },
+  });
+  ws2.run("begin", "--run-id", "r1", "--account", "b");
+  ws2.run("snapshot", "--account", "b", "--run-id", "r1");
+  const both = ws2.run("preview", "--account", "b", "--passes", "no-reply,receipt", "--run-id", "r1").json;
+  assert.deepEqual([both.moveCount, both.plans.map((p) => p.count)], [3, [2, 3]]);
+  assert.deepEqual(both.plans.map((p) => p.undoAdvisory.plannedCount), [2, 1]);
+  ws2.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  ws2.run("apply", "--account", "b", "--pass", "receipt", "--run-id", "r1");
+  assert.deepEqual(
+    ws2.run_("r1").undoAdvice.map((u) => [u.to, u.state]),
+    [
+      ["Auto/Notifications", "no-obstacle"],
+      ["Auto/Receipts", "no-obstacle"],
+    ]
+  );
 });
 
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {
