@@ -84,10 +84,10 @@ const MESSAGES = {
   MAILKEEPER_HIMALAYA_CONFIG_MISSING: "The email settings file doesn't exist yet.",
   MAILKEEPER_HIMALAYA_CONFIG_INVALID: "The email settings file has a problem that needs repair.",
   MAILKEEPER_ACCOUNT_NOT_FOUND: "This inbox isn't selected for the workspace or isn't in the email settings.",
-  MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH: "This inbox's contract or settings belong to a different inbox.",
+  MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH: "MailKeeper couldn't confirm it was using the right inbox.",
   MAILKEEPER_ACCOUNT_EXISTS: "The email settings already have an inbox entry with this name or address.",
   MAILKEEPER_CONTRACT_REVIEW_REQUIRED: "This inbox's contract needs the user's review; only reporting until then.",
-  MAILKEEPER_CONTRACT_INVALID: "This inbox's contract settings can't be read; only reporting until fixed.",
+  MAILKEEPER_CONTRACT_INVALID: "This inbox's contract settings can't be read.",
   MAILKEEPER_CONTRACT_CHANGED: "The contract or approved rules changed during this run; preview again before changing anything.",
   MAILKEEPER_PLAN_CHANGED: "This move isn't part of the plan the person was last shown; show the current plan and ask again before moving anything.",
   MAILKEEPER_CREDENTIAL_UNAVAILABLE: "The sign-in for this inbox can't be used.",
@@ -829,6 +829,15 @@ function lastJsonLine(stdout) {
 }
 
 /**
+ * Why an inbox has no sign-in to use: an unreadable contract reports its own
+ * problem, so the person isn't sent to set up a sign-in for the wrong reason.
+ */
+function noSignIn(inbox) {
+  if (inbox.contract?.status === "invalid") return failure(inbox.contract.code, { account: inbox.account, errorSource: "contract", contract: inbox.contractPath });
+  return failure("MAILKEEPER_CREDENTIAL_NOT_CONFIGURED", { account: inbox.account });
+}
+
+/**
  * Run one bounded operation for one inbox with that inbox's own credential.
  * A Secrets password is resolved by rtxexec into the runner's environment;
  * this process only ever handles the reference.
@@ -837,7 +846,7 @@ function mailboxOp(rules, inbox, op, opArgs = [], { mutating = false, deadlineAt
   const config = pinnedConfig(rules);
   if (config.missing) throw failure("MAILKEEPER_HIMALAYA_CONFIG_MISSING", { account: inbox.account });
   const credential = inbox.policy.credential;
-  if (!credential) throw failure("MAILKEEPER_CREDENTIAL_NOT_CONFIGURED", { account: inbox.account });
+  if (!credential) throw noSignIn(inbox);
 
   const runnerArgs = [
     RUNNER, op,
@@ -2314,7 +2323,7 @@ const commands = {
   check(args) {
     const setup = setupInbox(oneAccount(args));
     const credential = credentialFromArgs(args) ?? core.contractCredential(setup.contract);
-    const inbox = { account: setup.account, key: setup.key, policy: { credential } };
+    const inbox = { account: setup.account, key: setup.key, contract: setup.contract, contractPath: setup.file.relative, policy: { credential } };
     const binding = connectionBinding(setup.config, setup.account, credential);
     let folders;
     try {
@@ -3042,7 +3051,7 @@ const commands = {
     const inboxes = new Map();
     for (const account of accounts) {
       const inbox = inboxFor(rules, account);
-      if (!inbox.policy.credential) throw failure("MAILKEEPER_CREDENTIAL_NOT_CONFIGURED", { account });
+      if (!inbox.policy.credential) throw noSignIn(inbox);
       inboxes.set(account, inbox);
     }
     const undoRunId = `undo-${runId}`.slice(0, 80);
