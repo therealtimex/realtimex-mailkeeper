@@ -1,0 +1,26 @@
+# Checks for every push and pull request: the test suite (fakes and a local
+# IMAP stub only; no secrets, no live mail), the manifest syntax, and the
+# release package build. Nothing is installed: the package has no dependencies.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 20
+      - run: npm test
+      - run: npm run lint:manifest
+      - run: npm run build:plugin
