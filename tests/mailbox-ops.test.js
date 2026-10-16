@@ -902,13 +902,35 @@ test("the heartbeat readers agree with the host parser or say unknown", () => {
 
 test("the migration notice is owed once; the review status stays until confirmed", () => {
   const ws = makeWorkspace({ inboxes: { legacy: { contractText: "# old\n", fakeCredential: { kind: "native" } } } });
-  ws.writeRules({ legacyContract: "MAILBOX.md" });
+  // An approved rule for the inbox, with nothing recording that the 0.1
+  // conversion kept it: today's rules are no evidence, so it's unknown.
+  ws.writeRules({
+    legacyContract: "MAILBOX.md",
+    promoted: [{ id: "now", account: "legacy", pass: "no-reply", query: NOREPLY_QUERY, action: "move → Auto/Notifications" }],
+  });
+  const unrecorded = ws.run("begin", "--run-id", "r0").json;
+  assert.deepEqual([unrecorded.inboxes.legacy.migrationNotice, unrecorded.inboxes.legacy.rulesKept, unrecorded.legacyUnscopedRules], [true, null, null]);
+  ws.run("submit", "--run-id", "r0");
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "notices.json"), "{}");
+  ws.writeRules({
+    legacyUnscopedRules: 2,
+    legacyRulesKept: { legacy: 1 },
+    promoted: [{ id: "kept", account: "legacy", pass: "no-reply", query: NOREPLY_QUERY, action: "move → Auto/Notifications", scopedFrom: "v0.1.1-single-account" }],
+  });
   const first = ws.run("begin", "--run-id", "r1").json;
   assert.equal(first.inboxes.legacy.migrationNotice, true);
+  // What the migration recorded about approved rules, for the first report.
+  assert.deepEqual([first.inboxes.legacy.rulesKept, first.legacyUnscopedRules], [1, 2]);
   assert.equal(first.inboxes.legacy.code, "MAILKEEPER_CONTRACT_REVIEW_REQUIRED");
   ws.run("submit", "--run-id", "r1");
   const second = ws.run("begin", "--run-id", "r2").json;
   assert.equal(second.inboxes.legacy.migrationNotice, undefined);
+  assert.equal(second.inboxes.legacy.rulesKept, undefined, "the kept-rules fact comes with the first notice only");
+  assert.equal(second.legacyUnscopedRules, 2, "machine state on every begin; the skill speaks it with the first report only");
+  const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
+  assert.ok(skill.includes("Your approved rules for work@example.com are kept."));
+  assert.ok(skill.includes("MailKeeper couldn't establish which inbox <n> older approved rules belonged to. They're suggestions now, and MailKeeper won't apply them on its own."));
+  assert.equal(skill.includes("nothing will be moved. Your approved rules are kept."), false, "the generic notice makes no claim about rules");
   assert.equal(second.inboxes.legacy.code, "MAILKEEPER_CONTRACT_REVIEW_REQUIRED");
 });
 
@@ -2137,8 +2159,10 @@ test("account-security mail never enters a plan, Move all, an approved rule or a
   assert.equal(question.plans[0].sampleSubjects.some((line) => ACCOUNT_SECURITY.some(([, subject]) => line.includes(subject))), false);
   // Named for the person, left for them: those this question's pass would have taken
   // (the Microsoft sender isn't a no-reply address, so No-reply never matches it).
-  assert.equal(question.alwaysAskFirstLeftInPlace.total, security.length - 1);
-  assert.deepEqual(question.alwaysAskFirstLeftInPlace.items[0], { from: "no-reply@accounts.google.com", subject: "2-Step Verification turned on" });
+  const leftForYou = question.alwaysAskFirstLeftInPlace;
+  assert.equal(leftForYou.total, security.length - 1);
+  assert.deepEqual([leftForYou.groups.length, leftForYou.more], [10, 2], "ten groups shown, the rest counted");
+  assert.ok(leftForYou.groups.some((g) => g.from === "no-reply@accounts.google.com" && g.subject === "2-Step Verification turned on" && g.count === 1));
   assert.equal(chat.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.results[0].moved, 2);
   assert.deepEqual(left(chat), security.map((m) => m.subject).sort(), "every account-security message stays in the inbox");
 
@@ -2157,6 +2181,82 @@ test("account-security mail never enters a plan, Move all, an approved rule or a
   const suggested = reportOnly.run_("r1").proposals.filter((p) => p.pass === "no-reply");
   assert.deepEqual(suggested.map((p) => p.count), [6]);
   assert.equal(suggested[0].sampleSubjects.some((line) => ACCOUNT_SECURITY.some(([, subject]) => line.includes(subject))), false);
+});
+
+test("always-ask-first mail left in place is grouped exactly, and named in report-only runs too", () => {
+  const repeated = (n, id, from, subject) => Array.from({ length: n }, (_, i) => msg(id + i, from, subject));
+  const messages = [
+    ...repeated(5, 900, "no-reply@accounts.google.com", "Security alert"),
+    ...repeated(2, 910, "noreply@capy.ai", "New device signed in to your Capy account"),
+    ...repeated(2, 920, "noreply@bank.example", "Your password was changed"),
+    msg(930, "noreply@billing.example", "Final notice: payment overdue"), // urgent: listed only as urgent
+    ...tenNoReply().slice(0, 6),
+  ];
+  const groupsOf = (left) => left.groups.map((g) => [g.from, g.subject, g.count]);
+
+  // A chat plan: exact counts, most frequent first, ties by sender then subject.
+  const chat = twoInboxes({ b: { messages } });
+  chat.run("begin", "--run-id", "r1", "--account", "b");
+  chat.run("snapshot", "--account", "b", "--run-id", "r1");
+  const question = chat.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual(groupsOf(question.alwaysAskFirstLeftInPlace), [
+    ["no-reply@accounts.google.com", "Security alert", 5],
+    ["noreply@bank.example", "Your password was changed", 2],
+    ["noreply@capy.ai", "New device signed in to your Capy account", 2],
+  ]);
+  assert.deepEqual([question.alwaysAskFirstLeftInPlace.total, question.alwaysAskFirstLeftInPlace.more], [9, 0]);
+  assert.equal(question.plans[0].urgentLeftInPlace.total, 1, "the urgent one is only in the urgent list");
+
+  // A report-only chat run names the same mail from its suggestions.
+  const reportOnly = twoInboxes({ promoted: [], b: { messages, policy: { mode: "report-only", credential: secretB } } });
+  reportOnly.run("begin", "--run-id", "r1", "--account", "b");
+  reportOnly.run("snapshot", "--account", "b", "--run-id", "r1");
+  const proposed = reportOnly.run("propose", "--account", "b", "--run-id", "r1").json;
+  assert.deepEqual(groupsOf(proposed.alwaysAskFirstLeftInPlace), groupsOf(question.alwaysAskFirstLeftInPlace));
+  assert.equal(proposed.alwaysAskFirstLeftInPlace.total, 9);
+
+  // More than ten groups: total = the counts shown + more, counted in messages.
+  const many = twoInboxes({ b: { messages: Array.from({ length: 12 }, (_, i) => msg(900 + i, `noreply@n${i}.example`, `Security alert ${i}`)) } });
+  many.run("begin", "--run-id", "r1", "--account", "b");
+  many.run("snapshot", "--account", "b", "--run-id", "r1");
+  const capped = many.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1").json.alwaysAskFirstLeftInPlace;
+  assert.deepEqual([capped.total, capped.groups.length, capped.more], [12, 10, 2]);
+  assert.equal(capped.groups.reduce((n, g) => n + g.count, 0) + capped.more, capped.total);
+});
+
+test("status tells an urgent check that ran, one that didn't, and a run that recorded none apart", () => {
+  const ws = twoInboxes();
+  const urgentOf = () => ws.run("status").json.inboxes.find((inbox) => inbox.name === "b").lastRun.urgentChecked;
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.equal(urgentOf(), true);
+
+  // A read that failed: the run didn't check.
+  ws.setFake("b", { listFailPage: 1 });
+  ws.run("begin", "--run-id", "r2", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r2");
+  ws.run("submit", "--run-id", "r2", "--summary", "t");
+  assert.equal(urgentOf(), false);
+
+  // A run from before this version recorded no urgent result at all.
+  const file = path.join(ws.dir, ".mailkeeper", "runs", "r2.json");
+  const journal = JSON.parse(fs.readFileSync(file, "utf8"));
+  delete journal.accountsOutcome.b.urgentChecked;
+  fs.writeFileSync(file, JSON.stringify(journal));
+  assert.equal(urgentOf(), null);
+
+  const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
+  for (const line of [
+    "Left in work@example.com for you (always ask first): <total> messages. MailKeeper never moves these.",
+    "Nothing urgent in work@example.com: I checked and found none.",
+    "Set up: needs a fresh connection check. The last connection check for work@example.com was before this update.",
+    "No urgent-mail result is recorded for that run.",
+    "nothing was moved in their last runs",
+    "That stays true even if you change its contract.",
+  ]) {
+    assert.ok(skill.includes(line), line);
+  }
 });
 
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {

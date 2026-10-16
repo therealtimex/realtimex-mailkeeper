@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const FIXTURES = path.join(__dirname, "fixtures");
 const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "mk-service-"));
@@ -372,6 +373,9 @@ test("legacy unscoped approved rules are scoped only when one inbox is proven", 
   await single.service.provision(single.workspace);
   const scoped = single.store.get("ws-7-rules");
   assert.equal(scoped.promoted[0].account, "work");
+  assert.equal(scoped.promoted[0].scopedFrom, "v0.1.1-single-account");
+  const singleFile = JSON.parse(fs.readFileSync(path.join(single.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([singleFile.promoted.length, singleFile.legacyUnscopedRules, singleFile.legacyRulesKept], [1, 0, { work: 1 }]);
 
   const multi = harness({ config: { EMAIL_ACCOUNTS: ["work", "home"] } });
   multi.store.set("ws-7-profile", { emailAccounts: ["work", "home"] });
@@ -382,6 +386,87 @@ test("legacy unscoped approved rules are scoped only when one inbox is proven", 
   assert.equal(demoted.proposed[0].reviewRequired, true);
   const rulesFile = JSON.parse(fs.readFileSync(path.join(multi.dir, ".mailkeeper", "rules.json"), "utf8"));
   assert.deepEqual(rulesFile.promoted, []);
+  assert.deepEqual([rulesFile.legacyUnscopedRules, rulesFile.legacyRulesKept], [1, {}], "the disposition reaches the workspace");
+
+  // Mixed: an account-scoped rule is kept, an unscoped one becomes a suggestion.
+  const mixed = harness({ config: { EMAIL_ACCOUNTS: ["work", "home"] } });
+  mixed.store.set("ws-7-profile", { emailAccounts: ["work", "home"] });
+  mixed.store.set("ws-7-rules", {
+    revision: 3,
+    promoted: [
+      { id: "r1", pass: "no-reply", query: "q", action: "a", account: "home" },
+      { id: "r2", pass: "no-reply", query: "q", action: "a" },
+    ],
+    proposed: [],
+  });
+  await mixed.service.provision(mixed.workspace);
+  const mixedFile = JSON.parse(fs.readFileSync(path.join(mixed.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual(
+    [mixedFile.promoted.map((r) => [r.id, r.account]), mixedFile.legacyUnscopedRules, mixedFile.legacyRulesKept],
+    [[["r1", "home"]], 1, { home: 1 }]
+  );
+
+  // No recorded inbox history: the scope isn't inferred from today's selection.
+  const unknown = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  unknown.store.set("ws-7-profile", {});
+  unknown.store.set("ws-7-rules", { revision: 3, promoted: [{ id: "r1", pass: "no-reply", query: "q", action: "a" }], proposed: [] });
+  await unknown.service.provision(unknown.workspace);
+  const unknownFile = JSON.parse(fs.readFileSync(path.join(unknown.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([unknownFile.promoted, unknownFile.legacyUnscopedRules, unknownFile.legacyRulesKept], [[], 1, {}]);
+
+  // Already converted before this version: approved rules exist, but nothing
+  // records that the conversion kept them. Unknown, and never backfilled.
+  const earlier = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  earlier.store.set("ws-7-rules", {
+    schemaVersion: 2,
+    revision: 4,
+    promoted: [{ id: "r1", pass: "no-reply", query: "q", action: "a", account: "work" }],
+    proposed: [],
+  });
+  await earlier.service.provision(earlier.workspace);
+  await earlier.service.provision(earlier.workspace);
+  const earlierFile = JSON.parse(fs.readFileSync(path.join(earlier.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([earlierFile.promoted.length, earlierFile.legacyRulesKept], [1, null]);
+  assert.equal(earlier.store.get("ws-7-rules").legacyMigration, undefined);
+});
+
+test("the kept-rules record is exact for any inbox name, from the conversion through rules.json to begin", async () => {
+  const names = ["__proto__", "constructor", "toString"];
+  setMailbox(names);
+  const { service, dir, workspace, store } = harness({ config: { EMAIL_ACCOUNTS: names } });
+  fs.writeFileSync(path.join(dir, "MAILBOX.md"), "# Mailbox contract\n\nMy old shared rules.\n");
+  // All three were 0.1 inboxes, so each gets the copied contract and the first-report notice.
+  store.set("ws-7-profile", { emailAccounts: names });
+  store.set("ws-7-rules", {
+    revision: 3,
+    promoted: [
+      { id: "r1", pass: "no-reply", query: "q", action: "a" }, // no inbox: becomes a suggestion
+      { id: "r2", pass: "no-reply", query: "q", action: "a", account: "__proto__" },
+      { id: "r3", pass: "age", query: "q", action: "a", account: "toString" },
+      { id: "r4", pass: "no-reply", query: "q", action: "a", account: "toString" },
+      { id: "r5", pass: "no-reply", query: "q", action: "a", account: "constructor" },
+    ],
+    proposed: [],
+  });
+  await service.provision(workspace);
+
+  const kept = JSON.parse(fs.readFileSync(path.join(dir, ".mailkeeper", "rules.json"), "utf8")).legacyRulesKept;
+  assert.deepEqual(Object.keys(kept).sort(), [...names].sort());
+  for (const [name, count] of [["__proto__", 1], ["constructor", 1], ["toString", 2]]) {
+    assert.equal(core.own(kept, name), count, name);
+  }
+
+  const begun = spawnSync(process.execPath, [path.join(__dirname, "..", "skills", "mailbox-cleanup", "scripts", "mailbox-ops.js"), "begin", "--run-id", "r1"], {
+    cwd: dir,
+    encoding: "utf8",
+  });
+  const output = JSON.parse(begun.stdout);
+  const inboxes = output.inboxes;
+  assert.equal(output.legacyUnscopedRules, 1);
+  for (const [name, count] of [["__proto__", 1], ["constructor", 1], ["toString", 2]]) {
+    assert.equal(core.own(inboxes, name).migrationNotice, true, name);
+    assert.equal(core.own(inboxes, name).rulesKept, count, `${name}: its own count, nobody else's`);
+  }
 });
 
 test("receipts keep only account-scoped suggestions, idempotently", async () => {
