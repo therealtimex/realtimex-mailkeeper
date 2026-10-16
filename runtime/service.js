@@ -476,7 +476,12 @@ class MailKeeperService {
       ].join("\n");
       migrated = "copied";
     } else {
-      const policy = core.draftPolicy(name, config, { reviewRequired: fromLegacy });
+      // A v0.1.1 inbox signed in through its Himalaya entry: its draft keeps
+      // that sign-in. A new inbox gets none until its setup chooses one.
+      const policy = core.draftPolicy(name, config, {
+        reviewRequired: fromLegacy,
+        credential: fromLegacy ? { kind: "himalaya-native" } : null,
+      });
       const note = fromLegacy
         ? `\nYour old MAILBOX.md, which applied to all inboxes, is kept at the workspace root for reference but is no longer used. Review with the agent how its preferences apply to ${name}; until then MailKeeper only reports for this inbox.\n`
         : "";
