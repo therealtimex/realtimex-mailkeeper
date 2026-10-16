@@ -135,15 +135,11 @@ Once updating is safe, the first provision after the upgrade gives each selected
 - **One inbox:** its text is copied into that inbox's contract.
 - **Several inboxes:** each gets a conservative draft.
 
-Either way, each inbox stays report-only until you review its contract with the agent. Approved rules are kept for an inbox when the old setup had only one; otherwise they come back as suggestions.
+Either way, each inbox stays report-only until you review its contract with the agent. If you have approved rules, MailKeeper keeps those it can tie to an inbox. Rules whose inbox can't be established become suggestions, and MailKeeper won't apply them on its own.
 
-To roll back to 0.1:
+After installing or updating MailKeeper, quit RealTimeX completely and reopen it, so the update takes effect everywhere. Closing the window isn't enough.
 
-1. Disable MailKeeper for the workspace, so its scheduled task is removed.
-2. Install 0.1.
-3. Before you enable it again, reconcile the old shared `MAILBOX.md` with the inboxes you want: 0.1 doesn't read per-inbox contracts.
-
-Contracts and the run records in the workspace (`.mailkeeper/runs`) are kept either way; until realtimex-ai-app#2460 is fixed, a reinstall in either direction removes the in-app run history and approved rules.
+MailKeeper 0.1 can't read what this version records, so going back to 0.1 after updating isn't supported. If something isn't right, turn MailKeeper off for the workspace in Workspace Settings → Plugins. No new scheduled runs start, and your contracts, your old `MAILBOX.md` and the run records in the workspace stay. Then ask for help through Community & support in the RealTimeX sidebar.
 
 ## Development
 
