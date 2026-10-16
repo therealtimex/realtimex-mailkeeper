@@ -5,6 +5,7 @@ const assert = require("node:assert/strict");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
 const FIXTURES = path.join(__dirname, "fixtures");
 const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "mk-service-"));
@@ -427,6 +428,45 @@ test("legacy unscoped approved rules are scoped only when one inbox is proven", 
   const earlierFile = JSON.parse(fs.readFileSync(path.join(earlier.dir, ".mailkeeper", "rules.json"), "utf8"));
   assert.deepEqual([earlierFile.promoted.length, earlierFile.legacyRulesKept], [1, null]);
   assert.equal(earlier.store.get("ws-7-rules").legacyMigration, undefined);
+});
+
+test("the kept-rules record is exact for any inbox name, from the conversion through rules.json to begin", async () => {
+  const names = ["__proto__", "constructor", "toString"];
+  setMailbox(names);
+  const { service, dir, workspace, store } = harness({ config: { EMAIL_ACCOUNTS: names } });
+  fs.writeFileSync(path.join(dir, "MAILBOX.md"), "# Mailbox contract\n\nMy old shared rules.\n");
+  // All three were 0.1 inboxes, so each gets the copied contract and the first-report notice.
+  store.set("ws-7-profile", { emailAccounts: names });
+  store.set("ws-7-rules", {
+    revision: 3,
+    promoted: [
+      { id: "r1", pass: "no-reply", query: "q", action: "a" }, // no inbox: becomes a suggestion
+      { id: "r2", pass: "no-reply", query: "q", action: "a", account: "__proto__" },
+      { id: "r3", pass: "age", query: "q", action: "a", account: "toString" },
+      { id: "r4", pass: "no-reply", query: "q", action: "a", account: "toString" },
+      { id: "r5", pass: "no-reply", query: "q", action: "a", account: "constructor" },
+    ],
+    proposed: [],
+  });
+  await service.provision(workspace);
+
+  const kept = JSON.parse(fs.readFileSync(path.join(dir, ".mailkeeper", "rules.json"), "utf8")).legacyRulesKept;
+  assert.deepEqual(Object.keys(kept).sort(), [...names].sort());
+  for (const [name, count] of [["__proto__", 1], ["constructor", 1], ["toString", 2]]) {
+    assert.equal(core.own(kept, name), count, name);
+  }
+
+  const begun = spawnSync(process.execPath, [path.join(__dirname, "..", "skills", "mailbox-cleanup", "scripts", "mailbox-ops.js"), "begin", "--run-id", "r1"], {
+    cwd: dir,
+    encoding: "utf8",
+  });
+  const output = JSON.parse(begun.stdout);
+  const inboxes = output.inboxes;
+  assert.equal(output.legacyUnscopedRules, 1);
+  for (const [name, count] of [["__proto__", 1], ["constructor", 1], ["toString", 2]]) {
+    assert.equal(core.own(inboxes, name).migrationNotice, true, name);
+    assert.equal(core.own(inboxes, name).rulesKept, count, `${name}: its own count, nobody else's`);
+  }
 });
 
 test("receipts keep only account-scoped suggestions, idempotently", async () => {

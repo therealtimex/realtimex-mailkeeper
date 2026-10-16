@@ -750,10 +750,11 @@ class MailKeeperService {
     );
     // Recorded once, here: how many 0.1 approved rules this conversion kept
     // for each inbox. It is the only evidence for "your rules are kept".
-    const retained = {};
+    // Keyed by inbox name, which may be any accepted name ("__proto__" included).
+    const retained = Object.create(null);
     const keep = (rule) => {
       promoted.push(rule);
-      retained[rule.account] = (retained[rule.account] || 0) + 1;
+      core.setOwn(retained, rule.account, (core.own(retained, rule.account) || 0) + 1);
     };
     for (const rule of rules.promoted || []) {
       if (typeof rule.account === "string") keep(rule);
