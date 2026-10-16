@@ -297,7 +297,7 @@ Say "Nothing was changed" only when the inbox's receipt shows no confirmed moves
 Each inbox now has its own contract; `begin` marks the inboxes awaiting review. The first time an inbox shows `migrationNotice: true`, use the `CONTRACT_REVIEW_REQUIRED` wording and add: "Your old MAILBOX.md is kept for reference but is no longer used; each inbox now has its own contract: [links]." Every later report keeps saying the inbox needs review until the user confirms.
 
 In that first report, say what happened to approved rules only from what `begin` recorded, never from how many inboxes are selected today:
-- an inbox whose `rulesKept` is above 0: "Your approved rules for work@example.com are kept."
+- an inbox whose `rulesKept` is above 0: "Your approved rules for work@example.com are kept." When it is 0 or null (not recorded), say nothing about kept rules, and don't describe today's rules in the update notice.
 - once per report, when `legacyUnscopedRules` is above 0: "MailKeeper couldn't establish which inbox <n> older approved rules belonged to. They're suggestions now, and MailKeeper won't apply them on its own."
 
 Both can apply. Never say all rules were kept or all were demoted, and don't offer to approve them: approving rules isn't available in this release.

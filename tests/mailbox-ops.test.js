@@ -902,13 +902,19 @@ test("the heartbeat readers agree with the host parser or say unknown", () => {
 
 test("the migration notice is owed once; the review status stays until confirmed", () => {
   const ws = makeWorkspace({ inboxes: { legacy: { contractText: "# old\n", fakeCredential: { kind: "native" } } } });
-  ws.writeRules({ legacyContract: "MAILBOX.md" });
-  // Before this version, rules.json didn't record the disposition: unknown, not zero.
-  assert.equal(ws.run("begin", "--run-id", "r0").json.legacyUnscopedRules, null);
+  // An approved rule for the inbox, with nothing recording that the 0.1
+  // conversion kept it: today's rules are no evidence, so it's unknown.
+  ws.writeRules({
+    legacyContract: "MAILBOX.md",
+    promoted: [{ id: "now", account: "legacy", pass: "no-reply", query: NOREPLY_QUERY, action: "move → Auto/Notifications" }],
+  });
+  const unrecorded = ws.run("begin", "--run-id", "r0").json;
+  assert.deepEqual([unrecorded.inboxes.legacy.migrationNotice, unrecorded.inboxes.legacy.rulesKept, unrecorded.legacyUnscopedRules], [true, null, null]);
   ws.run("submit", "--run-id", "r0");
   fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "notices.json"), "{}");
   ws.writeRules({
     legacyUnscopedRules: 2,
+    legacyRulesKept: { legacy: 1 },
     promoted: [{ id: "kept", account: "legacy", pass: "no-reply", query: NOREPLY_QUERY, action: "move → Auto/Notifications", scopedFrom: "v0.1.1-single-account" }],
   });
   const first = ws.run("begin", "--run-id", "r1").json;
@@ -919,7 +925,8 @@ test("the migration notice is owed once; the review status stays until confirmed
   ws.run("submit", "--run-id", "r1");
   const second = ws.run("begin", "--run-id", "r2").json;
   assert.equal(second.inboxes.legacy.migrationNotice, undefined);
-  assert.equal(second.inboxes.legacy.rulesKept, undefined, "said once, with the first report");
+  assert.equal(second.inboxes.legacy.rulesKept, undefined, "the kept-rules fact comes with the first notice only");
+  assert.equal(second.legacyUnscopedRules, 2, "machine state on every begin; the skill speaks it with the first report only");
   const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
   assert.ok(skill.includes("Your approved rules for work@example.com are kept."));
   assert.ok(skill.includes("MailKeeper couldn't establish which inbox <n> older approved rules belonged to. They're suggestions now, and MailKeeper won't apply them on its own."));

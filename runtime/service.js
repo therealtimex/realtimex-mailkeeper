@@ -544,6 +544,9 @@ class MailKeeperService {
       promoted: rules.promoted.filter((rule) => typeof rule.account === "string"),
       // 0.1 approved rules whose inbox couldn't be established: now suggestions.
       legacyUnscopedRules: (rules.proposed || []).filter((rule) => rule.demotedReason === "legacy-unscoped").length,
+      // Per inbox, the 0.1 approved rules the one-time conversion kept; null
+      // when that conversion wasn't recorded (state migrated before 0.2.0).
+      legacyRulesKept: rules.legacyMigration?.retained || null,
     });
   }
 
@@ -745,9 +748,16 @@ class MailKeeperService {
     const proposed = [...(rules.proposed || [])].map((rule) =>
       typeof rule.account === "string" ? rule : { ...rule, reviewRequired: true }
     );
+    // Recorded once, here: how many 0.1 approved rules this conversion kept
+    // for each inbox. It is the only evidence for "your rules are kept".
+    const retained = {};
+    const keep = (rule) => {
+      promoted.push(rule);
+      retained[rule.account] = (retained[rule.account] || 0) + 1;
+    };
     for (const rule of rules.promoted || []) {
-      if (typeof rule.account === "string") promoted.push(rule);
-      else if (soleAccount) promoted.push({ ...rule, account: soleAccount, scopedFrom: "v0.1.1-single-account" });
+      if (typeof rule.account === "string") keep(rule);
+      else if (soleAccount) keep({ ...rule, account: soleAccount, scopedFrom: "v0.1.1-single-account" });
       else proposed.push({ ...rule, reviewRequired: true, demotedReason: "legacy-unscoped" });
     }
     rules = {
@@ -755,6 +765,7 @@ class MailKeeperService {
       schemaVersion: 2,
       promoted,
       proposed,
+      legacyMigration: { from: "v0.1.1", at: new Date().toISOString(), retained },
       revision: (rules.revision || 0) + 1,
       updatedAt: new Date().toISOString(),
     };

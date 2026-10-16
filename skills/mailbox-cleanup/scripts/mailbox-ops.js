@@ -2471,9 +2471,10 @@ const commands = {
         if (entry.contractStatus === "review-required" && rules.legacyContract && !core.own(notices.migration, account)) {
           core.setOwn(notices.migration, account, new Date().toISOString());
           core.own(inboxes, account).migrationNotice = true;
-          // Approved rules kept for this inbox (0.1's account-scoped ones, or
-          // those proven to belong to its only inbox), as the migration recorded.
-          core.own(inboxes, account).rulesKept = (rules.promoted || []).filter((rule) => rule.account === account).length;
+          // The 0.1 approved rules the one-time conversion recorded as kept for
+          // this inbox; null when no such record exists (never today's count).
+          core.own(inboxes, account).rulesKept =
+            rules.legacyRulesKept && typeof rules.legacyRulesKept === "object" ? core.own(rules.legacyRulesKept, account) || 0 : null;
         }
         if (entry.contractStatus === "invalid") recordFailure(run, account, entry.code);
         // Approved rules this version can't run in full get one notice each.
