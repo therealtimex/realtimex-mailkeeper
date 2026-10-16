@@ -469,6 +469,160 @@ test("the kept-rules record is exact for any inbox name, from the conversion thr
   }
 });
 
+const OPS = path.join(__dirname, "..", "skills", "mailbox-cleanup", "scripts", "mailbox-ops.js");
+
+/** Run the workspace CLI in a provisioned workspace, as the agent would. */
+function ops(dir, ...args) {
+  const result = spawnSync(process.execPath, [OPS, ...args], {
+    cwd: dir,
+    encoding: "utf8",
+    env: { ...process.env, MAILKEEPER_RTXEXEC_BIN: path.join(FIXTURES, "fake-rtxexec.js"), FAKE_RTX_SESSION: "1", FAKE_SECRETS: "{}" },
+  });
+  return JSON.parse(result.stdout);
+}
+
+function readPolicy(dir, name) {
+  return core.parseContract(fs.readFileSync(contractPath(dir, name), "utf8"), name);
+}
+
+const NATIVE = { kind: "himalaya-native" };
+
+/**
+ * A check is current only for an inbox that has an entry in the pinned email
+ * settings, so these tests give their inboxes one and restore the shared file.
+ */
+async function withStanzas(names, fn) {
+  const original = fs.readFileSync(himalayaConfig, "utf8");
+  fs.writeFileSync(himalayaConfig, original + names.map((name) => `[accounts.${name}]\nemail = "${name}@example.com"\n`).join("\n"));
+  try {
+    await fn();
+  } finally {
+    fs.writeFileSync(himalayaConfig, original);
+  }
+}
+
+test("a migrated single inbox keeps its sign-in through the review and reads after it", async () => {
+  await withStanzas(["work"], async () => {
+    setMailbox(["work"]);
+    const { service, dir, workspace, store } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+    const legacy = "# Mailbox contract — work\n\nNever touch: boss@example.com\n";
+    fs.writeFileSync(path.join(dir, "MAILBOX.md"), legacy);
+    store.set("ws-7-profile", { state: "ready", emailAccounts: ["work"] });
+    await service.provision(workspace);
+    const read = (runId) => {
+      assert.equal(ops(dir, "begin", "--run-id", runId).ok, true);
+      const snapshot = ops(dir, "snapshot", "--account", "work", "--run-id", runId);
+      ops(dir, "submit", "--run-id", runId, "--summary", "test");
+      return snapshot;
+    };
+
+    assert.equal(read("before-review").ok, true, "the copied contract reads with its Himalaya sign-in");
+    // The review's pre-filled draft is written before the person answers.
+    assert.equal(ops(dir, "contract-set", "--account", "work").status, "review-required");
+    assert.deepEqual(readPolicy(dir, "work").policy.credential, NATIVE, "the first settings block keeps the sign-in");
+    assert.equal(read("review-pending").ok, true);
+    assert.equal(ops(dir, "contract-set", "--account", "work", "--confirm-review").status, "valid");
+    assert.deepEqual(readPolicy(dir, "work").policy.credential, NATIVE);
+    assert.equal(read("after-review").ok, true, "the run after the review reads the inbox");
+
+    assert.equal(fs.readFileSync(path.join(dir, "MAILBOX.md"), "utf8"), legacy);
+    const status = ops(dir, "status").inboxes[0];
+    assert.equal(status.lastCheck, null, "reviewing and running record no connection check");
+    assert.equal(status.setupComplete, false);
+    assert.equal(ops(dir, "check", "--account", "work").ok, true);
+    const checked = ops(dir, "status").inboxes[0];
+    assert.deepEqual([checked.lastCheck.current, checked.setupComplete], [true, true]);
+  });
+});
+
+test("a shared v0.1.1 contract's drafts each keep their own inbox's sign-in", async () => {
+  await withStanzas(["a", "b"], async () => {
+    setMailbox(["a", "b"]);
+    const { service, dir, workspace, store } = harness({ config: { EMAIL_ACCOUNTS: ["a", "b"] } });
+    fs.writeFileSync(path.join(dir, "MAILBOX.md"), "# Mailbox contract — a, b\n");
+    store.set("ws-7-profile", { state: "ready", emailAccounts: ["a", "b"] });
+    await service.provision(workspace);
+    for (const name of ["a", "b"]) {
+      const parsed = readPolicy(dir, name);
+      assert.deepEqual([parsed.status, parsed.policy.account, parsed.policy.credential], ["review-required", name, NATIVE]);
+    }
+    assert.equal(ops(dir, "begin", "--run-id", "r1").ok, true);
+    for (const name of ["a", "b"]) assert.equal(ops(dir, "snapshot", "--account", name, "--run-id", "r1").ok, true, `${name} reads before the review`);
+    ops(dir, "submit", "--run-id", "r1", "--summary", "test");
+
+    for (const name of ["a", "b"]) ops(dir, "contract-set", "--account", name, "--confirm-review");
+    assert.equal(ops(dir, "begin", "--run-id", "r2").ok, true);
+    for (const name of ["a", "b"]) {
+      assert.deepEqual(readPolicy(dir, name).policy.credential, NATIVE);
+      assert.equal(ops(dir, "snapshot", "--account", name, "--run-id", "r2").ok, true, `${name} reads after the review`);
+    }
+    ops(dir, "submit", "--run-id", "r2", "--summary", "test");
+
+    // A check vouches only for its own inbox.
+    assert.equal(ops(dir, "check", "--account", "a").ok, true);
+    const [a, b] = ops(dir, "status").inboxes;
+    assert.deepEqual([a.lastCheck.current, b.lastCheck], [true, null]);
+  });
+});
+
+test("an inbox added after the update starts with no sign-in, and choosing one keeps a pending review", async () => {
+  await withStanzas(["a", "b", "c"], async () => {
+    setMailbox(["a", "b", "c"]);
+    const { service, dir, workspace, store, state } = harness({ config: { EMAIL_ACCOUNTS: ["a", "b"] } });
+    fs.writeFileSync(path.join(dir, "MAILBOX.md"), "# Mailbox contract — a, b\n");
+    store.set("ws-7-profile", { state: "ready", emailAccounts: ["a", "b"] });
+    await service.provision(workspace);
+    const before = fs.readFileSync(contractPath(dir, "a"), "utf8");
+    state.config = { ...state.config, EMAIL_ACCOUNTS: ["a", "b", "c"] };
+    await service.provision(workspace);
+    assert.equal(fs.readFileSync(contractPath(dir, "a"), "utf8"), before, "reprovision leaves existing contracts alone");
+    const added = readPolicy(dir, "c");
+    assert.deepEqual([added.status, added.policy.credential], ["valid", null], "the old root file doesn't make a new inbox a 0.1 inbox");
+
+    // No sign-in recorded: its own blocked condition, before any server contact.
+    assert.equal(ops(dir, "begin", "--run-id", "r1").ok, true);
+    assert.equal(ops(dir, "snapshot", "--account", "c", "--run-id", "r1").code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
+    const receipt = ops(dir, "submit", "--run-id", "r1", "--summary", "test");
+    assert.equal(receipt.ok, true);
+    assert.equal(ops(dir, "check", "--account", "c").code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
+
+    // The person's choice is written, then the normal check uses it.
+    ops(dir, "contract-set", "--account", "c", "--native");
+    assert.deepEqual(readPolicy(dir, "c").policy.credential, NATIVE);
+    assert.equal(ops(dir, "check", "--account", "c").ok, true);
+    assert.equal(ops(dir, "status").inboxes[2].lastCheck.current, true);
+
+    // Choosing a sign-in never confirms a pending review.
+    ops(dir, "contract-set", "--account", "a", "--password-ref", "secret://a-login");
+    const a = readPolicy(dir, "a");
+    assert.deepEqual([a.status, a.policy.credential.kind], ["review-required", "realtimex-secret"]);
+  });
+});
+
+test("a contract's own sign-in, null included, is what runs, checks and status use", () => {
+  const blockless = core.parseContract("# Old shared text\n", "a");
+  assert.deepEqual(core.contractCredential(blockless), NATIVE, "only a contract with no block yet inherits its Himalaya sign-in");
+  const typedNull = core.parseContract(core.renderPolicyBlock(core.draftPolicy("a", { ageThresholdDays: 90 }, { reviewRequired: true })), "a");
+  assert.equal(typedNull.status, "review-required");
+  assert.equal(core.contractCredential(typedNull), null, "a block's null is kept, even while its review is pending");
+  assert.equal(core.effectivePolicy({ mode: "report-only" }, typedNull).credential, null);
+  const invalid = core.parseContract("```mailkeeper-policy\n{\n```\n", "a");
+  assert.equal(core.contractCredential(invalid), null, "an unreadable contract gets no fallback");
+});
+
+test("a one-off check sign-in doesn't make a contract's missing sign-in current", async () => {
+  await withStanzas(["a"], async () => {
+    setMailbox(["a"]);
+    const { service, dir, workspace } = harness({ config: { EMAIL_ACCOUNTS: ["a"] } });
+    await service.provision(workspace);
+    assert.equal(readPolicy(dir, "a").policy.credential, null);
+    assert.equal(ops(dir, "check", "--account", "a", "--native").ok, true);
+    const status = ops(dir, "status").inboxes[0];
+    assert.deepEqual([status.lastCheck.ok, status.lastCheck.current, status.setupComplete], [true, false, false]);
+    assert.equal(readPolicy(dir, "a").policy.credential, null, "check never rewrites the contract");
+  });
+});
+
 test("receipts keep only account-scoped suggestions, idempotently", async () => {
   setMailbox(["work"]);
   const { service, workspace, store } = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });

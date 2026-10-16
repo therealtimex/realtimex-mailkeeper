@@ -455,7 +455,7 @@ test("mixed-inbox undo checks every inbox before changing any", () => {
   fs.writeFileSync(ws.contract("b"), text);
   const callsBefore = ws.mailbox().calls.length;
   const undone = ws.run("undo", "--run-id", "r1");
-  assert.equal(undone.json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
+  assert.equal(undone.json.code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
   assert.equal(ws.mailbox().calls.length, callsBefore, "no inbox was contacted");
 });
 
@@ -479,7 +479,7 @@ test("setup works before the inbox is selected and never overwrites a contract",
   box.accounts.c = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [], Archive: [], Sent: [] } };
   fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
 
-  assert.equal(ws.run("check", "--account", "c").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
+  assert.equal(ws.run("check", "--account", "c").json.code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
   assert.equal(ws.run("check", "--account", "c", "--login", "a-imap").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE", "names are never turned into references");
   const checked = ws.run("check", "--account", "c", "--password-ref", "secret://a-imap");
   assert.deepEqual(checked.json.folders, ["INBOX", "Archive", "Sent"]);

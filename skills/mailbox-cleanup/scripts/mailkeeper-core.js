@@ -316,10 +316,22 @@ function replacePolicyBlock(text, policy) {
 }
 
 /**
- * Seed policy for a new inbox: always report-only, no credential until setup,
- * no folders until setup resolves them from this inbox.
+ * The sign-in a contract gives its inbox. A settings block owns its
+ * credential, null included; only a contract with no block yet (migrated
+ * v0.1.1 text awaiting review) keeps the sign-in its Himalaya entry already
+ * had. Runs, checks and status all read it here so they cannot disagree.
  */
-function draftPolicy(account, workspace, { reviewRequired = false } = {}) {
+function contractCredential(contract) {
+  if (contract?.policy) return contract.policy.credential;
+  return contract?.status === "review-required" ? { kind: "himalaya-native" } : null;
+}
+
+/**
+ * Seed policy for a new inbox: always report-only, no credential until setup,
+ * no folders until setup resolves them from this inbox. A migrated v0.1.1
+ * inbox passes the sign-in it already had.
+ */
+function draftPolicy(account, workspace, { reviewRequired = false, credential = null } = {}) {
   return {
     version: 1,
     account,
@@ -330,7 +342,7 @@ function draftPolicy(account, workspace, { reviewRequired = false } = {}) {
     excludedPasses: [],
     archiveFolder: null,
     sentFolder: null,
-    credential: null,
+    credential,
     ...(reviewRequired ? { reviewRequired: true } : {}),
   };
 }
@@ -364,9 +376,7 @@ function effectivePolicy(workspace, contract, { requestedMode } = {}) {
     protectedDomains: workspace.protectedDomains || [],
     archiveFolder: policy?.archiveFolder || null,
     sentFolder: policy?.sentFolder || null,
-    // A migrated v0.1.1 contract has no settings block yet; it keeps the
-    // sign-in its Himalaya entry already had, for read-only work only.
-    credential: policy ? policy.credential : contract?.status === "review-required" ? { kind: "himalaya-native" } : null,
+    credential: contractCredential(contract),
     autoFolderPrefix: workspace.autoFolderPrefix || "Auto",
   };
 }
@@ -435,6 +445,7 @@ module.exports = {
   MODE_PARAGRAPHS,
   MODE_HEADING,
   replacePolicyBlock,
+  contractCredential,
   draftPolicy,
   effectivePolicy,
   ruleId,
