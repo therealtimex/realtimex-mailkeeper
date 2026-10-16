@@ -1845,57 +1845,65 @@ const DEFAULT_CAPS = {
  * the user selects the inbox in settings, so it needs only the inbox to be
  * in the email settings, never the workspace selection.
  */
-/** Submitted receipts, newest first. */
-function recentReceipts() {
+/**
+ * Submitted runs, newest first, from their journals: kept after the host
+ * ingests (and deletes) the outbox receipt. Undo runs report through undo.
+ */
+function submittedRuns() {
   let names = [];
   try {
-    names = fs.readdirSync(statePath("outbox")).filter((name) => name.endsWith(".json"));
+    names = fs.readdirSync(statePath("runs")).filter((name) => name.endsWith(".json"));
   } catch {
     return [];
   }
   return names
-    .map((name) => readJson(statePath("outbox", name)))
-    .filter((receipt) => receipt && typeof receipt.runId === "string" && typeof receipt.finishedAt === "string")
-    .sort((a, b) => b.finishedAt.localeCompare(a.finishedAt));
+    .map((name) => readJson(statePath("runs", name)))
+    .filter((run) => run && typeof run.runId === "string" && typeof run.submittedAt === "string" && run.trigger !== "undo" && run.accountsOutcome)
+    .sort((a, b) => b.submittedAt.localeCompare(a.submittedAt));
 }
 
 /**
- * The last submitted run that covered this inbox, as its receipt and journal
- * record it: outcome, coverage, moves, urgent items, and whether its moves
- * were undone (from the run's recorded undo state, never inferred).
+ * The last submitted run that covered this inbox, as its journal records it:
+ * outcome, coverage, moves, urgent items, and this inbox's undo state.
  */
-function lastRunFor(receipts, account) {
-  const receipt = receipts.find((r) => core.own(r.accounts || {}, account));
-  if (!receipt) return null;
-  const entry = core.own(receipt.accounts, account);
-  const journal = readJson(runFile(receipt.runId));
-  const undoJournal = readJson(runFile(`undo-${receipt.runId}`.slice(0, 80)));
-  const moved = Number.isInteger(entry.moved) ? entry.moved : 0;
+function lastRunFor(runs, account) {
+  const run = runs.find((r) => core.own(r.accountsOutcome, account));
+  if (!run) return null;
+  const entry = core.own(run.accountsOutcome, account);
   return {
-    runId: receipt.runId,
-    trigger: receipt.trigger || null,
-    finishedAt: receipt.finishedAt,
+    runId: run.runId,
+    trigger: run.trigger || null,
+    finishedAt: run.submittedAt,
     outcome: entry.outcome || null,
     code: entry.code || null,
     coverage: entry.coverage || null,
-    moved,
+    moved: Number.isInteger(entry.moved) ? entry.moved : 0,
     urgentChecked: entry.urgentChecked === true,
     urgentCount: Number.isInteger(entry.urgentCount) ? entry.urgentCount : null,
     urgent: Array.isArray(entry.urgent) ? entry.urgent.slice(0, 5) : [],
-    undo:
-      moved === 0
-        ? null
-        : journal?.undoneAt
-          ? { state: "done", at: journal.undoneAt }
-          : undoJournal
-            ? { state: "partial", remaining: moved - undoReversed(undoJournal, receipt.runId, account) }
-            : { state: "none" },
+    undo: undoStateFor(run, account),
   };
 }
 
-/** Confirmed reversals an undo run recorded for this inbox's moves of `runId`. */
-function undoReversed(undoJournal, runId, account) {
-  return new Set((undoJournal.actions || []).filter((a) => a.account === account && a.undoOf === runId && typeof a.reverses === "string").map((a) => a.reverses)).size;
+/**
+ * This inbox's undo state for a run, from the confirmed reversals of its own
+ * moves (a preview reverses nothing; another inbox's undo doesn't count):
+ * none, partial (with what remains), done, or uncertain when an undo move for
+ * this inbox was never confirmed. Null when the run moved nothing here.
+ */
+function undoStateFor(run, account) {
+  const moves = (run.actions || []).filter((a) => a.account === account && a.kind === "move" && !a.reverses);
+  if (!moves.length) return null;
+  const keys = new Set(moves.map(moveKey));
+  const undoJournal = readJson(runFile(`undo-${run.runId}`.slice(0, 80)));
+  const reversed = new Set(
+    (undoJournal?.actions || []).filter((a) => a.account === account && a.undoOf === run.runId && keys.has(a.reverses)).map((a) => a.reverses)
+  ).size;
+  const open = [...(undoJournal?.uncertain || []), ...(undoJournal?.pending ? [undoJournal.pending] : [])];
+  if (open.some((u) => u.account === account)) return { state: "uncertain", remaining: moves.length - reversed };
+  if (reversed === 0) return { state: "none" };
+  if (reversed === moves.length) return { state: "done" };
+  return { state: "partial", remaining: moves.length - reversed };
 }
 
 /** A contract's own settings, plain; `effectiveMode` is null until the inbox is selected. */
@@ -2346,7 +2354,7 @@ const commands = {
     const configured = rules?.schemaVersion === 2;
     const selected = configured ? rules.config.emailAccounts : [];
     const agentChosen = Boolean(configured && rules.config.agent);
-    const receipts = recentReceipts();
+    const runs = submittedRuns();
     const inboxes = selected.map((name) => {
       const key = core.accountKey(name);
       const { relative, target } = contractFile(key);
@@ -2365,7 +2373,7 @@ const commands = {
         // What the contract asks for, and what applies within this workspace's limit.
         mode: contract.policy?.mode || null,
         effectiveMode: configured ? core.effectivePolicy(rules.config, contract).mode : null,
-        lastRun: lastRunFor(receipts, name),
+        lastRun: lastRunFor(runs, name),
       };
     });
     output({

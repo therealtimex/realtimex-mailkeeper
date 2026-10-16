@@ -11,6 +11,7 @@ const { promisify } = require("util");
 
 const core = require("../skills/mailbox-cleanup/scripts/mailkeeper-core");
 const { startImapStub } = require("./fixtures/imap-stub");
+const { MailKeeperService } = require("../runtime/service");
 
 const execFileAsync = promisify(execFile);
 const OPS = path.join(__dirname, "..", "skills", "mailbox-cleanup", "scripts", "mailbox-ops.js");
@@ -2028,6 +2029,63 @@ test("status answers per inbox: modes, the last run, its undo and urgent items, 
     assert.ok(skill.includes(line), line);
   }
   assert.equal(skill.includes("stays open until you answer"), false);
+});
+
+// Review 5e803aa: status history survives the host's receipt ingestion, and
+// undo state is each inbox's own confirmed reversals.
+function movedRun(accounts) {
+  const ws = twoInboxes({ a: { policy: { mode: "label-only", vipSenders: [], credential: secretA } } });
+  ws.run("begin", "--run-id", "r1", ...accounts.flatMap((account) => ["--account", account]));
+  for (const account of accounts) {
+    ws.run("snapshot", "--account", account, "--run-id", "r1");
+    ws.run("preview", "--account", account, "--passes", "no-reply", "--run-id", "r1");
+    assert.equal(ws.run("apply", "--account", account, "--pass", "no-reply", "--run-id", "r1").json.ok, true);
+  }
+  assert.equal(ws.run("submit", "--run-id", "r1", "--summary", "t").json.ok, true);
+  return ws;
+}
+const lastRunOf = (ws, account) => ws.run("status").json.inboxes.find((inbox) => inbox.name === account).lastRun;
+
+test("status keeps the last run after the host ingests its receipt", async () => {
+  const ws = movedRun(["b"]);
+  const before = lastRunOf(ws, "b");
+  assert.equal(before.runId, "r1");
+  const store = new Map();
+  const noop = async () => null;
+  const service = new MailKeeperService({
+    getStore: () => ({ get: async (key) => store.get(key) || null, set: async (key, value) => store.set(key, value) }),
+    workspaces: { get: noop, listEnabledForPlugin: noop, ensureThread: noop },
+    heartbeat: { readSettings: noop, upsertManagedTask: noop, removeManagedTask: noop },
+  });
+  const workspace = { id: 99, slug: "fixture", workingDirectory: ws.dir };
+  assert.equal((await service.ingestOutbox(workspace)).ingested, 1);
+  assert.equal(fs.existsSync(path.join(ws.dir, ".mailkeeper", "outbox", "r1.json")), false, "the receipt was taken");
+  assert.deepEqual(lastRunOf(ws, "b"), before);
+});
+
+test("status undo is each inbox's own: preview only, one inbox done, the other untouched, partial and uncertain", () => {
+  // A preview reverses nothing.
+  const previewed = movedRun(["b"]);
+  assert.equal(previewed.run("undo", "--run-id", "r1", "--account", "b", "--dry-run").json.ok, true);
+  assert.deepEqual(lastRunOf(previewed, "b").undo, { state: "none" });
+
+  // Undo of one inbox in a two-inbox run: that inbox is done, the other untouched.
+  const both = movedRun(["a", "b"]);
+  assert.equal(both.run("undo", "--run-id", "r1", "--account", "a").json.reversed, 2);
+  assert.deepEqual([lastRunOf(both, "a").undo, lastRunOf(both, "b").undo], [{ state: "done" }, { state: "none" }]);
+
+  // One moved message can't be found: partial, with what remains.
+  const partial = movedRun(["b"]);
+  const box = partial.mailbox().accounts.b.folders;
+  partial.setFake("b", { folders: { ...box, "Auto/Notifications": box["Auto/Notifications"].slice(1) } });
+  partial.run("undo", "--run-id", "r1", "--account", "b");
+  assert.deepEqual(lastRunOf(partial, "b").undo, { state: "partial", remaining: 1 });
+
+  // An undo move whose result is unknown is never reported as done.
+  const uncertain = movedRun(["b"]);
+  uncertain.setFake("b", { failMove: "unknown" });
+  assert.equal(uncertain.run("undo", "--run-id", "r1", "--account", "b").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
+  assert.deepEqual(lastRunOf(uncertain, "b").undo, { state: "uncertain", remaining: 2 });
 });
 
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {

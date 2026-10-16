@@ -233,7 +233,7 @@ Run `mailbox-ops status` and answer from it only, one section per inbox by its f
 - **Set up:** `setupComplete`. When `lastCheck.current` is false: "The last connection check for work@example.com was before this update. Say “check work@example.com” to confirm it." Don't call it "setup incomplete" for that reason alone.
 - **Mode:** the contract's `mode`, and `effectiveMode` when the workspace limit makes it stricter.
 - **Last run** (`lastRun`): when it finished, its `outcome`, and its coverage in the Reports wording. A `partial` read uses the Reports line for it, with no promise that another run or a smaller scope gets further. Name the folder when `coverage.folder` isn't INBOX.
-- **Moves and undo:** `moved`, and `undo.state`: `done` ("Those moves were undone."), `partial` (the Undo line "I haven't undone <n> moves from this run.", with `remaining` for <n>), or `none` (the undo line from Reports).
+- **Moves and undo:** `moved`, and this inbox's `undo.state`: `done` ("Those moves were undone."), `partial` (the Undo line "I haven't undone <n> moves from this run.", with `remaining` for <n>), `uncertain` (an undo move wasn't confirmed: the `MUTATION_UNCERTAIN` line and its check), or `none` (the undo line from Reports).
 - **Urgent mail:** `urgentCount` with up to five `urgent` items when `urgentChecked`; otherwise say it wasn't checked.
 - **Schedule:** the one sentence for `schedule.closing`, as in setup.
 
