@@ -1,10 +1,10 @@
 # {{INBOX}} — MailKeeper contract
 
-This contract belongs to you. MailKeeper created it once and never overwrites it. The agent reads it before every run of this inbox, and it outranks MailKeeper's own instructions. Each inbox has its own contract; changes here affect only {{INBOX}}.
+This contract belongs to you. MailKeeper created it once. When you ask, it changes only its settings block below and, if you haven't edited it, its own sentence about what MailKeeper may do on its own. The agent reads it before every run of this inbox, and it outranks MailKeeper's own instructions. Each inbox has its own contract; changes here affect only {{INBOX}}.
 {{MIGRATION_NOTE}}
 ## What MailKeeper may do on its own
 
-Report only. MailKeeper checks this inbox and lists what it would suggest, but moves nothing.
+{{MODE_PARAGRAPH}}
 
 Scheduled runs apply only rules you have already approved, and only within this contract and your workspace settings. Everything else appears as a suggestion in the report. To act on a suggestion now, ask the agent in chat: it shows you what it would move and asks before moving anything. Approving new automatic rules isn't available from chat or settings in this release.
 

@@ -14,6 +14,8 @@
  *                           holding its stdout/stderr open for listSlowMs),
  *                           listStderrPage + listStderr (a custom failure),
  *                           failFolderList (folder list fails, for destination checks),
+ *                           stealLockFile + stealLockAfterMoves: <n> (after that many moves, another
+ *                           run takes the workspace guard, as if it had been released meanwhile),
  *                           listPages: { <page>: [rows as returned, valid or not] } } },
  *     calls: [ { op, account } ] }
  *
@@ -143,6 +145,9 @@ if (group === "folder" && action === "list") {
     folders[target].push({ ...row, id: String(account.nextUid) });
   }
   account.moves = (account.moves ?? 0) + 1;
+  if (account.stealLockFile && account.moves === account.stealLockAfterMoves) {
+    fs.writeFileSync(account.stealLockFile, JSON.stringify({ runId: "someone-else", trigger: "chat", startedAt: new Date().toISOString() }));
+  }
   save();
   process.stdout.write(JSON.stringify("Message(s) successfully moved!"));
 } else {

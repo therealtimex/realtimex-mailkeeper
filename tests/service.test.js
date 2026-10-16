@@ -128,6 +128,13 @@ test("contracts are never overwritten and survive deselection", async () => {
   await service.provision(workspace);
   assert.equal(fs.readFileSync(file, "utf8"), edited);
 
+  // A contract from an earlier version keeps its old header and wording, byte for byte.
+  const older = edited.replace(/^This contract belongs to you\..*$/m, "This contract belongs to you. MailKeeper created it once and never overwrites it.");
+  fs.writeFileSync(file, older);
+  await service.provision(workspace);
+  assert.equal(fs.readFileSync(file, "utf8"), older);
+  fs.writeFileSync(file, edited);
+
   state.config = { ...state.config, EMAIL_ACCOUNTS: ["personal@example.com"] };
   await service.provision(workspace);
   assert.equal(fs.readFileSync(file, "utf8"), edited, "a deselected inbox keeps its contract");

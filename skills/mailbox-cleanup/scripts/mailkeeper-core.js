@@ -250,6 +250,43 @@ function renderPolicyBlock(policy) {
 }
 
 /**
+ * MailKeeper's own paragraph under "## What MailKeeper may do on its own", per
+ * mode. The one source for new contracts and for following a mode change.
+ */
+const MODE_HEADING = "## What MailKeeper may do on its own";
+const MODE_PARAGRAPHS = Object.freeze({
+  "report-only": "Report only. MailKeeper checks this inbox and lists what it would suggest, but moves nothing.",
+  "label-only":
+    "Label only. MailKeeper may move mail into its Auto/ folders: on its own only by rules you've approved, and in chat only after you say yes. It never archives mail.",
+  "archive-promoted":
+    "Archive. MailKeeper may move mail into its Auto/ folders and its archive folder: on its own only by rules you've approved, and in chat only after you say yes.",
+});
+
+/**
+ * After a requested mode change, replace the paragraph under the mode heading
+ * only when it is exactly MailKeeper's paragraph for the previous mode: one
+ * such heading, and its first paragraph byte-equal to that text. Anything
+ * else (edited, extended, a different mode's text, a repeated heading, an
+ * unknown previous mode) is left as it is: `kept-edited`.
+ */
+function followModeParagraph(text, previousMode, nextMode) {
+  if (previousMode === nextMode) return { text, modeSentence: "unchanged" };
+  const previous = Object.prototype.hasOwnProperty.call(MODE_PARAGRAPHS, previousMode) ? MODE_PARAGRAPHS[previousMode] : null;
+  const next = Object.prototype.hasOwnProperty.call(MODE_PARAGRAPHS, nextMode) ? MODE_PARAGRAPHS[nextMode] : null;
+  if (!previous || !next) return { text, modeSentence: "kept-edited" };
+  const lines = text.split("\n");
+  const headings = lines.map((line, i) => (line === MODE_HEADING ? i : -1)).filter((i) => i !== -1);
+  if (headings.length !== 1) return { text, modeSentence: "kept-edited" };
+  let start = headings[0] + 1;
+  while (start < lines.length && lines[start] === "") start += 1;
+  let end = start;
+  while (end < lines.length && lines[end] !== "" && !lines[end].startsWith("#")) end += 1;
+  if (end !== start + 1 || lines[start] !== previous) return { text, modeSentence: "kept-edited" };
+  lines[start] = next;
+  return { text: lines.join("\n"), modeSentence: "updated" };
+}
+
+/**
  * Render a new inbox contract from the skill's template. Only the settings
  * block carries enforceable values; the prose points to it rather than
  * repeating them, so the two cannot drift apart.
@@ -258,6 +295,7 @@ function renderContract(template, { account, protectedDomains = [], policy, note
   return template
     .replaceAll("{{INBOX}}", account)
     .replaceAll("{{MIGRATION_NOTE}}", note)
+    .replaceAll("{{MODE_PARAGRAPH}}", MODE_PARAGRAPHS[policy.mode] || MODE_PARAGRAPHS["report-only"])
     .replaceAll("{{PROTECTED_DOMAINS}}", protectedDomains.join(", ") || "none")
     .replaceAll("{{POLICY_BLOCK}}", renderPolicyBlock(policy));
 }
@@ -393,6 +431,9 @@ module.exports = {
   parseContract,
   renderPolicyBlock,
   renderContract,
+  followModeParagraph,
+  MODE_PARAGRAPHS,
+  MODE_HEADING,
   replacePolicyBlock,
   draftPolicy,
   effectivePolicy,

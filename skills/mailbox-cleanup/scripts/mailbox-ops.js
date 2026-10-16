@@ -1629,10 +1629,24 @@ function moveKey(action) {
   return `${action.account}\n${action.from}\n${action.uid}\n${action.to}`;
 }
 
+/**
+ * Before a folder is created or a chunk is moved, this run must still hold
+ * the workspace guard. If it doesn't, stop: never take it again midway. The
+ * moves already confirmed stay recorded, and the stop is reported with how
+ * many of them this request made (`movedBeforeStop`).
+ */
+function assertOwner(run, account, movedBeforeStop) {
+  if (readLock()?.runId === run.runId) return;
+  throw failure("MAILKEEPER_RUN_BUSY", { account, procedural: true, ownershipLost: true, movedBeforeStop });
+}
+
 function moveChunks(run, rules, inbox, envelopes, from, to, extra) {
   let moved = 0;
+  const confirmedSoFar = () =>
+    extra.question ? run.actions.filter((a) => a.account === inbox.account && a.question === extra.question).length : moved;
   for (let i = 0; i < envelopes.length; i += BATCH) {
     const chunk = envelopes.slice(i, i + BATCH);
+    assertOwner(run, inbox.account, confirmedSoFar());
     run.pending = { account: inbox.account, from, to, uids: chunk.map((e) => e.uid), ...extra, at: new Date().toISOString() };
     saveRun(run);
     try {
@@ -1831,6 +1845,59 @@ const DEFAULT_CAPS = {
  * the user selects the inbox in settings, so it needs only the inbox to be
  * in the email settings, never the workspace selection.
  */
+/** Submitted receipts, newest first. */
+function recentReceipts() {
+  let names = [];
+  try {
+    names = fs.readdirSync(statePath("outbox")).filter((name) => name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  return names
+    .map((name) => readJson(statePath("outbox", name)))
+    .filter((receipt) => receipt && typeof receipt.runId === "string" && typeof receipt.finishedAt === "string")
+    .sort((a, b) => b.finishedAt.localeCompare(a.finishedAt));
+}
+
+/**
+ * The last submitted run that covered this inbox, as its receipt and journal
+ * record it: outcome, coverage, moves, urgent items, and whether its moves
+ * were undone (from the run's recorded undo state, never inferred).
+ */
+function lastRunFor(receipts, account) {
+  const receipt = receipts.find((r) => core.own(r.accounts || {}, account));
+  if (!receipt) return null;
+  const entry = core.own(receipt.accounts, account);
+  const journal = readJson(runFile(receipt.runId));
+  const undoJournal = readJson(runFile(`undo-${receipt.runId}`.slice(0, 80)));
+  const moved = Number.isInteger(entry.moved) ? entry.moved : 0;
+  return {
+    runId: receipt.runId,
+    trigger: receipt.trigger || null,
+    finishedAt: receipt.finishedAt,
+    outcome: entry.outcome || null,
+    code: entry.code || null,
+    coverage: entry.coverage || null,
+    moved,
+    urgentChecked: entry.urgentChecked === true,
+    urgentCount: Number.isInteger(entry.urgentCount) ? entry.urgentCount : null,
+    urgent: Array.isArray(entry.urgent) ? entry.urgent.slice(0, 5) : [],
+    undo:
+      moved === 0
+        ? null
+        : journal?.undoneAt
+          ? { state: "done", at: journal.undoneAt }
+          : undoJournal
+            ? { state: "partial", remaining: moved - undoReversed(undoJournal, receipt.runId, account) }
+            : { state: "none" },
+  };
+}
+
+/** Confirmed reversals an undo run recorded for this inbox's moves of `runId`. */
+function undoReversed(undoJournal, runId, account) {
+  return new Set((undoJournal.actions || []).filter((a) => a.account === account && a.undoOf === runId && typeof a.reverses === "string").map((a) => a.reverses)).size;
+}
+
 /** A contract's own settings, plain; `effectiveMode` is null until the inbox is selected. */
 function contractSettings(policy, effectiveMode) {
   if (!policy) return null;
@@ -2249,12 +2316,23 @@ const commands = {
     else if (base.reviewRequired) next.reviewRequired = true;
     else delete next.reviewRequired;
 
-    const content = core.replacePolicyBlock(setup.text, next);
-    if (content === null) throw failure("MAILKEEPER_CONTRACT_INVALID", { reason: "the contract has more than one settings block; keep one" });
+    const replaced = core.replacePolicyBlock(setup.text, next);
+    if (replaced === null) throw failure("MAILKEEPER_CONTRACT_INVALID", { reason: "the contract has more than one settings block; keep one" });
+    // A requested mode change also updates MailKeeper's own, unedited mode paragraph.
+    const followed =
+      typeof args.mode === "string" ? core.followModeParagraph(replaced, setup.contract.policy?.mode, next.mode) : { text: replaced, modeSentence: "unchanged" };
+    const content = followed.text;
     const parsed = core.parseContract(content, setup.account);
     if (parsed.status === "invalid") throw failure("MAILKEEPER_CONTRACT_INVALID", { reason: "check the values given" });
     writeContract(setup.file, setup.text, content);
-    output({ ok: true, account: setup.account, contract: setup.file.relative, status: parsed.status, changed: content !== setup.text });
+    output({
+      ok: true,
+      account: setup.account,
+      contract: setup.file.relative,
+      status: parsed.status,
+      changed: content !== setup.text,
+      modeSentence: followed.modeSentence,
+    });
   },
 
   /**
@@ -2268,6 +2346,7 @@ const commands = {
     const configured = rules?.schemaVersion === 2;
     const selected = configured ? rules.config.emailAccounts : [];
     const agentChosen = Boolean(configured && rules.config.agent);
+    const receipts = recentReceipts();
     const inboxes = selected.map((name) => {
       const key = core.accountKey(name);
       const { relative, target } = contractFile(key);
@@ -2283,6 +2362,10 @@ const commands = {
         code: contract.code,
         lastCheck: check ? { ok: check.ok === true, at: check.at, code: check.code || null, current } : null,
         setupComplete: agentChosen && contract.status === "valid" && check?.ok === true && current,
+        // What the contract asks for, and what applies within this workspace's limit.
+        mode: contract.policy?.mode || null,
+        effectiveMode: configured ? core.effectivePolicy(rules.config, contract).mode : null,
+        lastRun: lastRunFor(receipts, name),
       };
     });
     output({
@@ -2643,17 +2726,21 @@ const commands = {
             // has advice for the destination that received mail.
             run.undoAdvice = run.undoAdvice || [];
             run.undoAdvice.push({ account, to, pass: step.pass, ruleId: step.ruleId, ...undoAdvisory, at: new Date().toISOString() });
+            assertOwner(run, account, question ? run.actions.filter((a) => a.account === account && a.question === question.id).length : 0);
             ensureFolder(rules, inbox, to);
-            moved = moveChunks(run, rules, inbox, list, snapshot.folder, to, {
-              pass: step.pass,
-              ruleId: step.ruleId,
-              ...(question ? { question: question.id } : {}),
-            });
-            // Drop moved messages from this inbox's cache by account and
-            // source folder, not by UID alone.
-            const movedUids = new Set(run.actions.filter((a) => a.account === account && a.from === snapshot.folder).map((a) => a.uid));
-            snapshot.envelopes = snapshot.envelopes.filter((e) => !(e.folder === snapshot.folder && movedUids.has(e.uid)));
-            writeJson(snapshotFile(inbox), snapshot);
+            try {
+              moved = moveChunks(run, rules, inbox, list, snapshot.folder, to, {
+                pass: step.pass,
+                ruleId: step.ruleId,
+                ...(question ? { question: question.id } : {}),
+              });
+            } finally {
+              // Drop moved messages from this inbox's cache by account and
+              // source folder, not by UID alone, even when a later chunk stopped.
+              const movedUids = new Set(run.actions.filter((a) => a.account === account && a.from === snapshot.folder).map((a) => a.uid));
+              snapshot.envelopes = snapshot.envelopes.filter((e) => !(e.folder === snapshot.folder && movedUids.has(e.uid)));
+              writeJson(snapshotFile(inbox), snapshot);
+            }
           }
           if (question) question.applied.push(step.pass);
           const unchecked = passAvailability(step.pass).uncheckedSignals;
@@ -2939,7 +3026,8 @@ const commands = {
     const run = readJson(runFile(runId));
     const lock = readLock();
     if (lock?.runId !== runId) {
-      output({ ok: true, runId, released: false, heldBy: lock?.runId || null });
+      // This run holds nothing; another run's guard is never removed.
+      output({ ok: true, runId, released: false, holdsGuard: false, heldBy: lock?.runId || null });
       return;
     }
     if (run && (run.pending || run.uncertain?.length)) {
@@ -2951,7 +3039,7 @@ const commands = {
       saveRun(run);
     }
     fs.rmSync(lockFile(), { force: true });
-    output({ ok: true, runId, released: true });
+    output({ ok: true, runId, released: true, holdsGuard: false });
   },
 };
 

@@ -1813,6 +1813,223 @@ test("what a question shows per destination is what the in-order applies move: p
   assert.equal("Auto/Receipts" in complete.mailbox().accounts.b.folders, false);
 });
 
+test("an unanswered question holds nothing: other runs and undo go ahead, and the yes takes the guard again", () => {
+  const calendar = Array.from({ length: 3 }, (_, i) => msg(400 + i, `p${i}@people.example`, `Accepted: Meeting ${i}`));
+  const ws = twoInboxes({ b: { messages: [...tenNoReply().slice(0, 2), ...calendar], folders: { "Auto/Notifications": [] } } });
+  const lockPath = path.join(ws.dir, ".mailkeeper", "run.lock");
+  const lockOwner = () => (fs.existsSync(lockPath) ? JSON.parse(fs.readFileSync(lockPath, "utf8")).runId : null);
+  const moveCalls = () => ws.mailbox().calls.filter((call) => call.op === "message move").length;
+
+  // An earlier run moved the calendar replies, so there is something to undo.
+  ws.run("begin", "--run-id", "r0", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r0");
+  ws.run("preview", "--account", "b", "--passes", "calendar-response", "--run-id", "r0");
+  ws.run("apply", "--account", "b", "--pass", "calendar-response", "--run-id", "r0");
+  ws.run("submit", "--run-id", "r0", "--summary", "t");
+
+  // The question is asked with nothing held.
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  assert.equal(ws.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1").json.plans[0].count, 2);
+  assert.deepEqual(ws.run("release", "--run-id", "r1").json, { ok: true, runId: "r1", released: true, holdsGuard: false });
+  assert.equal(lockOwner(), null);
+
+  // Meanwhile another chat run, a scheduled run and an undo all start and end.
+  assert.equal(ws.run("begin", "--run-id", "r2", "--account", "a").json.ok, true);
+  ws.run("snapshot", "--account", "a", "--run-id", "r2");
+  assert.equal(ws.run("submit", "--run-id", "r2", "--summary", "t").json.ok, true);
+  assert.equal(maintenance(ws, "r3", ["a"]).submit.json.ok, true);
+  assert.equal(ws.run("undo", "--run-id", "r0", "--account", "b").json.undone, true);
+  assert.equal(lockOwner(), null);
+
+  // The yes: apply takes the guard again and moves only the shown messages.
+  const before = moveCalls();
+  const applied = ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([applied.ok, applied.results[0].moved, moveCalls() - before], [true, 2, 1]);
+  assert.equal(lockOwner(), "r1");
+  assert.equal(ws.mailbox().accounts.b.folders["Auto/Notifications"].length, 2, "the undone calendar replies weren't swept in");
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  assert.equal(lockOwner(), null);
+});
+
+test("after a release, a changed read, a busy guard or a lost guard never moves more than the person agreed to", () => {
+  const lockPath = (ws) => path.join(ws.dir, ".mailkeeper", "run.lock");
+  const lockOwner = (ws) => (fs.existsSync(lockPath(ws)) ? JSON.parse(fs.readFileSync(lockPath(ws), "utf8")).runId : null);
+  const asked = (extra = {}) => {
+    const ws = twoInboxes({ b: { messages: tenNoReply().slice(0, 2), folders: {}, ...extra } });
+    ws.run("begin", "--run-id", "r1", "--account", "b");
+    ws.run("snapshot", "--account", "b", "--run-id", "r1");
+    ws.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+    assert.equal(ws.run("release", "--run-id", "r1").json.holdsGuard, false);
+    return ws;
+  };
+
+  // Another run read the inbox meanwhile: the old yes moves nothing and creates no folder.
+  const reread = asked();
+  reread.run("begin", "--run-id", "r2", "--account", "b");
+  reread.run("snapshot", "--account", "b", "--run-id", "r2");
+  reread.run("submit", "--run-id", "r2", "--summary", "t");
+  const refused = reread.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([refused.code, refused.movedInQuestion], ["MAILKEEPER_PLAN_CHANGED", 0]);
+  assert.equal("Auto/Notifications" in reread.mailbox().accounts.b.folders, false);
+  assert.equal(reread.mailbox().calls.filter((call) => call.op === "message move").length, 0);
+  // The refusal took the guard; showing the plan again and releasing leaves none behind.
+  assert.equal(lockOwner(reread), "r1");
+  reread.run("snapshot", "--account", "b", "--run-id", "r1");
+  reread.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  assert.equal(reread.run("release", "--run-id", "r1").json.holdsGuard, false);
+  assert.equal(lockOwner(reread), null);
+
+  // Another run holds the guard at the yes: refused, nothing replayed, its guard untouched.
+  const busy = asked();
+  busy.run("begin", "--run-id", "r2", "--account", "a");
+  const blocked = busy.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([blocked.code, blocked.ownershipLost, blocked.heldBy], ["MAILKEEPER_RUN_BUSY", undefined, "r2"]);
+  assert.equal(busy.mailbox().calls.filter((call) => call.op === "message move").length, 0);
+  assert.equal(lockOwner(busy), "r2");
+  assert.deepEqual(busy.run("release", "--run-id", "r1").json, { ok: true, runId: "r1", released: false, holdsGuard: false, heldBy: "r2" });
+  assert.equal(lockOwner(busy), "r2", "another run's guard is never removed");
+
+  // An uncertain move can't be released as a pause.
+  const uncertain = asked({ fake: { failMove: "unknown" } });
+  assert.equal(uncertain.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
+  assert.equal(uncertain.run("release", "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
+  assert.equal(lockOwner(uncertain), "r1");
+
+  // The guard is lost between chunks: the rest stops, and the confirmed chunk is kept.
+  const many = Array.from({ length: 250 }, (_, i) => msg(100 + i, `noreply${i}@bulk.example`, `Promo ${i}`));
+  const lost = twoInboxes({ b: { messages: many } });
+  lost.setFake("b", { stealLockFile: lockPath(lost), stealLockAfterMoves: 1 });
+  lost.run("begin", "--run-id", "r1", "--account", "b");
+  lost.run("snapshot", "--account", "b", "--run-id", "r1");
+  lost.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  lost.run("release", "--run-id", "r1");
+  const stopped = lost.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([stopped.code, stopped.ownershipLost, stopped.movedBeforeStop], ["MAILKEEPER_RUN_BUSY", true, 200]);
+  const journal = lost.run_("r1");
+  assert.deepEqual([journal.actions.length, journal.pending, journal.uncertain.length], [200, null, 0]);
+  assert.equal(lost.mailbox().calls.filter((call) => call.op === "message move").length, 1, "no move after the guard was lost");
+  assert.equal(lockOwner(lost), "someone-else", "the other run's guard is left alone");
+  const cached = JSON.parse(fs.readFileSync(path.join(lost.dir, ".mailkeeper", "accounts", core.accountKey("b"), "snapshot.json"), "utf8"));
+  assert.equal(cached.envelopes.filter((e) => /^noreply/.test(e.fromAddress)).length, 50, "moved messages leave the cached read");
+});
+
+test("a requested mode change updates MailKeeper's own mode sentence, and only that", () => {
+  const MODE = "## What MailKeeper may do on its own";
+  const workspace = { mode: "archive-promoted", modeCeiling: "archive-promoted" };
+  const fresh = () => {
+    const ws = twoInboxes({ workspace });
+    fs.rmSync(ws.contract("b"));
+    assert.equal(ws.run("contract-init", "--account", "b", "--password-ref", "secret://b-imap").json.created, true);
+    ws.run("contract-set", "--account", "b", "--archive-folder", "Archive");
+    return ws;
+  };
+  const paragraph = (text) => text.split("\n")[text.split("\n").indexOf(MODE) + 2];
+
+  // A new contract: the new header, and its mode paragraph from the shared source.
+  const ws = fresh();
+  const created = fs.readFileSync(ws.contract("b"), "utf8");
+  assert.match(created, /MailKeeper created it once\. When you ask, it changes only its settings block below and, if you haven't edited it, its own sentence about what MailKeeper may do on its own\./);
+  assert.equal(paragraph(created), core.MODE_PARAGRAPHS["report-only"]);
+
+  // Every transition, from each mode's own paragraph.
+  for (const from of core.MODES) {
+    for (const to of core.MODES) {
+      const t = fresh();
+      if (from !== "report-only") assert.equal(t.run("contract-set", "--account", "b", "--mode", from).json.modeSentence, "updated");
+      const before = fs.readFileSync(t.contract("b"), "utf8");
+      const result = t.run("contract-set", "--account", "b", "--mode", to).json;
+      const after = fs.readFileSync(t.contract("b"), "utf8");
+      assert.equal(result.modeSentence, from === to ? "unchanged" : "updated", `${from} → ${to}`);
+      assert.equal(paragraph(after), core.MODE_PARAGRAPHS[to], `${from} → ${to}`);
+      const outsideBlock = (text) => text.replace(/```mailkeeper-policy[\s\S]*?```/, "").split("\n").filter((line) => !Object.values(core.MODE_PARAGRAPHS).includes(line));
+      assert.deepEqual(outsideBlock(after), outsideBlock(before), "nothing else changes");
+    }
+  }
+
+  // No mode asked for: nothing about the sentence, even for other edits.
+  assert.equal(fresh().run("contract-set", "--account", "b", "--vip", "boss@example.com").json.modeSentence, "unchanged");
+
+  // Wording MailKeeper doesn't recognise as its own for the previous mode is kept.
+  const kept = (rewrite) => {
+    const t = fresh();
+    fs.writeFileSync(t.contract("b"), rewrite(fs.readFileSync(t.contract("b"), "utf8")));
+    const before = fs.readFileSync(t.contract("b"), "utf8");
+    const result = t.run("contract-set", "--account", "b", "--mode", "label-only").json;
+    const after = fs.readFileSync(t.contract("b"), "utf8");
+    assert.equal(result.modeSentence, "kept-edited");
+    assert.equal(result.ok, true, "the settings change still applies");
+    assert.equal(after.replace(/```mailkeeper-policy[\s\S]*?```/, ""), before.replace(/```mailkeeper-policy[\s\S]*?```/, ""));
+  };
+  const starter = core.MODE_PARAGRAPHS["report-only"];
+  kept((text) => text.replace(starter, "Report only, please. Nothing moves."));
+  kept((text) => text.replace(starter, `${starter} Never touch my newsletters.`));
+  kept((text) => text.replace(starter, `${starter}\nAnd ask me first about anything from school.`));
+  kept((text) => text.replace(MODE, `${MODE}\n\n${starter}\n\n${MODE}`));
+  kept((text) => text.replace(starter, core.MODE_PARAGRAPHS["archive-promoted"]));
+
+  // A contract from an earlier version keeps its old header; its starter sentence still follows.
+  const old = fresh();
+  const oldText = fs
+    .readFileSync(old.contract("b"), "utf8")
+    .replace(/^This contract belongs to you\..*$/m, "This contract belongs to you. MailKeeper created it once and never overwrites it.");
+  fs.writeFileSync(old.contract("b"), oldText);
+  assert.equal(old.run("contract-set", "--account", "b", "--mode", "label-only").json.modeSentence, "updated");
+  const oldAfter = fs.readFileSync(old.contract("b"), "utf8");
+  assert.match(oldAfter, /MailKeeper created it once and never overwrites it\./);
+  assert.equal(paragraph(oldAfter), core.MODE_PARAGRAPHS["label-only"]);
+});
+
+test("status answers per inbox: modes, the last run, its undo and urgent items, from what was recorded", () => {
+  const ws = twoInboxes();
+  let status = ws.run("status").json;
+  const b = () => status.inboxes.find((i) => i.name === "b");
+  assert.deepEqual([b().mode, b().effectiveMode, b().lastRun], ["label-only", "label-only", null]);
+
+  ws.run("begin", "--run-id", "r1", "--account", "b");
+  ws.run("snapshot", "--account", "b", "--run-id", "r1");
+  ws.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1");
+  ws.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1");
+  ws.run("submit", "--run-id", "r1", "--summary", "t");
+  status = ws.run("status").json;
+  assert.deepEqual(
+    [b().lastRun.runId, b().lastRun.outcome, b().lastRun.moved, b().lastRun.urgentChecked, b().lastRun.urgentCount, b().lastRun.undo],
+    ["r1", "completed", 2, true, 1, { state: "none" }]
+  );
+  assert.deepEqual(b().lastRun.urgent, [{ from: "noreply@billing.example", subject: "Final notice: payment overdue" }]);
+  assert.equal(b().lastRun.coverage.complete, true);
+  assert.equal(status.inboxes.find((i) => i.name === "a").lastRun, null, "a run that didn't cover an inbox isn't its last run");
+
+  // One moved message is gone from its folder: the undo is partial, with what remains.
+  const box = ws.mailbox().accounts.b.folders;
+  ws.setFake("b", { folders: { ...box, "Auto/Notifications": box["Auto/Notifications"].slice(1) } });
+  ws.run("undo", "--run-id", "r1", "--account", "b");
+  status = ws.run("status").json;
+  assert.deepEqual(b().lastRun.undo, { state: "partial", remaining: 1 });
+  ws.setFake("b", { folders: { ...ws.mailbox().accounts.b.folders, "Auto/Notifications": [box["Auto/Notifications"][0]] } });
+  ws.run("undo", "--run-id", "r1", "--account", "b");
+  status = ws.run("status").json;
+  assert.equal(b().lastRun.undo.state, "done");
+
+  // A contract asking for more than the workspace allows shows both.
+  ws.run("contract-set", "--account", "b", "--mode", "archive-promoted", "--archive-folder", "Archive");
+  status = ws.run("status").json;
+  assert.deepEqual([b().mode, b().effectiveMode], ["archive-promoted", "label-only"]);
+
+  const skill = fs.readFileSync(path.join(__dirname, "..", "skills", "mailbox-cleanup", "SKILL.md"), "utf8");
+  for (const line of [
+    "run `mailbox-ops release --run-id <id>` and go on only when it answers `holdsGuard: false`",
+    "I couldn't confirm whether another MailKeeper run has ended, so I haven't started these moves. Ask me again and I'll show you the current plan.",
+    "I moved <n> as planned, then stopped before moving the rest. Ask me again and I'll show you the current plan for the rest.",
+    "The last connection check for work@example.com was before this update. Say “check work@example.com” to confirm it.",
+    "I've updated the settings and the sentence under “What MailKeeper may do on its own” to match.",
+    "I've updated the settings and left the wording under ‘What MailKeeper may do on its own’ unchanged. Want me to update it to match?",
+  ]) {
+    assert.ok(skill.includes(line), line);
+  }
+  assert.equal(skill.includes("stays open until you answer"), false);
+});
+
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {
   const ws = twoInboxes();
   ws.run("begin", "--run-id", "r1", "--account", "b");
