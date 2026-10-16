@@ -34,15 +34,17 @@ test("workspace mode is capped by the global ceiling", () => {
   assert.equal(config.modeCappedByCeiling, true);
 });
 
-test("email accounts must be Himalaya account names, not addresses", () => {
-  const { errors } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["work", "me@example.com"] });
-  assert.ok(errors.some((e) => /"me@example.com" must be a Himalaya account name/.test(e)));
+test("inbox names are Himalaya account names, which may look like addresses", () => {
+  const ok = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["work", "me@example.com", "My Inbox"] });
+  assert.deepEqual(ok.errors, []);
+  const bad = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["work", "line\nbreak", "x".repeat(201)] });
+  assert.ok(bad.errors.some((e) => /control characters/.test(e)));
 });
 
 test("at least one account is required and duplicates collapse", () => {
   assert.ok(
     resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: [] }).errors.includes(
-      "At least one email account is required."
+      "At least one inbox is required."
     )
   );
   const { config } = resolveProfileConfig({ ...valid, EMAIL_ACCOUNTS: ["a", "a", "b"] });
@@ -55,10 +57,13 @@ test("empty cadence falls back to the daily default", () => {
   assert.equal(config.cadence, "1d");
 });
 
-test("cadence must be a positive duration", () => {
+test("schedule must be manual or a positive duration", () => {
   for (const bad of ["0d", "daily", "1w"]) {
     const { errors } = resolveProfileConfig({ ...valid, CADENCE: bad });
-    assert.ok(errors.some((e) => /Cadence/.test(e)), `expected cadence error for ${JSON.stringify(bad)}`);
+    assert.ok(errors.some((e) => /Schedule/.test(e)), `expected schedule error for ${JSON.stringify(bad)}`);
+  }
+  for (const good of ["manual", "1h", "8h", "1d", "7d"]) {
+    assert.deepEqual(resolveProfileConfig({ ...valid, CADENCE: good }).errors, [], good);
   }
 });
 
@@ -70,4 +75,44 @@ test("aggressiveness widens promotable passes", () => {
 
 test("mode ladder order is stable", () => {
   assert.deepEqual(MODES, ["report-only", "label-only", "archive-promoted"]);
+});
+
+test("effort is forwarded with the agent's option key when a model is selected", () => {
+  const codex = resolveProfileConfig({ ...valid, AGENT: "codex", MODEL: "gpt-5", EFFORT: "high" }).config.effort;
+  assert.deepEqual(codex, { requested: "high", forwarded: "high", runtimeOptionValues: { reasoning_effort: "high" }, warning: null });
+  const claude = resolveProfileConfig({ ...valid, AGENT: "claude", MODEL: "opus", EFFORT: "low" }).config.effort;
+  assert.deepEqual(claude.runtimeOptionValues, { effort: "low" });
+});
+
+test("empty effort keeps the agent default and forwards nothing", () => {
+  for (const EFFORT of ["", "   ", null, undefined]) {
+    const { config, errors } = resolveProfileConfig({ ...valid, MODEL: "gpt-5", EFFORT });
+    assert.deepEqual(errors, []);
+    assert.deepEqual(config.effort, { requested: null, forwarded: null, runtimeOptionValues: {}, warning: null });
+  }
+});
+
+test("effort that cannot be applied is a warning, never a config error", () => {
+  const noModel = resolveProfileConfig({ ...valid, AGENT: "codex", MODEL: "", EFFORT: "high" });
+  assert.deepEqual(noModel.errors, []);
+  assert.deepEqual(noModel.config.effort.runtimeOptionValues, {});
+  assert.deepEqual(noModel.config.effort.warning, { code: "MAILKEEPER_EFFORT_UNSUPPORTED", reason: "no-model" });
+  assert.equal(noModel.config.effort.requested, "high");
+
+  const unmapped = resolveProfileConfig({ ...valid, AGENT: "gemini", MODEL: "pro", EFFORT: "high" });
+  assert.deepEqual(unmapped.errors, []);
+  assert.deepEqual(unmapped.config.effort.warning, { code: "MAILKEEPER_EFFORT_UNSUPPORTED", reason: "unmapped-agent" });
+});
+
+test("a missing agent is still a configuration error", () => {
+  const { errors } = resolveProfileConfig({ ...valid, AGENT: "", EFFORT: "high" });
+  assert.ok(errors.includes("Maintenance agent is required."));
+});
+
+test("VIP senders normalise to an address or a domain with its subdomains", () => {
+  const { config, errors } = resolveProfileConfig({ ...valid, VIP_SENDERS: ["Boss@Example.com", "*.bank.com", "@school.edu", ".gov.vn"] });
+  assert.deepEqual(errors, []);
+  assert.deepEqual(config.vipSenders, ["boss@example.com", "bank.com", "school.edu", "gov.vn"]);
+  const bad = resolveProfileConfig({ ...valid, VIP_SENDERS: ["*bank*", "not a sender"] });
+  assert.equal(bad.errors.filter((e) => /VIP sender/.test(e)).length, 2);
 });

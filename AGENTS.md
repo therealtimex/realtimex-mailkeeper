@@ -21,10 +21,10 @@ This file is for coding agents (Codex/Claude/Cursor/etc.). Keep it strict and ac
 - Start here:
   - `README.md`
   - `skills/mailbox-cleanup/SKILL.md` for interactive and maintenance contracts
-  - `templates/MAILBOX.md` for the human-owned mailbox policy
+  - `skills/mailbox-cleanup/templates/MAILBOX.md` for the human-owned per-inbox contract
 - Plugin entrypoint: `index.js`; host capability adapter: `runtime/host.js`.
 - Release packaging: `scripts/build-plugin-release.mjs`.
-- Tests: `tests/config.test.js` and `tests/host.test.js`.
+- Tests: `tests/*.test.js` (fakes and an IMAP stub in `tests/fixtures/`).
 
 #### Commands (copy/paste)
 **Local checks**
@@ -45,8 +45,8 @@ npm run build:plugin
 #### Where to put new things
 
 - Plugin runtime logic — `runtime/`; host capability access — `runtime/host.js` only.
-- Workspace cleanup CLI — `skills/mailbox-cleanup/scripts/mailbox-ops.js`.
-- Seeded mailbox policy — `templates/MAILBOX.md`.
+- Workspace cleanup CLI — `skills/mailbox-cleanup/scripts/mailbox-ops.js`; rules shared with the plugin runtime — `skills/mailbox-cleanup/scripts/mailkeeper-core.js`.
+- Seeded inbox contract — `skills/mailbox-cleanup/templates/MAILBOX.md`.
 - Release utilities — `scripts/`; automated coverage — `tests/`.
 - Create planning/spec directories only when requested; they are not part of the current layout.
 <!-- AGENTSGEN:END section=repo_context -->
@@ -60,10 +60,10 @@ npm run build:plugin
 - Keep mailbox mutations limited to moves into configured archive or `Auto/*` folders; never add delete, trash, reply, or server-side filter behavior.
 - Default to `report-only` and preserve the global mode ceiling. Maintenance executes only human-promoted rules; proposals never activate themselves.
 - Preserve VIP sender, protected domain, flagged-message, and urgency-triage exclusions in every pass. Workspace settings cannot override globally protected domains.
-- Run urgency triage before cleanup passes. Interactive applies require a dry-run preview and explicit human confirmation for each apply.
+- Run urgency triage before cleanup passes. Interactive applies require a dry-run preview and explicit human confirmation for each plan: one question covers the moves it lists; a changed or later selection is asked again.
 - Preserve one receipt per run, each moved UID and its account/source/destination, and the ability to undo across all affected accounts.
-- Treat workspace `MAILBOX.md` as human-owned policy: seed it only when absent and never overwrite existing preferences. Keep message bodies and credentials out of chat and logs.
-- Confine host capability access and server-internal `@/` imports to `runtime/host.js`; preserve its preference for public SDK namespaces when available. Keep the workspace cleanup CLI self-contained.
+- Treat each inbox contract (`mailboxes/<key>/MAILBOX.md`) as human-owned policy: seed it only when absent and never overwrite existing preferences. Never let one inbox's contract, rules, folders or credential affect another. Keep message bodies and credentials out of chat, logs, files and arguments; credentials reach Himalaya only through `himalaya-runner.js`/`himalaya-auth.js`.
+- Confine host capability access to `runtime/host.js`, using only the public plugin SDK; never import server internals (`@/`). Keep the workspace cleanup CLI self-contained: it may require only its sibling skill files.
 
 #### 0) Scope & intent
 - Implement exactly what's requested. If requirements are ambiguous: ask one precise question (or make the smallest reasonable assumption and state it).
@@ -164,7 +164,7 @@ Think like you're preparing a PR:
 - Code changes: `npm test` and `npm run lint:manifest`.
 - Packaging or shipped asset changes: also run `npm run build:plugin`; artifacts are written to ignored `dist/`.
 - Documentation-only changes: verify referenced commands and paths against the repository; run commands whose behavior the documentation changes.
-- Existing tests cover config and the host adapter. They do not verify live IMAP behavior, rule application, or undo; add focused coverage when changing those contracts.
+- Tests cover config, the host adapter, contracts and policy, provisioning, and the workspace CLI against a fake Himalaya. They do not verify a live IMAP server; add focused coverage when changing those contracts.
 
 #### If checks cannot be run
 State:
@@ -250,10 +250,10 @@ State:
 
 <!-- AGENTSGEN:START section=structure -->
 - **Entrypoint:** `index.js` — plugin routes, lifecycle, heartbeat hooks.
-- **Runtime:** `runtime/host.js` (host adapter), `runtime/config.js` (configuration and mode ceiling), `runtime/service.js` (provisioning, rules, receipts, undo), `runtime/mailbox.js` (Himalaya wrapper).
-- **Workspace skill:** `skills/mailbox-cleanup/SKILL.md` and `skills/mailbox-cleanup/scripts/mailbox-ops.js`.
-- **Policy template:** `templates/MAILBOX.md`.
-- **Tests:** `tests/config.test.js` and `tests/host.test.js`.
+- **Runtime:** `runtime/host.js` (host adapter), `runtime/config.js` (configuration, mode ceiling, effort), `runtime/service.js` (provisioning, inbox contracts, rules, receipts), `runtime/mailbox.js` (Himalaya account discovery).
+- **Workspace skill:** `skills/mailbox-cleanup/SKILL.md`, `templates/MAILBOX.md` and `scripts/` (`mailbox-ops.js`, `mailkeeper-core.js`, `himalaya-runner.js`, `himalaya-auth.js`).
+- **Contract template:** `skills/mailbox-cleanup/templates/MAILBOX.md`.
+- **Tests:** `tests/*.test.js`; fixtures in `tests/fixtures/`.
 - **Release packaging:** `scripts/build-plugin-release.mjs`; generated output in `dist/`.
 - **Config:** `package.json` and `realtimex.plugin.json`.
 - **Agent guidance:** `CLAUDE.md` is a symlink to `AGENTS.md`; preserve the shared source.

@@ -1,34 +1,32 @@
 "use strict";
 
-const MODES = ["report-only", "label-only", "archive-promoted"];
-const AGGRESSIVENESS = ["conservative", "standard", "aggressive"];
+const {
+  MODES,
+  AGGRESSIVENESS,
+  PASSES_BY_AGGRESSIVENESS,
+  modeRank,
+  validAccountName,
+  normalizeSender,
+} = require("../skills/mailbox-cleanup/scripts/mailkeeper-core");
+
 const CADENCE_RE = /^(?:\d+d)?(?:\d+h)?(?:\d+m)?$/;
+/** Schedule "Manual": the managed task stays, with `interval: disabled`. */
+const CADENCE_MANUAL = "manual";
 
 /**
- * Which cleanup passes may be promoted at each aggressiveness level.
- * Mirrors the Vellum inbox-cleanup playbook; "safe" patterns first.
+ * Runtime option key that carries reasoning effort for each verified
+ * terminal agent. The public plugin API exposes the scalar EFFORT field, not
+ * the host's option resolver, so the mapping lives here; add an agent only
+ * after its launch has been verified.
  */
-const PASSES_BY_AGGRESSIVENESS = {
-  conservative: ["no-reply", "calendar-response", "sketchy-tld"],
-  standard: [
-    "no-reply",
-    "calendar-response",
-    "sketchy-tld",
-    "receipt",
-    "generic-outreach",
-    "age",
-  ],
-  aggressive: [
-    "no-reply",
-    "calendar-response",
-    "sketchy-tld",
-    "receipt",
-    "generic-outreach",
-    "age",
-    "personalized-outreach",
-    "repeat-sender",
-  ],
-};
+const EFFORT_OPTION_KEYS = { codex: "reasoning_effort", claude: "effort" };
+
+/**
+ * The scheduler resolves runtime options against the task's explicit model;
+ * with Model empty the option is dropped at launch. Forward effort only when
+ * a model is selected so the task never claims an effort it will not get.
+ */
+const EFFORT_NEEDS_MODEL = true;
 
 function text(value, max = 500) {
   return String(value ?? "")
@@ -42,8 +40,31 @@ function list(value) {
     : [];
 }
 
-function modeRank(mode) {
-  return MODES.indexOf(mode);
+/**
+ * Decide which runtime option (if any) carries the requested effort.
+ * Never an error: an effort the launch cannot apply is a warning the next
+ * report explains, and the schedule keeps running at the agent's default.
+ */
+function resolveEffort({ agent, model, effort }) {
+  if (!effort) return { requested: null, forwarded: null, runtimeOptionValues: {}, warning: null };
+  const optionKey = EFFORT_OPTION_KEYS[agent];
+  if (!optionKey) {
+    return {
+      requested: effort,
+      forwarded: null,
+      runtimeOptionValues: {},
+      warning: { code: "MAILKEEPER_EFFORT_UNSUPPORTED", reason: "unmapped-agent" },
+    };
+  }
+  if (EFFORT_NEEDS_MODEL && !model) {
+    return {
+      requested: effort,
+      forwarded: null,
+      runtimeOptionValues: {},
+      warning: { code: "MAILKEEPER_EFFORT_UNSUPPORTED", reason: "no-model" },
+    };
+  }
+  return { requested: effort, forwarded: effort, runtimeOptionValues: { [optionKey]: effort }, warning: null };
 }
 
 /**
@@ -51,50 +72,63 @@ function modeRank(mode) {
  * config the host hands us (api.getConfig({ workspaceSlug })).
  *
  * Returns { config, errors }. `errors` non-empty means the profile is not
- * ready and no heartbeat task may be provisioned.
+ * ready and no heartbeat task may be provisioned. Effort compatibility is
+ * never an error; it is reported through `config.effort.warning`.
  */
 function resolveProfileConfig(raw = {}) {
   const ceiling = text(raw.DEFAULT_MODE_CEILING, 40) || "label-only";
   const requestedMode = text(raw.MODE, 40) || "report-only";
   const effectiveMode =
     modeRank(requestedMode) > modeRank(ceiling) ? ceiling : requestedMode;
+  const accounts = Array.isArray(raw.EMAIL_ACCOUNTS)
+    ? raw.EMAIL_ACCOUNTS.filter((entry) => typeof entry === "string" && entry.length > 0)
+    : [];
+  const vipEntries = list(raw.VIP_SENDERS);
+  const agent = text(raw.AGENT, 60);
+  const model = text(raw.MODEL, 120);
 
   const config = {
     // global
     modeCeiling: ceiling,
     autoFolderPrefix: text(raw.AUTO_FOLDER_PREFIX, 60) || "Auto",
-    protectedDomains: list(raw.PROTECTED_DOMAINS),
+    protectedDomains: list(raw.PROTECTED_DOMAINS).map((entry) => entry.toLowerCase()),
     retentionDays: Number(raw.RETENTION_DAYS) || 90,
     // workspace
-    emailAccounts: [...new Set(list(raw.EMAIL_ACCOUNTS))],
+    emailAccounts: [...new Set(accounts)],
     requestedMode,
     mode: effectiveMode,
     modeCappedByCeiling: effectiveMode !== requestedMode,
     cadence: text(raw.CADENCE, 20).toLowerCase() || "1d",
     ageThresholdDays: Number(raw.AGE_THRESHOLD_DAYS) || 90,
     aggressiveness: text(raw.AGGRESSIVENESS, 20).toLowerCase() || "conservative",
-    vipSenders: list(raw.VIP_SENDERS),
-    agent: text(raw.AGENT, 60),
-    model: text(raw.MODEL, 120),
-    contractPath: "MAILBOX.md",
+    vipSenders: [...new Set(vipEntries.map(normalizeSender).filter(Boolean))],
+    agent,
+    model,
+    effort: resolveEffort({ agent, model, effort: text(raw.EFFORT, 40) }),
   };
   config.promotablePasses =
     PASSES_BY_AGGRESSIVENESS[config.aggressiveness] ||
     PASSES_BY_AGGRESSIVENESS.conservative;
 
   const errors = [];
-  if (!config.emailAccounts.length) errors.push("At least one email account is required.");
+  if (!config.emailAccounts.length) errors.push("At least one inbox is required.");
   for (const account of config.emailAccounts) {
-    if (/[@\s]/.test(account)) {
-      errors.push(
-        `Email account "${account}" must be a Himalaya account name, not an address.`
-      );
+    if (!validAccountName(account)) {
+      errors.push("An inbox name is empty, too long, or contains control characters.");
+    }
+  }
+  for (const entry of vipEntries) {
+    if (!normalizeSender(entry)) {
+      errors.push(`VIP sender "${entry.slice(0, 80)}" is not an email address or domain.`);
     }
   }
   if (!MODES.includes(config.modeCeiling)) errors.push("Mode ceiling is invalid.");
   if (!MODES.includes(config.requestedMode)) errors.push("Mode is invalid.");
-  if (!CADENCE_RE.test(config.cadence) || !/[1-9]/.test(config.cadence)) {
-    errors.push("Cadence must be a positive duration using m, h, or d.");
+  if (
+    config.cadence !== CADENCE_MANUAL &&
+    (!CADENCE_RE.test(config.cadence) || !/[1-9]/.test(config.cadence))
+  ) {
+    errors.push("Schedule must be manual or a positive duration using m, h, or d.");
   }
   if (!AGGRESSIVENESS.includes(config.aggressiveness)) {
     errors.push("Aggressiveness is invalid.");
@@ -108,8 +142,11 @@ function resolveProfileConfig(raw = {}) {
 }
 
 module.exports = {
+  CADENCE_MANUAL,
   MODES,
   AGGRESSIVENESS,
   PASSES_BY_AGGRESSIVENESS,
+  EFFORT_OPTION_KEYS,
+  resolveEffort,
   resolveProfileConfig,
 };
