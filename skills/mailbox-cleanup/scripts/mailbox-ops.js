@@ -1671,11 +1671,17 @@ function moveChunks(run, rules, inbox, envelopes, from, to, extra) {
 const TABLE_RE = /^\s*\[\s*([^\]]+?)\s*\]\s*(?:#.*)?$/;
 
 function accountTableName(header) {
-  // [accounts.name] or [accounts."name"] (with optional sub-table suffix)
-  const match = /^accounts\.(?:"((?:[^"\\]|\\.)*)"|([A-Za-z0-9_-]+))(\..*)?$/.exec(header);
+  // [accounts.name], [accounts."name"] or [accounts.'name'], with optional
+  // spaces around the dot and an optional sub-table suffix.
+  const match = /^accounts\s*\.\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)'|([A-Za-z0-9_-]+))\s*(\..*)?$/.exec(header);
   if (!match) return null;
-  const name = match[1] !== undefined ? JSON.parse(`"${match[1]}"`) : match[2];
-  return { name, subTable: Boolean(match[3]) };
+  let name;
+  try {
+    name = match[1] !== undefined ? JSON.parse(`"${match[1]}"`) : match[2] !== undefined ? match[2] : match[3];
+  } catch {
+    return null;
+  }
+  return { name, subTable: Boolean(match[4]) };
 }
 
 /** Locate one account's stanza by table headers only; values are never parsed out. */
@@ -1872,7 +1878,10 @@ function connectionBinding(config, account, credential) {
   return { signIn, file, settings };
 }
 
-const sameBinding = (a, b) => Boolean(a && b && a.signIn && a.signIn === b.signIn && a.file === b.file && a.settings === b.settings);
+// Settings that couldn't be found or read are never a match: a check whose
+// connection settings are unknown doesn't count.
+const sameBinding = (a, b) =>
+  Boolean(a && b && a.signIn && a.file && a.settings && a.signIn === b.signIn && a.file === b.file && a.settings === b.settings);
 
 function setupInbox(account) {
   if (!core.validAccountName(account)) throw failure("MAILKEEPER_ACCOUNT_NOT_FOUND");
@@ -2558,6 +2567,13 @@ const commands = {
     perInbox(
       args,
       ({ rules, run, account, inbox, entry }) => {
+        // A move recorded as started but never confirmed (the helper stopped
+        // mid-move) has an unknown result: it becomes uncertain, kept as
+        // evidence, and no other move may replace it.
+        if (run.pending) {
+          run.uncertain.push(run.pending);
+          run.pending = null;
+        }
         if (run.uncertain.some((u) => u.account === account)) throw failure("MAILKEEPER_MUTATION_UNCERTAIN", { account });
         if (inbox.contract.status === "invalid") throw failure(inbox.contract.code || "MAILKEEPER_CONTRACT_INVALID", { account });
         if (inbox.contract.status === "review-required") {

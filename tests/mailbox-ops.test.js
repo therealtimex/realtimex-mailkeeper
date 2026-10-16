@@ -47,7 +47,8 @@ function standardInbox() {
 function makeWorkspace({ inboxes, promoted = [], workspace = {}, revision = 1 }) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "mk-ops-"));
   const configFile = path.join(dir, "himalaya.toml");
-  fs.writeFileSync(configFile, "# fake\n");
+  // One stanza per inbox, as Himalaya's own config has: connection checks are bound to it.
+  fs.writeFileSync(configFile, Object.keys(inboxes).map((name) => `[accounts.${JSON.stringify(name)}]\nemail = ${JSON.stringify(`${name}@example.com`)}\n`).join("\n"));
   const mailboxFile = path.join(dir, "fake-mailbox.json");
   const caps = {
     emailAccounts: Object.keys(inboxes),
@@ -579,6 +580,7 @@ test("a connection check counts for setup only with the sign-in and server setti
   const box = ws.mailbox();
   box.accounts.c = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [] } };
   fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
+  fs.appendFileSync(configFile, '[accounts.c]\nemail = "c@example.com"\n');
   ws.run("check", "--account", "c", "--password-ref", "secret://a-imap");
   ws.run("contract-init", "--account", "c", "--password-ref", "secret://a-imap");
   ws.writeRules({
@@ -586,6 +588,41 @@ test("a connection check counts for setup only with the sign-in and server setti
     accounts: { ...ws.rules.accounts, c: { key: core.accountKey("c"), contract: core.contractRelativePath(core.accountKey("c")) } },
   });
   assert.deepEqual(complete().c, [true, true], "the earlier check counts for the contract's Login");
+});
+
+test("a connection check whose server settings can't be found or read never counts", () => {
+  const ws = twoInboxes();
+  const configFile = path.join(ws.dir, "himalaya.toml");
+  const complete = () => Object.fromEntries(ws.run("status").json.inboxes.map((i) => [i.name, [i.setupComplete, i.lastCheck?.current ?? null]]));
+
+  // A literal-quoted account key, as Himalaya accepts: recognized and bound.
+  fs.writeFileSync(configFile, "[accounts.'a']\nemail = \"a@example.com\"\nbackend.host = \"imap.a.example\"\n\n[ accounts . \"b\" ]\nemail = \"b@example.com\"\n");
+  ws.run("check", "--account", "a");
+  ws.run("check", "--account", "b");
+  assert.deepEqual(complete(), { a: [true, true], b: [true, true] });
+  fs.writeFileSync(configFile, "[accounts.'a']\nemail = \"a@example.com\"\nbackend.host = \"imap.elsewhere.example\"\n\n[ accounts . \"b\" ]\nemail = \"b@example.com\"\n");
+  assert.deepEqual(complete().a, [false, false], "a server change under a literal key is seen");
+
+  // No stanza MailKeeper can find: the check succeeds but never counts, even unchanged.
+  fs.writeFileSync(configFile, "[accounts]\na.email = \"a@example.com\"\n");
+  assert.equal(ws.run("check", "--account", "a").json.ok, true);
+  assert.deepEqual(complete().a, [false, false]);
+
+  // An unreadable settings file, or a check recorded without its binding.
+  fs.writeFileSync(configFile, "[accounts.a]\nemail = \"a@example.com\"\n");
+  ws.run("check", "--account", "a");
+  assert.deepEqual(complete().a, [true, true]);
+  if (process.getuid?.() !== 0) {
+    // (Permissions don't stop root, so this part only runs as a normal user.)
+    fs.chmodSync(configFile, 0o000);
+    try {
+      assert.deepEqual(complete().a, [false, false]);
+    } finally {
+      fs.chmodSync(configFile, 0o600);
+    }
+  }
+  fs.writeFileSync(path.join(ws.dir, ".mailkeeper", "accounts", core.accountKey("a"), "check.json"), JSON.stringify({ account: "a", ok: true, at: new Date().toISOString() }));
+  assert.deepEqual(complete().a, [false, false], "a check from before this version doesn't count");
 });
 
 test("contract-set changes only the settings block and never implies review consent", () => {
@@ -1885,7 +1922,42 @@ test("a chat apply moves only what the last question showed, in its order, from 
   fs.writeFileSync(runFile, JSON.stringify(stored));
   assert.deepEqual(refusedWith(legacy, "no-reply"), ["MAILKEEPER_PLAN_CHANGED", false, null]);
 
-  // A pending or uncertain move still wins over a plan refusal.
+  // A move left pending by a crash (started, never acknowledged): its result is
+  // unknown, so nothing moves and no folder is created, even for an invalid plan,
+  // and its record is kept.
+  const crashed = setup();
+  crashed.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
+  const crashedFile = path.join(crashed.dir, ".mailkeeper", "runs", "r1.json");
+  const journal = JSON.parse(fs.readFileSync(crashedFile, "utf8"));
+  const shownUids = ["300", "301"];
+  journal.pending = { account: "b", from: "INBOX", to: "Auto/Notifications", uids: shownUids, pass: "no-reply", ruleId: null, question: journal.questions.b.id, at: new Date().toISOString() };
+  fs.writeFileSync(crashedFile, JSON.stringify(journal));
+  const moves = () => crashed.mailbox().calls.filter((call) => call.op === "message move").length;
+  for (const pass of ["no-reply", "calendar-response"]) {
+    const before = structuredClone(crashed.mailbox().accounts.b.folders);
+    assert.equal(crashed.run("apply", "--account", "b", "--pass", pass, "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN", pass);
+    assert.deepEqual(crashed.mailbox().accounts.b.folders, before);
+    assert.equal(moves(), 0);
+  }
+  const kept = crashed.run_("r1");
+  assert.equal(kept.pending, null);
+  assert.deepEqual(kept.uncertain.map((u) => [u.account, u.uids, u.question]), [["b", shownUids, journal.questions.b.id]], "kept once, as uncertain");
+
+  // Another inbox can still move; the pending record isn't replaced or lost.
+  const other = twoInboxes();
+  other.run("begin", "--run-id", "r1");
+  other.run("snapshot", "--account", "a", "--run-id", "r1");
+  other.run("snapshot", "--account", "b", "--run-id", "r1");
+  other.run("preview", "--account", "a", "--passes", "no-reply", "--run-id", "r1");
+  const otherFile = path.join(other.dir, ".mailkeeper", "runs", "r1.json");
+  const otherJournal = JSON.parse(fs.readFileSync(otherFile, "utf8"));
+  otherJournal.pending = { account: "b", from: "INBOX", to: "Auto/Notifications", uids: ["1"], pass: "no-reply", ruleId: null, at: new Date().toISOString() };
+  fs.writeFileSync(otherFile, JSON.stringify(otherJournal));
+  assert.equal(other.run("apply", "--account", "a", "--pass", "no-reply", "--run-id", "r1").json.ok, true);
+  assert.deepEqual(other.run_("r1").uncertain.map((u) => [u.account, u.uids]), [["b", ["1"]]]);
+  assert.equal(other.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.code, "MAILKEEPER_MUTATION_UNCERTAIN");
+
+  // An uncertain move still wins over a plan refusal.
   const uncertain = setup();
   uncertain.setFake("b", { failMove: "unknown" });
   uncertain.run("preview", "--account", "b", "--passes", "no-reply,calendar-response", "--run-id", "r1");
