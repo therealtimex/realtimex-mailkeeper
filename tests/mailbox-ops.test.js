@@ -2088,6 +2088,77 @@ test("status undo is each inbox's own: preview only, one inbox done, the other u
   assert.deepEqual(lastRunOf(uncertain, "b").undo, { state: "uncertain", remaining: 2 });
 });
 
+// QA 2979e31: account-security mail is always ask first, whatever the pass.
+const ACCOUNT_SECURITY = [
+  ["no-reply@accounts.google.com", "2-Step Verification turned on"],
+  ["noreply@capy.ai", "New device signed in to your Capy account"],
+  ["no-reply@accounts.google.com", "Your Google Account was recovered successfully"],
+  ["no-reply@accounts.google.com", "Your password was changed"],
+  ["account-security-noreply@accountprotection.microsoft.com", "Microsoft account password change"],
+  ["noreply@github.com", "[GitHub] A new SSH authentication public key was added to your account"],
+  ["noreply@example.com", "Two-step verification is now on"],
+  ["noreply@example.com", "Your password has been reset"],
+  ["noreply@example.com", "New login to your account"],
+  ["noreply@example.com", "An app password was created"],
+  ["noreply@example.com", "Security key added to your account"],
+  ["noreply@example.com", "A new personal access token was added"],
+  ["no-reply@accounts.google.com", "Your Google Account summary"], // the sender alone
+];
+
+test("account-security mail is always ask first, by subject or by a known security sender", () => {
+  const { CONFIRM_FIRST_RE, isAccountSecuritySender } = require(OPS);
+  for (const [from, subject] of ACCOUNT_SECURITY) {
+    assert.ok(CONFIRM_FIRST_RE.test(subject) || isAccountSecuritySender(from), `${from} | ${subject}`);
+  }
+  for (const subject of ["Weekly digest", "Your deals this week", "Your receipt 1", "Your order has shipped", "Password managers compared", "Sign in to see your offers"]) {
+    assert.equal(CONFIRM_FIRST_RE.test(subject), false, subject);
+  }
+  for (const from of ["noreply@news.example", "no-reply@shop.example", "noreply@google.com", "securities@bank-news.example"]) {
+    assert.equal(isAccountSecuritySender(from), false, from);
+  }
+  assert.equal(isAccountSecuritySender("security@example.com"), true);
+});
+
+test("account-security mail never enters a plan, Move all, an approved rule or a suggestion; ordinary cleanup still works", () => {
+  const security = ACCOUNT_SECURITY.map(([from, subject], i) => msg(900 + i, from, subject));
+  const ordinary = [msg(950, "noreply@news.example", "Weekly digest"), msg(951, "noreply@shop.example", "Your deals this week")];
+  const setup = () => {
+    const ws = twoInboxes({ b: { messages: [...security, ...ordinary], folders: { "Auto/Notifications": [] } } });
+    return ws;
+  };
+  const left = (ws) => ws.mailbox().accounts.b.folders.INBOX.map((m) => m.subject).sort();
+
+  // The chat plan and its Move all.
+  const chat = setup();
+  chat.run("begin", "--run-id", "r1", "--account", "b");
+  chat.run("snapshot", "--account", "b", "--run-id", "r1");
+  const question = chat.run("preview", "--account", "b", "--passes", "no-reply", "--run-id", "r1").json;
+  assert.deepEqual([question.moveCount, question.plans[0].count, question.destinations.map((d) => [d.target, d.count])], [2, 2, [["Auto/Notifications", 2]]]);
+  assert.equal(question.plans[0].sampleSubjects.some((line) => ACCOUNT_SECURITY.some(([, subject]) => line.includes(subject))), false);
+  // Named for the person, left for them: those this question's pass would have taken
+  // (the Microsoft sender isn't a no-reply address, so No-reply never matches it).
+  assert.equal(question.alwaysAskFirstLeftInPlace.total, security.length - 1);
+  assert.deepEqual(question.alwaysAskFirstLeftInPlace.items[0], { from: "no-reply@accounts.google.com", subject: "2-Step Verification turned on" });
+  assert.equal(chat.run("apply", "--account", "b", "--pass", "no-reply", "--run-id", "r1").json.results[0].moved, 2);
+  assert.deepEqual(left(chat), security.map((m) => m.subject).sort(), "every account-security message stays in the inbox");
+
+  // An approved no-reply rule on a scheduled run.
+  const scheduled = setup();
+  maintenance(scheduled, "r1", ["b"]);
+  assert.deepEqual(scheduled.receipt("r1").accounts.b.movedByDestination, { "Auto/Notifications": 2 });
+  assert.deepEqual(left(scheduled), security.map((m) => m.subject).sort());
+
+  // Suggestions in a report-only inbox.
+  // (A rule is suggested from five candidates: six ordinary ones, never the security mail.)
+  const reportOnly = twoInboxes({ promoted: [], b: { messages: [...security, ...tenNoReply().slice(0, 6)], policy: { mode: "report-only", credential: secretB } } });
+  reportOnly.run("begin", "--run-id", "r1", "--account", "b");
+  reportOnly.run("snapshot", "--account", "b", "--run-id", "r1");
+  reportOnly.run("propose", "--account", "b", "--run-id", "r1");
+  const suggested = reportOnly.run_("r1").proposals.filter((p) => p.pass === "no-reply");
+  assert.deepEqual(suggested.map((p) => p.count), [6]);
+  assert.equal(suggested[0].sampleSubjects.some((line) => ACCOUNT_SECURITY.some(([, subject]) => line.includes(subject))), false);
+});
+
 test("the receipt carries the undo advice for moves made, and unassessed for scheduled or changed plans", () => {
   const ws = twoInboxes();
   ws.run("begin", "--run-id", "r1", "--account", "b");

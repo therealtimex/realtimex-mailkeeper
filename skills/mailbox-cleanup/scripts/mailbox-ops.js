@@ -138,8 +138,39 @@ const RECEIPT_RE = /\b(receipt|order confirmation|your order|has shipped|shipped
 const SKETCHY_TLDS = new Set(["shop", "biz", "xyz", "info", "club", "online", "top", "icu", "cfd", "sbs"]);
 const URGENT_RE = /\b(overdue|suspension|suspended|collections|final notice|legal|subpoena|action required|past due|account (will be )?(closed|terminated))\b/i;
 const URGENT_DOMAIN_RE = /\.gov(\.[a-z]{2})?$/i;
-/** "Always ask first": never moved by any pass, only listed. */
-const CONFIRM_FIRST_RE = /\b(invoice(?! paid)|statement|payment (failed|declined|due|overdue|reminder)|chargeback|contract|legal notice|subpoena|dmca|password reset|reset your password|new sign-?in|sign-?in attempt|verification code|security (alert|code|notice)|two-factor|2fa|suspicious (activity|sign-?in)|tax|irs|government)\b/i;
+/**
+ * "Always ask first": never moved by any pass, only listed. Financial, legal,
+ * government, and account security: sign-ins, verification, passwords,
+ * recovery, and keys or tokens added to an account.
+ */
+const CONFIRM_FIRST_RE = new RegExp(
+  "\\b(" +
+    [
+      "invoice(?! paid)|statement|payment (failed|declined|due|overdue|reminder)|chargeback",
+      "contract|legal notice|subpoena|dmca|tax|irs|government",
+      // Sign-ins and devices.
+      "new (sign-?in|log-?in|login|device)|signed in|logged in|(sign-?in|log-?in|login) (attempt|alert|activity)",
+      "(suspicious|unusual) (activity|sign-?in|log-?in|login)",
+      // Verification and second factors.
+      "verification code|verify (it'?s|that it'?s) you|security (alert|code|notice|key|info|information)",
+      "(2|two)[- ]?(step|factor)( verification| authentication)?|2fa|mfa|multi-?factor|authenticator|one[- ]time (code|password|passcode)|passkey",
+      // Passwords and recovery.
+      "password (reset|change|changed|updated)|password (was|has been) (reset|changed|updated)|(reset|changed) your password",
+      "account (was |has been )?(recovered|locked|suspended|compromised)|account recovery|recovery (email|phone|code)",
+      // Keys and tokens added to an account.
+      "app password|ssh (authentication )?(public )?key|(personal )?access token|api key",
+    ].join("|") +
+    ")\\b",
+  "i"
+);
+/** Senders that only write about account security: their mail is always ask first. */
+const ACCOUNT_SECURITY_DOMAINS = ["accounts.google.com", "accountprotection.microsoft.com", "id.apple.com"];
+function isAccountSecuritySender(address) {
+  const [local = "", domain = ""] = String(address || "").toLowerCase().split("@");
+  return (
+    ACCOUNT_SECURITY_DOMAINS.some((d) => domain === d || domain.endsWith(`.${d}`)) || /(^|[._-])security([._-]|$)/.test(local)
+  );
+}
 
 const PASSES = {
   age: {
@@ -1174,7 +1205,7 @@ function buildContext(rules, inbox, snapshot) {
     policy.vipSenders.some((entry) => core.senderMatches(entry, e.fromAddress, e.fromDomain)) ||
     protectedDomains.some((d) => e.fromDomain === d.replace(/^\./, "") || e.fromDomain.endsWith(d.startsWith(".") ? d : `.${d}`)) ||
     e.flags.includes("Flagged");
-  const isConfirmFirst = (e) => CONFIRM_FIRST_RE.test(e.subject);
+  const isConfirmFirst = (e) => CONFIRM_FIRST_RE.test(e.subject) || isAccountSecuritySender(e.fromAddress);
   return { rules, policy, identity, senderCounts, repliedTo, knownDomains, isProtected, isConfirmFirst };
 }
 
@@ -2639,7 +2670,18 @@ const commands = {
         });
         // The lines for the one question, once per folder and reason.
         const warnings = undoWarnings(set, checked);
-        if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings };
+        // Matches the contract always asks about first, left in place and named
+        // for the person (urgent items are listed separately).
+        const urgentKeys = new Set(urgent.map((e) => e.uid));
+        const askFirst = snapshot.envelopes.filter(
+          (e) => !urgentKeys.has(e.uid) && ctx.isConfirmFirst(e) && plans.some((plan) => PASSES[plan.passName].match(e, ctx))
+        );
+        const alwaysAskFirstLeftInPlace = {
+          total: askFirst.length,
+          items: askFirst.slice(0, URGENT_SHOWN).map((e) => ({ from: e.fromAddress, subject: e.subject.slice(0, 90) })),
+          more: Math.max(0, askFirst.length - URGENT_SHOWN),
+        };
+        if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings, alwaysAskFirstLeftInPlace };
         // What the person is shown: each destination that receives messages in
         // this question, with the messages it really receives, in plan order.
         const destinations = checked.map(({ target, incoming, check }) => ({
@@ -2648,7 +2690,7 @@ const commands = {
           targetExists: check.targetExists,
           ...summarize(incoming),
         }));
-        return { account, passes: passNames, moveCount: taken.size, destinations, undoWarnings: warnings, plans: results };
+        return { account, passes: passNames, moveCount: taken.size, destinations, undoWarnings: warnings, alwaysAskFirstLeftInPlace, plans: results };
       },
       { requestedMode: args.mode }
     );
@@ -2729,6 +2771,13 @@ const commands = {
           // order; checked before any folder is created or message moved.
           const question = !dryRun && step.ruleId === null ? planCheck(run, account, { pass: step.pass, snapshot, mode, to, list, matchesOf: (name) => candidates(name, ctx, snapshot, urgent) }) : null;
           if (!dryRun && list.length) {
+            // The mutation boundary: a message that is always left in place
+            // (always ask first, urgent, or protected) never moves, whatever
+            // produced the list.
+            const urgentUids = new Set(urgent.map((e) => e.uid));
+            if (list.some((e) => urgentUids.has(e.uid) || ctx.isProtected(e) || ctx.isConfirmFirst(e))) {
+              throw failure("MAILKEEPER_OPERATION_FAILED", { account, procedural: true, reason: "a message that is always left in place reached a move" });
+            }
             revalidate(run, rules, account);
             // Kept with the journal before any move, so a partway stop still
             // has advice for the destination that received mail.
@@ -3074,4 +3123,4 @@ function main() {
 
 if (require.main === module) main();
 
-module.exports = { PASSES, CONFIRM_FIRST_RE, findStanza, describeStanza, renderStanza, accountTableName, listStanzas };
+module.exports = { PASSES, CONFIRM_FIRST_RE, isAccountSecuritySender, findStanza, describeStanza, renderStanza, accountTableName, listStanzas };
