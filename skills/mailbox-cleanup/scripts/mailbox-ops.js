@@ -1611,6 +1611,32 @@ function coverageComplete(entry, snapshot) {
   return entry.steps.includes("snapshot") && snapshot.coverage?.complete === true;
 }
 
+/**
+ * Messages the contract always asks about first that these passes would
+ * otherwise have taken, left in place and named for the person: grouped by
+ * sender and subject, most frequent first, up to ten groups; `more` counts
+ * the messages outside the groups shown. Urgent messages are listed
+ * separately, never here.
+ */
+function alwaysAskFirstLeftInPlace(passNames, ctx, snapshot, urgent) {
+  const urgentUids = new Set(urgent.map((e) => e.uid));
+  const left = snapshot.envelopes.filter(
+    (e) => !urgentUids.has(e.uid) && ctx.isConfirmFirst(e) && passNames.some((name) => PASSES[name].match(e, ctx))
+  );
+  const groups = new Map();
+  for (const e of left) {
+    const key = `${e.fromAddress}\n${e.subject}`;
+    const group = groups.get(key) || { from: e.fromAddress, subject: e.subject.slice(0, 90), count: 0 };
+    group.count += 1;
+    groups.set(key, group);
+  }
+  // Most frequent first; ties by sender, then subject, so the list is stable.
+  const shown = [...groups.values()]
+    .sort((a, b) => b.count - a.count || a.from.localeCompare(b.from) || a.subject.localeCompare(b.subject))
+    .slice(0, URGENT_SHOWN);
+  return { total: left.length, groups: shown, more: left.length - shown.reduce((n, g) => n + g.count, 0) };
+}
+
 function candidates(passName, ctx, snapshot, urgent) {
   const pass = PASSES[passName];
   if (!pass) throw failure("MAILKEEPER_OPERATION_FAILED", { procedural: true, reason: `unknown pass; one of ${Object.keys(PASSES).join(", ")}` });
@@ -1909,7 +1935,8 @@ function lastRunFor(runs, account) {
     code: entry.code || null,
     coverage: entry.coverage || null,
     moved: Number.isInteger(entry.moved) ? entry.moved : 0,
-    urgentChecked: entry.urgentChecked === true,
+    // null: the run recorded no urgent result (a run from before 0.2).
+    urgentChecked: typeof entry.urgentChecked === "boolean" ? entry.urgentChecked : null,
     urgentCount: Number.isInteger(entry.urgentCount) ? entry.urgentCount : null,
     urgent: Array.isArray(entry.urgent) ? entry.urgent.slice(0, 5) : [],
     undo: undoStateFor(run, account),
@@ -2444,6 +2471,9 @@ const commands = {
         if (entry.contractStatus === "review-required" && rules.legacyContract && !core.own(notices.migration, account)) {
           core.setOwn(notices.migration, account, new Date().toISOString());
           core.own(inboxes, account).migrationNotice = true;
+          // Approved rules kept for this inbox (0.1's account-scoped ones, or
+          // those proven to belong to its only inbox), as the migration recorded.
+          core.own(inboxes, account).rulesKept = (rules.promoted || []).filter((rule) => rule.account === account).length;
         }
         if (entry.contractStatus === "invalid") recordFailure(run, account, entry.code);
         // Approved rules this version can't run in full get one notice each.
@@ -2463,7 +2493,16 @@ const commands = {
     }
     saveRun(run);
     writeJson(statePath("notices.json"), notices);
-    output({ ok: true, runId, trigger, inboxes, effort: run.effort, legacyContract: rules.legacyContract || null });
+    output({
+      ok: true,
+      runId,
+      trigger,
+      inboxes,
+      effort: run.effort,
+      legacyContract: rules.legacyContract || null,
+      // 0.1 approved rules the migration couldn't tie to an inbox (null: not recorded).
+      legacyUnscopedRules: Number.isInteger(rules.legacyUnscopedRules) ? rules.legacyUnscopedRules : null,
+    });
   },
 
   snapshot(args) {
@@ -2670,18 +2709,9 @@ const commands = {
         });
         // The lines for the one question, once per folder and reason.
         const warnings = undoWarnings(set, checked);
-        // Matches the contract always asks about first, left in place and named
-        // for the person (urgent items are listed separately).
-        const urgentKeys = new Set(urgent.map((e) => e.uid));
-        const askFirst = snapshot.envelopes.filter(
-          (e) => !urgentKeys.has(e.uid) && ctx.isConfirmFirst(e) && plans.some((plan) => PASSES[plan.passName].match(e, ctx))
-        );
-        const alwaysAskFirstLeftInPlace = {
-          total: askFirst.length,
-          items: askFirst.slice(0, URGENT_SHOWN).map((e) => ({ from: e.fromAddress, subject: e.subject.slice(0, 90) })),
-          more: Math.max(0, askFirst.length - URGENT_SHOWN),
-        };
-        if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings, alwaysAskFirstLeftInPlace };
+        // What the contract always asks about first, left in place and named.
+        const leftForYou = alwaysAskFirstLeftInPlace(passNames, ctx, snapshot, urgent);
+        if (typeof args.passes !== "string") return { ...results[0], undoWarnings: warnings, alwaysAskFirstLeftInPlace: leftForYou };
         // What the person is shown: each destination that receives messages in
         // this question, with the messages it really receives, in plan order.
         const destinations = checked.map(({ target, incoming, check }) => ({
@@ -2690,7 +2720,15 @@ const commands = {
           targetExists: check.targetExists,
           ...summarize(incoming),
         }));
-        return { account, passes: passNames, moveCount: taken.size, destinations, undoWarnings: warnings, alwaysAskFirstLeftInPlace, plans: results };
+        return {
+          account,
+          passes: passNames,
+          moveCount: taken.size,
+          destinations,
+          undoWarnings: warnings,
+          alwaysAskFirstLeftInPlace: leftForYou,
+          plans: results,
+        };
       },
       { requestedMode: args.mode }
     );
@@ -2831,12 +2869,14 @@ const commands = {
       );
       const proposals = [];
       const unavailable = [];
+      const evaluated = [];
       for (const passName of inbox.policy.promotablePasses) {
         const availability = passAvailability(passName);
         if (!availability.available) {
           unavailable.push({ pass: passName, skipped: availability.skipReason });
           continue;
         }
+        evaluated.push(passName);
         const query = PASSES[passName].describe(ctx);
         if (approved.has(`${passName}\n${query}`)) continue;
         const list = candidates(passName, ctx, snapshot, urgent);
@@ -2850,7 +2890,14 @@ const commands = {
       }
       run.proposals = [...run.proposals.filter((p) => p.account !== account), ...proposals];
       entry.steps.push("propose");
-      return { account, proposals: proposals.length, passes: proposals.map((p) => `${p.pass}: ${p.count}`), ...(unavailable.length ? { unavailable } : {}) };
+      return {
+        account,
+        proposals: proposals.length,
+        passes: proposals.map((p) => `${p.pass}: ${p.count}`),
+        ...(unavailable.length ? { unavailable } : {}),
+        // Named once per inbox in a report-only chat run, as in a chat plan.
+        alwaysAskFirstLeftInPlace: alwaysAskFirstLeftInPlace(evaluated, ctx, snapshot, urgent),
+      };
     });
   },
 

@@ -542,6 +542,8 @@ class MailKeeperService {
       ),
       legacyContract: fs.existsSync(path.join(workspace.workingDirectory, LEGACY_CONTRACT)) ? LEGACY_CONTRACT : null,
       promoted: rules.promoted.filter((rule) => typeof rule.account === "string"),
+      // 0.1 approved rules whose inbox couldn't be established: now suggestions.
+      legacyUnscopedRules: (rules.proposed || []).filter((rule) => rule.demotedReason === "legacy-unscoped").length,
     });
   }
 

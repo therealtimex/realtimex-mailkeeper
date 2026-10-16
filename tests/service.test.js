@@ -372,6 +372,9 @@ test("legacy unscoped approved rules are scoped only when one inbox is proven", 
   await single.service.provision(single.workspace);
   const scoped = single.store.get("ws-7-rules");
   assert.equal(scoped.promoted[0].account, "work");
+  assert.equal(scoped.promoted[0].scopedFrom, "v0.1.1-single-account");
+  const singleFile = JSON.parse(fs.readFileSync(path.join(single.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([singleFile.promoted.length, singleFile.legacyUnscopedRules], [1, 0]);
 
   const multi = harness({ config: { EMAIL_ACCOUNTS: ["work", "home"] } });
   multi.store.set("ws-7-profile", { emailAccounts: ["work", "home"] });
@@ -382,6 +385,30 @@ test("legacy unscoped approved rules are scoped only when one inbox is proven", 
   assert.equal(demoted.proposed[0].reviewRequired, true);
   const rulesFile = JSON.parse(fs.readFileSync(path.join(multi.dir, ".mailkeeper", "rules.json"), "utf8"));
   assert.deepEqual(rulesFile.promoted, []);
+  assert.equal(rulesFile.legacyUnscopedRules, 1, "the disposition reaches the workspace");
+
+  // Mixed: an account-scoped rule is kept, an unscoped one becomes a suggestion.
+  const mixed = harness({ config: { EMAIL_ACCOUNTS: ["work", "home"] } });
+  mixed.store.set("ws-7-profile", { emailAccounts: ["work", "home"] });
+  mixed.store.set("ws-7-rules", {
+    revision: 3,
+    promoted: [
+      { id: "r1", pass: "no-reply", query: "q", action: "a", account: "home" },
+      { id: "r2", pass: "no-reply", query: "q", action: "a" },
+    ],
+    proposed: [],
+  });
+  await mixed.service.provision(mixed.workspace);
+  const mixedFile = JSON.parse(fs.readFileSync(path.join(mixed.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([mixedFile.promoted.map((r) => [r.id, r.account]), mixedFile.legacyUnscopedRules], [[["r1", "home"]], 1]);
+
+  // No recorded inbox history: the scope isn't inferred from today's selection.
+  const unknown = harness({ config: { EMAIL_ACCOUNTS: ["work"] } });
+  unknown.store.set("ws-7-profile", {});
+  unknown.store.set("ws-7-rules", { revision: 3, promoted: [{ id: "r1", pass: "no-reply", query: "q", action: "a" }], proposed: [] });
+  await unknown.service.provision(unknown.workspace);
+  const unknownFile = JSON.parse(fs.readFileSync(path.join(unknown.dir, ".mailkeeper", "rules.json"), "utf8"));
+  assert.deepEqual([unknownFile.promoted, unknownFile.legacyUnscopedRules], [[], 1]);
 });
 
 test("receipts keep only account-scoped suggestions, idempotently", async () => {
