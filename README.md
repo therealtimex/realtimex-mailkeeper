@@ -76,14 +76,16 @@ Chat runs use whichever agent the chat is using, under the same contracts.
 
 The scheduled agent runs Himalaya in its own terminal. That session needs outbound network access to your IMAP servers, and access to the credential source: RealTimeX Secrets through `rtxexec`, or the inbox's existing password command or keyring.
 
-- **Codex CLI**: RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, which denies outbound network by default. Add this to `~/.codex/config.toml`:
+- **Codex CLI**: RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, which denies outbound network by default. Scheduled checks need network access configured in advance, so add this to `~/.codex/config.toml`:
 
   ```toml
   [sandbox_workspace_write]
   network_access = true
   ```
 
-  Without it, each inbox's report says it couldn't connect, and nothing is moved.
+  Without network access, each inbox's report says it couldn't connect, and nothing is moved.
+
+  **Codex in chat:** a workspace chat with Codex runs in the same sandbox. When its network access is off, MailKeeper's chat runs can't reach your mail server either: add the setting above, or ask Codex to request permission to run MailKeeper's mail commands with network access.
 - **Other agents**: check the equivalent sandbox or network setting for the agent you pick.
 
 Himalaya 1.2 must be installed and on `PATH`, along with `rtxexec` 0.3 or later for Secrets sign-in.
@@ -130,6 +132,8 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 Before updating MailKeeper from 0.1, update RealTimeX Desktop to 1.2.40 or later.
 
 After installing or updating MailKeeper, quit RealTimeX completely and reopen it, so the update takes effect everywhere. Closing the window isn't enough.
+
+If you use Codex in chat, check its network setting first (see "Requirements for the maintenance agent").
 
 The first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
 
