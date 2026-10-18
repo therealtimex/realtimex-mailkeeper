@@ -290,6 +290,7 @@ test("a snapshot belonging to another inbox is refused", () => {
   fs.copyFileSync(aFile, bFile);
   const triage = ws.run("triage", "--account", "b", "--run-id", "r1");
   assert.equal(triage.json.code, "MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH");
+  assert.equal(triage.json.errorSource, undefined, "not the contract: no contract marker");
 });
 
 test("one blocked inbox does not stop the other, and the run is not reported complete", () => {
@@ -455,7 +456,35 @@ test("mixed-inbox undo checks every inbox before changing any", () => {
   fs.writeFileSync(ws.contract("b"), text);
   const callsBefore = ws.mailbox().calls.length;
   const undone = ws.run("undo", "--run-id", "r1");
-  assert.equal(undone.json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
+  assert.equal(undone.json.code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
+  assert.equal(ws.mailbox().calls.length, callsBefore, "no inbox was contacted");
+});
+
+test("an unreadable contract reports its own problem, not a missing sign-in", () => {
+  const ws = twoInboxes();
+  // b's settings block now names another inbox: no sign-in applies, and the reason is the contract.
+  const text = fs.readFileSync(ws.contract("b"), "utf8").replace('"account": "b"', '"account": "a"');
+  fs.writeFileSync(ws.contract("b"), text);
+  const calls = () => (ws.mailbox().calls || []).length;
+  const callsBefore = calls();
+  const fromContract = (json, code) =>
+    assert.deepEqual([json.code, json.errorSource, json.contract], [code, "contract", "mailboxes/" + core.accountKey(json.account) + "/MAILBOX.md"]);
+  fromContract(ws.run("check", "--account", "b").json, "MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH");
+  ws.run("begin", "--run-id", "r1");
+  fromContract(ws.run("snapshot", "--account", "b", "--run-id", "r1").json, "MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH");
+  // A settings block that can't be parsed reports CONTRACT_INVALID the same way.
+  fs.writeFileSync(ws.contract("a"), fs.readFileSync(ws.contract("a"), "utf8").replace('"version": 1', '"version": 1,,'));
+  fromContract(ws.run("check", "--account", "a").json, "MAILKEEPER_CONTRACT_INVALID");
+  assert.equal(calls(), callsBefore, "no inbox was contacted");
+});
+
+test("undo reports an unreadable contract before touching any inbox", () => {
+  const ws = twoInboxes({ promoted: [ruleB] });
+  maintenance(ws, "r1");
+  fs.writeFileSync(ws.contract("b"), fs.readFileSync(ws.contract("b"), "utf8").replace('"account": "b"', '"account": "a"'));
+  const callsBefore = ws.mailbox().calls.length;
+  const undone = ws.run("undo", "--run-id", "r1").json;
+  assert.deepEqual([undone.code, undone.errorSource], ["MAILKEEPER_ACCOUNT_IDENTITY_MISMATCH", "contract"]);
   assert.equal(ws.mailbox().calls.length, callsBefore, "no inbox was contacted");
 });
 
@@ -479,7 +508,7 @@ test("setup works before the inbox is selected and never overwrites a contract",
   box.accounts.c = { credential: { kind: "secret", password: SECRET_A }, folders: { INBOX: [], Archive: [], Sent: [] } };
   fs.writeFileSync(path.join(ws.dir, "fake-mailbox.json"), JSON.stringify(box));
 
-  assert.equal(ws.run("check", "--account", "c").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE");
+  assert.equal(ws.run("check", "--account", "c").json.code, "MAILKEEPER_CREDENTIAL_NOT_CONFIGURED");
   assert.equal(ws.run("check", "--account", "c", "--login", "a-imap").json.code, "MAILKEEPER_CREDENTIAL_UNAVAILABLE", "names are never turned into references");
   const checked = ws.run("check", "--account", "c", "--password-ref", "secret://a-imap");
   assert.deepEqual(checked.json.folders, ["INBOX", "Archive", "Sent"]);

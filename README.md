@@ -76,14 +76,16 @@ Chat runs use whichever agent the chat is using, under the same contracts.
 
 The scheduled agent runs Himalaya in its own terminal. That session needs outbound network access to your IMAP servers, and access to the credential source: RealTimeX Secrets through `rtxexec`, or the inbox's existing password command or keyring.
 
-- **Codex CLI**: RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, which denies outbound network by default. Add this to `~/.codex/config.toml`:
+- **Codex CLI**: RealTimeX launches Codex with `sandbox_mode = "workspace-write"`, which denies outbound network by default. Scheduled checks need network access configured in advance, so add this to `~/.codex/config.toml`:
 
   ```toml
   [sandbox_workspace_write]
   network_access = true
   ```
 
-  Without it, each inbox's report says it couldn't connect, and nothing is moved.
+  Without network access, each inbox's report says it couldn't connect, and nothing is moved.
+
+  **Codex in chat:** a workspace chat with Codex runs in the same sandbox. When its network access is off, MailKeeper's chat runs can't reach your mail server either: add the setting above, or ask Codex to request permission to run MailKeeper's mail commands with network access.
 - **Other agents**: check the equivalent sandbox or network setting for the agent you pick.
 
 Himalaya 1.2 must be installed and on `PATH`, along with `rtxexec` 0.3 or later for Secrets sign-in.
@@ -122,28 +124,27 @@ MailKeeper uses only the public plugin API: `registerRoute`, `getConfig`, `getSt
 ### Known limitations
 
 - Very large inboxes may not be checked fully within a check's limit; MailKeeper then only reports for them. In this version it doesn't check for unsubscribe links, and the “Repeat senders” and “Personalized outreach” cleanups are off. A fix is tracked in realtimex-mailkeeper#6.
+- After installing or updating MailKeeper, quit RealTimeX completely and reopen it, so the update takes effect everywhere. Closing the window isn't enough.
 - If RealTimeX closes or restarts while MailKeeper is running, including an automatic update, MailKeeper may not be able to confirm that run ended. It then stops for that workspace and says so, rather than risk two runs on the same inbox. To clear it, ask for help through Community & support in the RealTimeX sidebar. A fix is tracked in realtimex-ai-app#2456.
 
 ### Upgrading from 0.1
 
-**Not yet:** updating from 0.1 currently removes your approved cleanup rules and in-app run history, because of a RealTimeX issue (realtimex-ai-app#2460). Keep 0.1 until that's fixed; this page will say when it's safe to update.
+Before updating MailKeeper from 0.1, update RealTimeX Desktop to 1.2.40 or later.
 
-Moves made by MailKeeper 0.1 can't be undone in this version, because that version didn't record enough information to find the moved messages again.
+After installing or updating MailKeeper, quit RealTimeX completely and reopen it, so the update takes effect everywhere. Closing the window isn't enough.
 
-Once updating is safe, the first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
+If you use Codex in chat, check its network setting first (see "Requirements for the maintenance agent").
+
+The first provision after the upgrade gives each selected inbox its own contract. Your old root `MAILBOX.md` is kept, untouched, for reference.
 
 - **One inbox:** its text is copied into that inbox's contract.
 - **Several inboxes:** each gets a conservative draft.
 
-Either way, each inbox stays report-only until you review its contract with the agent. Approved rules are kept for an inbox when the old setup had only one; otherwise they come back as suggestions.
+Either way, each inbox stays report-only until you review its contract with the agent. If you have approved rules, MailKeeper keeps those it can tie to an inbox. Rules whose inbox can't be established become suggestions, and MailKeeper won't apply them on its own.
 
-To roll back to 0.1:
+Moves made by MailKeeper 0.1 can't be undone in this version, because that version didn't record enough information to find the moved messages again.
 
-1. Disable MailKeeper for the workspace, so its scheduled task is removed.
-2. Install 0.1.
-3. Before you enable it again, reconcile the old shared `MAILBOX.md` with the inboxes you want: 0.1 doesn't read per-inbox contracts.
-
-Contracts and the run records in the workspace (`.mailkeeper/runs`) are kept either way; until realtimex-ai-app#2460 is fixed, a reinstall in either direction removes the in-app run history and approved rules.
+MailKeeper 0.1 can't read what this version records, so going back to 0.1 after updating isn't supported. If something isn't right, turn MailKeeper off for the workspace in Workspace Settings → Plugins. No new scheduled runs start, and your contracts, your old `MAILBOX.md` and the run records in the workspace stay. Then ask for help through Community & support in the RealTimeX sidebar.
 
 ## Development
 
